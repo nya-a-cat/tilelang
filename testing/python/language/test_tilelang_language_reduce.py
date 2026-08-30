@@ -1197,5 +1197,46 @@ def test_reduce_packed_max_nan_batch_runtime():
         assert math.isnan(B[2].float().item()), f"{tl_dtype}: NaN row must produce NaN"
 
 
+def test_consecutive_full_cta_reductions_reuse_leading_barrier_codegen():
+    """The second AllReduce's own leading barrier orders workspace reuse.
+
+    This is a source-only regression test: device compilation and execution
+    are deliberately disabled so the backend contract is covered on CPU-only
+    CI as well.  Both collectives must remain; only the redundant standalone
+    synchronization between them is eliminated.
+    """
+
+    width = 1024
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((2, width), T.float32),
+        B: T.Tensor((2,), T.float32),
+    ):
+        with T.Kernel(1, threads=128):
+            first_values = T.alloc_fragment((width,), T.float32)
+            second_values = T.alloc_fragment((width,), T.float32)
+            first_sum = T.alloc_fragment((1,), T.float32)
+            second_sum = T.alloc_fragment((1,), T.float32)
+            T.copy(A[0, :], first_values)
+            T.copy(A[1, :], second_values)
+            T.reduce_sum(first_values, first_sum, dim=0)
+            T.reduce_sum(second_values, second_sum, dim=0)
+            if T.get_thread_binding() == 0:
+                B[0] = first_sum[0]
+                B[1] = second_sum[0]
+
+    target = {"kind": "cuda", "arch": "sm_80"}
+    with tvm.transform.PassContext(), tvm.target.Target(target):
+        artifact = tilelang.lower(kernel, target=target, enable_device_compile=False)
+    source = artifact.kernel_source
+    assert source is not None
+    assert source.count("tl::AllReduce") == 2, source
+    assert "tl.collective_leading_barrier" not in source, source
+    first_call = source.index("tl::AllReduce")
+    second_call = source.index("tl::AllReduce", first_call + 1)
+    assert "__syncthreads()" not in source[first_call:second_call], source
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

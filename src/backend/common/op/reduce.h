@@ -7,6 +7,7 @@
 #define TVM_TL_BACKEND_COMMON_OP_REDUCE_H_
 
 #include "backend/common/target_utils.h"
+#include "op/builtin.h"
 #include "op/reduce.h"
 #include "support/check.h"
 #include <tvm/ir/cast.h>
@@ -202,6 +203,36 @@ inline void CheckAllReduceWidth(int reducing_threads, int scale,
       << "(threads / scale) to be a positive power of two, got "
       << logical_width << " (threads=" << reducing_threads
       << ", scale=" << scale << ")";
+}
+
+/*! \brief Expose an implementation-owned leading barrier to ThreadSync.
+ *
+ * The AllReduce templates enter their shared-memory butterfly with a barrier
+ * before touching the workspace.  Once shared-workspace allocations are
+ * merged, this barrier also orders reuse against a preceding collective.  Keep
+ * that fact explicit in TIR so ThreadSync does not insert a second barrier it
+ * cannot otherwise see through call_extern.
+ *
+ * A non-zero thread offset is intentionally left unmarked.  Such collectives
+ * synchronize only a sub-range of a CTA; ThreadSync must retain its conservative
+ * dependency barrier until it can prove equality of partial participant sets.
+ * The planner independently checks that `participants` equals the physical CTA
+ * size before consuming the marker.
+ */
+template <typename Impl>
+inline Stmt MarkAllReduceLeadingBarrier(Stmt stmt, int reducing_threads,
+                                        PrimExpr thread_offset,
+                                        PrimExpr participants, Target target) {
+  int warp_size = Impl::WarpSize(target);
+  if (reducing_threads / 2 < warp_size) {
+    return stmt;
+  }
+  const int64_t *offset = as_const_int(thread_offset);
+  if (offset == nullptr || *offset != 0) {
+    return stmt;
+  }
+  return AttrStmt(Integer(0), attr::kCollectiveLeadingBarrier,
+                  std::move(participants), std::move(stmt));
 }
 
 inline PrimExpr MakeInitValue(const ReduceOpNode &op, int vsize = 1) {
@@ -1093,8 +1124,11 @@ template <typename Impl> struct ReduceLowerer {
               if (need_workspace) {
                 args.push_back(workspace);
               }
-              phases.push_back(Evaluate(
-                  Call(DataType::Handle(), builtin::call_extern(), args)));
+              Stmt allreduce_stmt = Evaluate(
+                  Call(DataType::Handle(), builtin::call_extern(), args));
+              phases.push_back(reduce::MarkAllReduceLeadingBarrier<Impl>(
+                  std::move(allreduce_stmt), reducing_threads, thread_offset,
+                  lower_args.thread_bounds->extent, lower_args.target));
 
               Var unpack_j("unpack_j");
               PrimExpr ubase = Integer(flat_offset);
@@ -1223,7 +1257,10 @@ template <typename Impl> struct ReduceLowerer {
         }
         auto call = Call(clear_buffer->dtype, builtin::call_extern(),
                          thread_reduce_args);
-        stmts.push_back(BufferStore(clear_buffer, call, red_indices));
+        Stmt allreduce_stmt = BufferStore(clear_buffer, call, red_indices);
+        stmts.push_back(reduce::MarkAllReduceLeadingBarrier<Impl>(
+            std::move(allreduce_stmt), reducing_threads, thread_offset,
+            all_threads, lower_args.target));
       }
 
       PrimExpr predicate = Bool(true);

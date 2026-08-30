@@ -17,6 +17,8 @@ using namespace tirx;
 namespace rocm {
 
 struct Reduce : backend::ReduceLowerer<Reduce> {
+  static int WarpSize(Target target) { return TargetRocmGetWarpSize(target); }
+
   static bool SupportsFp16Bf16NanReduce(Target) { return false; }
 
   static int GetPreferredVectorizedSize(const ReduceOpNode &, Target) {

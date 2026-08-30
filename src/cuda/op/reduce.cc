@@ -17,6 +17,8 @@ using namespace tirx;
 namespace cuda {
 
 struct Reduce : backend::ReduceLowerer<Reduce> {
+  static int WarpSize(Target target) { return TargetCudaGetWarpSize(target); }
+
   static bool IsFAdd2Enabled(const ReduceOpNode &op) {
     constexpr const char *kEnableFAdd2 = "enable_fadd2";
     if (auto value = op.annotations.Get(kEnableFAdd2)) {

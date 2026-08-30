@@ -107,8 +107,11 @@ template <typename Impl> struct FinalizeReducerLowerer {
         int ws_size = workspace_stride * static_cast<int>(effective_batch);
         PrimExpr workspace = lower_args.add_workspace(ws_size, buffer->dtype);
         Array<PrimExpr> args = {StringImm(allreduce), buffer->data, workspace};
-        step_stmts.push_back(
-            Evaluate(Call(DataType::Handle(), builtin::call_extern(), args)));
+        Stmt allreduce_stmt =
+            Evaluate(Call(DataType::Handle(), builtin::call_extern(), args));
+        step_stmts.push_back(reduce::MarkAllReduceLeadingBarrier<Impl>(
+            std::move(allreduce_stmt), reducing_threads, thread_offset,
+            lower_args.thread_bounds->extent, lower_args.target));
         continue;
       }
 
@@ -125,6 +128,9 @@ template <typename Impl> struct FinalizeReducerLowerer {
       auto call =
           Call(buffer->dtype, builtin::call_extern(), thread_reduce_args);
       Stmt body = BufferStore(buffer, call, indices_0);
+      body = reduce::MarkAllReduceLeadingBarrier<Impl>(
+          std::move(body), reducing_threads, thread_offset,
+          lower_args.thread_bounds->extent, lower_args.target);
 
       for (int i = layout->OutputDim() - 1; i >= 0; i--) {
         body = For(indices_0[i].as<Var>().value(), 0, layout->OutputShape()[i],

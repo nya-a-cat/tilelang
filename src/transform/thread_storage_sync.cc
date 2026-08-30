@@ -862,6 +862,23 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
         ConstrVisitor::VisitStmt_(op);
       }
       env_threads_.pop_back();
+    } else if (op->attr_key == tvm::tl::attr::kCollectiveLeadingBarrier) {
+      // call_extern is opaque to ThreadSync, but selected collective templates
+      // begin with a real block barrier before touching shared workspace. Treat
+      // the marker as an existing sync only for an unconditional, full-CTA
+      // collective. Partial named barriers intentionally remain conservative.
+      if (in_device_env_ && conditional_depth_ == 0 &&
+          CollectiveBarrierCoversPhysicalCTA(op->value)) {
+        StmtEntry barrier;
+        barrier.stmt = op;
+        AccessEntry access{.cset = {constr_stack_}};
+        access.threads = env_threads();
+        access.type = kSync;
+        access.scope = sync_scope_;
+        barrier.access.emplace_back(std::move(access));
+        scope_.back().emplace_back(std::move(barrier));
+      }
+      ConstrVisitor::VisitStmt_(op);
     } else {
       ConstrVisitor::VisitStmt_(op);
     }
@@ -931,7 +948,9 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
 
       scope_.push_back(std::vector<StmtEntry>());
       {
+        ++conditional_depth_;
         this->VisitStmt(op->then_case);
+        --conditional_depth_;
       }
 
       s.stmt = op;
@@ -954,7 +973,9 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
       auto guard = MakeGuard(tirx::Not(op->condition));
       scope_.push_back(std::vector<StmtEntry>());
       {
+        ++conditional_depth_;
         this->VisitStmt(op->else_case.value());
+        --conditional_depth_;
       }
       auto v = Summarize(std::move(scope_.back()), nullptr);
       scope_.pop_back();
@@ -1042,7 +1063,9 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
 
       scope_.push_back(std::vector<StmtEntry>());
       {
+        ++conditional_depth_;
         this->VisitStmt(op->body);
+        --conditional_depth_;
       }
       s.stmt = op;
       s.access = Summarize(std::move(scope_.back()), nullptr);
@@ -1464,6 +1487,33 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
   const Array<IterVar> &env_threads() const { return env_threads_; }
 
 private:
+  bool CollectiveBarrierCoversPhysicalCTA(const PrimExpr &participants) const {
+    const int64_t *participant_count = as_const_int(participants);
+    if (participant_count == nullptr || *participant_count <= 0) {
+      return false;
+    }
+
+    int64_t physical_threads = 1;
+    bool saw_thread_axis = false;
+    for (const IterVar &iv : env_threads_) {
+      runtime::ThreadScope scope =
+          runtime::ThreadScope::Create(iv->thread_tag);
+      if (scope.rank != 1) {
+        continue;
+      }
+      if (!iv->dom.defined()) {
+        return false;
+      }
+      const int64_t *extent = as_const_int(iv->dom->extent);
+      if (extent == nullptr || *extent <= 0) {
+        return false;
+      }
+      physical_threads *= *extent;
+      saw_thread_axis = true;
+    }
+    return saw_thread_axis && physical_threads == *participant_count;
+  }
+
   ConditionThreadProperty AnalyzeExprProperty(const PrimExpr &expr) const {
     arith::Analyzer analyzer;
     ConstrSet constr_set = GetConstrSet();
@@ -1491,6 +1541,10 @@ private:
   // (e.g., atomic_add/atomic_max/atomic_load). When > 0, accesses produced by
   // the pointer metadata ops are tagged as atomic.
   int atomic_dst_ptr_depth_{0};
+  // A collective marker inside thread-divergent control flow cannot stand in
+  // for a block-wide dependency barrier, even if its declared count matches
+  // blockDim. Keep ThreadSync conservative in that case.
+  int conditional_depth_{0};
   // the current free stmt entry.
   StmtEntry curr_stmt_;
   // The involving threads
