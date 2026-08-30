@@ -19,6 +19,16 @@ namespace rocm {
 struct FinalizeReducer : backend::FinalizeReducerLowerer<FinalizeReducer> {
   static int WarpSize(Target target) { return TargetRocmGetWarpSize(target); }
 
+  static int GetAllReduceWorkspaceStride(int, int, PrimExpr, PrimExpr,
+                                         int fallback_stride, Target) {
+    return fallback_stride;
+  }
+
+  static bool AllReduceHasLeadingBarrier(int, int, PrimExpr, PrimExpr,
+                                         Target) {
+    return true;
+  }
+
   static std::string MakeBatchAllReduce(std::string reducer,
                                         int reducing_threads, int scale,
                                         PrimExpr thread_offset, PrimExpr,

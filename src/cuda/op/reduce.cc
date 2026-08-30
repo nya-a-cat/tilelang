@@ -52,11 +52,41 @@ struct Reduce : backend::ReduceLowerer<Reduce> {
     return vsize;
   }
 
+  static bool SupportsBatchPackedAllReduce(Target target) {
+    // CuTeDSL currently has neither vector-typed dynamic shared buffers nor
+    // the packed CUDA reducer functors (SumOp_f32x2, MaxOp_fp16x2, ...).
+    // Keep local vector reduction decisions independent, but scalarize the
+    // batch AllReduce interface for that code generator.
+    return !TargetIsCuTeDSL(target);
+  }
+
+  static int GetAllReduceWorkspaceStride(
+      int reducing_threads, int scale, PrimExpr thread_offset,
+      PrimExpr all_threads, int fallback_stride, Target target) {
+    if (backend::reduce::CanUseHierarchicalAllReduce(
+            reducing_threads, scale, thread_offset, all_threads,
+            TargetCudaGetWarpSize(target))) {
+      return reducing_threads / TargetCudaGetWarpSize(target);
+    }
+    return fallback_stride;
+  }
+
+  static bool AllReduceHasLeadingBarrier(
+      int reducing_threads, int scale, PrimExpr thread_offset,
+      PrimExpr all_threads, Target target) {
+    return !backend::reduce::CanUseHierarchicalAllReduce(
+        reducing_threads, scale, thread_offset, all_threads,
+        TargetCudaGetWarpSize(target));
+  }
+
   static std::string MakeBatchAllReduce(std::string reducer,
                                         int reducing_threads, int scale,
                                         PrimExpr thread_offset,
                                         PrimExpr all_threads, int batch,
                                         int workspace_stride, Target target) {
+    bool hierarchical = backend::reduce::CanUseHierarchicalAllReduce(
+        reducing_threads, scale, thread_offset, all_threads,
+        TargetCudaGetWarpSize(target));
     std::stringstream ss;
     ss << "tl::AllReduce<" << reducer << ", " << reducing_threads << ", "
        << scale << ", " << thread_offset;
@@ -65,7 +95,11 @@ struct Reduce : backend::ReduceLowerer<Reduce> {
     } else {
       ss << ", tl::SyncThreadsBarrier";
     }
-    ss << ", " << batch << ", " << workspace_stride << ">::run_batch";
+    ss << ", " << batch << ", " << workspace_stride;
+    if (hierarchical) {
+      ss << ", true";
+    }
+    ss << ">::run_batch";
     return ss.str();
   }
 
@@ -73,11 +107,19 @@ struct Reduce : backend::ReduceLowerer<Reduce> {
                                          int reducing_threads, int scale,
                                          PrimExpr thread_offset,
                                          PrimExpr all_threads, Target target) {
+    bool hierarchical = backend::reduce::CanUseHierarchicalAllReduce(
+        reducing_threads, scale, thread_offset, all_threads,
+        TargetCudaGetWarpSize(target));
     std::stringstream ss;
     ss << "tl::AllReduce<" << reducer << ", " << reducing_threads << ", "
        << scale << ", " << thread_offset;
     if (TargetSupportsNamedBarrier(target)) {
       ss << ", tl::NamedBarrier<" << all_threads << ">";
+    } else if (hierarchical) {
+      ss << ", tl::SyncThreadsBarrier";
+    }
+    if (hierarchical) {
+      ss << ", 1, 0, true";
     }
     ss << ">::run";
     return ss.str();

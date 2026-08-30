@@ -97,9 +97,14 @@ template <typename Impl> struct FinalizeReducerLowerer {
       bool use_batch = effective_batch > 1 &&
                        reducing_threads > Impl::WarpSize(lower_args.target);
 
+      int block_threads =
+          static_cast<int>(*as_const_int(lower_args.thread_bounds->extent));
+
       if (use_batch) {
-        int workspace_stride =
-            static_cast<int>(*as_const_int(lower_args.thread_bounds->extent));
+        int workspace_stride = Impl::GetAllReduceWorkspaceStride(
+            reducing_threads, scale, thread_offset,
+            lower_args.thread_bounds->extent, block_threads,
+            lower_args.target);
         std::string allreduce = Impl::MakeBatchAllReduce(
             op_str, reducing_threads, scale, thread_offset,
             lower_args.thread_bounds->extent, static_cast<int>(effective_batch),
@@ -110,7 +115,7 @@ template <typename Impl> struct FinalizeReducerLowerer {
         Stmt allreduce_stmt =
             Evaluate(Call(DataType::Handle(), builtin::call_extern(), args));
         step_stmts.push_back(reduce::MarkAllReduceLeadingBarrier<Impl>(
-            std::move(allreduce_stmt), reducing_threads, thread_offset,
+            std::move(allreduce_stmt), reducing_threads, scale, thread_offset,
             lower_args.thread_bounds->extent, lower_args.target));
         continue;
       }
@@ -121,15 +126,19 @@ template <typename Impl> struct FinalizeReducerLowerer {
       Array<PrimExpr> thread_reduce_args = {StringImm(allreduce),
                                             BufferLoad(buffer, indices_0)};
       if (reducing_threads > Impl::WarpSize(lower_args.target)) {
-        PrimExpr workspace = lower_args.add_workspace(
-            *as_const_int(lower_args.thread_bounds->extent), buffer->dtype);
+        int workspace_size = Impl::GetAllReduceWorkspaceStride(
+            reducing_threads, scale, thread_offset,
+            lower_args.thread_bounds->extent, block_threads,
+            lower_args.target);
+        PrimExpr workspace =
+            lower_args.add_workspace(workspace_size, buffer->dtype);
         thread_reduce_args.push_back(workspace);
       }
       auto call =
           Call(buffer->dtype, builtin::call_extern(), thread_reduce_args);
       Stmt body = BufferStore(buffer, call, indices_0);
       body = reduce::MarkAllReduceLeadingBarrier<Impl>(
-          std::move(body), reducing_threads, thread_offset,
+          std::move(body), reducing_threads, scale, thread_offset,
           lower_args.thread_bounds->extent, lower_args.target);
 
       for (int i = layout->OutputDim() - 1; i >= 0; i--) {

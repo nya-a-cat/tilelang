@@ -418,7 +418,23 @@ class NamedBarrier:
         self.all_threads = all_threads
 
 
-def AllReduce(reducer, threads, scale, thread_offset, all_threads=None, batch_size=1, workspace_stride=0):
+@cute.jit
+def _store_warp_aggregate(red_buf, index, value, lane):
+    """Store one warp aggregate without capturing AllReduce policy state."""
+    if lane == 0:
+        cute.make_tensor(red_buf + index, (1,))[0] = value
+
+
+def AllReduce(
+    reducer,
+    threads,
+    scale,
+    thread_offset,
+    all_threads=None,
+    batch_size=1,
+    workspace_stride=0,
+    hierarchical=False,
+):
     """
     AllReduce operation implementing warp/block-level reduction.
     Based on tl::AllReduce from reduce.h
@@ -431,10 +447,21 @@ def AllReduce(reducer, threads, scale, thread_offset, all_threads=None, batch_si
         all_threads: Total number of threads in block (or NamedBarrier instance)
         batch_size: Number of elements per thread to reduce in parallel (default 1)
         workspace_stride: Stride between batch channels in shared memory (default 0)
+        hierarchical: Use warp aggregates for a contiguous full-participant
+            reduction group (default False)
 
     Returns:
         A callable object with run() and run_hopper() methods
     """
+
+    if hierarchical:
+        num_warps = threads // 32
+        valid_group = scale == 1 and thread_offset == 0
+        valid_width = 64 <= threads <= 1024 and threads % 32 == 0 and num_warps & (num_warps - 1) == 0
+        if not (valid_group and valid_width):
+            raise ValueError("hierarchical AllReduce requires a contiguous scale-1 group of 2-32 power-of-two CUDA warps")
+        if batch_size > 1 and workspace_stride < num_warps:
+            raise ValueError("hierarchical AllReduce workspace_stride must cover all warp aggregates")
 
     # Detect NamedBarrier: extract all_threads and use bar.sync path
     use_named_barrier = isinstance(all_threads, NamedBarrier)
@@ -454,6 +481,7 @@ def AllReduce(reducer, threads, scale, thread_offset, all_threads=None, batch_si
             use_named_barrier: cutlass.Constexpr[bool],
             batch_size: cutlass.Constexpr[int],
             workspace_stride: cutlass.Constexpr[int],
+            hierarchical: cutlass.Constexpr[bool],
         ):
             self.reducer = reducer
             self.threads = threads
@@ -463,6 +491,66 @@ def AllReduce(reducer, threads, scale, thread_offset, all_threads=None, batch_si
             self.use_named_barrier = use_named_barrier
             self.batch_size = batch_size
             self.workspace_stride = workspace_stride
+            self.hierarchical = hierarchical
+
+        @cute.jit
+        def _reduce_full_warp(self, x):
+            for offset in (16, 8, 4, 2, 1):
+                x = self.reducer()(x, _shfl_xor_sync(x, offset))
+            return x
+
+        @cute.jit
+        def _reduce_warp_aggregates(self, x):
+            if cutlass.const_expr(self.threads >= 1024):
+                x = self.reducer()(x, _shfl_xor_sync(x, 16))
+            if cutlass.const_expr(self.threads >= 512):
+                x = self.reducer()(x, _shfl_xor_sync(x, 8))
+            if cutlass.const_expr(self.threads >= 256):
+                x = self.reducer()(x, _shfl_xor_sync(x, 4))
+            if cutlass.const_expr(self.threads >= 128):
+                x = self.reducer()(x, _shfl_xor_sync(x, 2))
+            x = self.reducer()(x, _shfl_xor_sync(x, 1))
+            return x
+
+        @cute.jit
+        def _hierarchical_barrier(self, barrier_id):
+            if cutlass.const_expr(self.use_named_barrier):
+                bar_sync_ptx(barrier_id, self.all_threads)
+            else:
+                cute.arch.sync_threads()
+
+        @cute.jit
+        def _run_hierarchical(self, x, red_buf):
+            num_warps = self.threads // 32
+            tidx, _, _ = cute.arch.thread_idx()
+            lane = tidx % 32
+            warp = tidx // 32
+
+            if cutlass.const_expr(self.batch_size > 1):
+                x_tensor = cute.make_tensor(x, (self.batch_size,))
+                for i in range(self.batch_size):
+                    x_tensor[i] = self._reduce_full_warp(x_tensor[i])
+                for i in range(self.batch_size):
+                    _store_warp_aggregate(
+                        red_buf,
+                        warp + i * self.workspace_stride,
+                        x_tensor[i],
+                        lane,
+                    )
+                self._hierarchical_barrier(1)
+                for i in range(self.batch_size):
+                    x_tensor[i] = cute.make_tensor(
+                        red_buf + (lane % num_warps) + i * self.workspace_stride,
+                        (1,),
+                    )[0]
+                    x_tensor[i] = self._reduce_warp_aggregates(x_tensor[i])
+                return x
+
+            x = self._reduce_full_warp(x)
+            _store_warp_aggregate(red_buf, warp, x, lane)
+            self._hierarchical_barrier(1)
+            x = cute.make_tensor(red_buf + (lane % num_warps), (1,))[0]
+            return self._reduce_warp_aggregates(x)
 
         def run(self, x, red_buf: cute.Pointer = None):
             """
@@ -471,6 +559,8 @@ def AllReduce(reducer, threads, scale, thread_offset, all_threads=None, batch_si
             When NamedBarrier is used, delegates to run_hopper.
             Supports both scalar (x is a value) and batched (x is a pointer) modes.
             """
+            if self.hierarchical:
+                return self._run_hierarchical(x, red_buf)
             if self.use_named_barrier:
                 return self.run_hopper(x, red_buf)
 
@@ -507,8 +597,17 @@ def AllReduce(reducer, threads, scale, thread_offset, all_threads=None, batch_si
                 return x
             else:
                 return AllReduce(
-                    self.reducer, offset, self.scale, self.thread_offset, self.all_threads, self.batch_size, self.workspace_stride
+                    self.reducer,
+                    offset,
+                    self.scale,
+                    self.thread_offset,
+                    self.all_threads,
+                    self.batch_size,
+                    self.workspace_stride,
                 ).run(x, red_buf)
+
+        def run_batch(self, x, red_buf: cute.Pointer = None):
+            return self.run(x, red_buf)
 
         def run_hopper(self, x, red_buf: cute.Pointer = None):
             """
@@ -516,6 +615,9 @@ def AllReduce(reducer, threads, scale, thread_offset, all_threads=None, batch_si
             Based on tl::AllReduce<...>::run_hopper from reduce.h
             Supports both scalar and batched modes.
             """
+            if self.hierarchical:
+                return self._run_hierarchical(x, red_buf)
+
             offset = self.threads // 2
             tidx, _, _ = cute.arch.thread_idx()
             if offset >= 32:
@@ -548,7 +650,23 @@ def AllReduce(reducer, threads, scale, thread_offset, all_threads=None, batch_si
                 return x
             else:
                 return AllReduce(
-                    self.reducer, offset, self.scale, self.thread_offset, self.all_threads, self.batch_size, self.workspace_stride
+                    self.reducer,
+                    offset,
+                    self.scale,
+                    self.thread_offset,
+                    self.all_threads,
+                    self.batch_size,
+                    self.workspace_stride,
                 ).run_hopper(x, red_buf)
 
-    return AllReduceInstance(reducer, threads, scale, thread_offset, barrier_threads, use_named_barrier, batch_size, workspace_stride)
+    return AllReduceInstance(
+        reducer,
+        threads,
+        scale,
+        thread_offset,
+        barrier_threads,
+        use_named_barrier,
+        batch_size,
+        workspace_stride,
+        hierarchical,
+    )

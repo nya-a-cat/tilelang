@@ -232,11 +232,18 @@ template <int all_threads> struct NamedBarrier {
 //                     sharing synchronization barriers across all values.
 //                     Default 1 preserves the original scalar behaviour.
 //   workspace_stride - stride between per-channel slices in the shared-memory
-//                     workspace (typically total threads in the block).
-//                     Only used when batch_size > 1.
+//                     workspace. This is typically total threads in the block,
+//                     or physical warps for the hierarchical path. Only used
+//                     when batch_size > 1.
+//   hierarchical    - use warp-local reductions followed by a compact
+//                     per-warp aggregate reduction. Lowering enables this only
+//                     for one contiguous, scale-1 participant group of at
+//                     least two physical warps. The path has one barrier
+//                     after publishing the aggregates; callers must order any
+//                     preceding reuse of the workspace.
 template <class Reducer, int threads, int scale, int thread_offset = 0,
           class Barrier = SyncThreadsBarrier, int batch_size = 1,
-          int workspace_stride = 0>
+          int workspace_stride = 0, bool hierarchical = false>
 struct AllReduce {
   static_assert(threads > 0, "tl::AllReduce threads must be positive");
   static_assert(scale > 0, "tl::AllReduce scale must be positive");
@@ -245,11 +252,25 @@ struct AllReduce {
   static_assert(((threads / scale) & (threads / scale - 1)) == 0,
                 "AllReduce reduce width (threads / scale) must be a power of "
                 "two");
+  static_assert(!hierarchical || scale == 1,
+                "hierarchical AllReduce requires scale == 1");
+  static_assert(!hierarchical || thread_offset == 0,
+                "hierarchical AllReduce requires thread_offset == 0");
+  static_assert(!hierarchical || threads >= 64,
+                "hierarchical AllReduce requires at least two warps");
+  static_assert(!hierarchical || threads <= 1024,
+                "hierarchical AllReduce supports at most one CUDA CTA");
+  static_assert(!hierarchical || batch_size == 1 ||
+                                  workspace_stride >= threads / 32,
+                "hierarchical AllReduce workspace stride must cover all "
+                "warp aggregates");
 
   // Scalar interface (backward-compatible).
   template <typename T> static TL_DEVICE T run(T x, T *red_buf = nullptr) {
     if constexpr (threads == scale) {
       return x;
+    } else if constexpr (hierarchical) {
+      return hierarchical_reduce_scalar(x, red_buf);
     } else {
       return butterfly_reduce_scalar(x, red_buf);
     }
@@ -261,6 +282,8 @@ struct AllReduce {
   static TL_DEVICE void run_batch(T *x, T *red_buf = nullptr) {
     if constexpr (threads == scale) {
       return;
+    } else if constexpr (hierarchical) {
+      hierarchical_reduce_batch(x, red_buf);
     } else {
       butterfly_reduce_batch(x, red_buf);
     }
@@ -268,7 +291,52 @@ struct AllReduce {
 
 private:
   using Next = AllReduce<Reducer, threads / 2, scale, thread_offset, Barrier,
-                         batch_size, workspace_stride>;
+                         batch_size, workspace_stride, false>;
+
+  template <typename T> static TL_DEVICE T reduce_warp_aggregates(T x) {
+    constexpr int kWarps = threads / 32;
+#pragma unroll
+    for (int offset = kWarps / 2; offset > 0; offset >>= 1) {
+      x = Reducer()(x, tl::shfl_xor_sync(uint32_t(-1), x, offset));
+    }
+    return x;
+  }
+
+  template <typename T>
+  static TL_DEVICE T hierarchical_reduce_scalar(T x, T *red_buf) {
+    constexpr int kWarps = threads / 32;
+    x = warp_reduce(x, Reducer());
+    const int lane = threadIdx.x & 31;
+    if (lane == 0) {
+      red_buf[threadIdx.x >> 5] = x;
+    }
+    Barrier::template sync<1>();
+    x = red_buf[lane & (kWarps - 1)];
+    return reduce_warp_aggregates(x);
+  }
+
+  template <typename T>
+  static TL_DEVICE void hierarchical_reduce_batch(T *x, T *red_buf) {
+    constexpr int kWarps = threads / 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int i = 0; i < batch_size; ++i) {
+      x[i] = warp_reduce(x[i], Reducer());
+    }
+    if (lane == 0) {
+#pragma unroll
+      for (int i = 0; i < batch_size; ++i) {
+        red_buf[warp + i * workspace_stride] = x[i];
+      }
+    }
+    Barrier::template sync<1>();
+#pragma unroll
+    for (int i = 0; i < batch_size; ++i) {
+      x[i] = red_buf[(lane & (kWarps - 1)) + i * workspace_stride];
+      x[i] = reduce_warp_aggregates(x[i]);
+    }
+  }
 
   template <typename T>
   static TL_DEVICE T butterfly_reduce_scalar(T x, T *red_buf) {
@@ -325,22 +393,32 @@ TL_DEVICE T warp_reduce(T value, ReduceOp op) {
   constexpr uint32_t mask = 0xffffffff;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) &&                       \
     (defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM100_F))
-  float value_cast = 0.0f;
-  if constexpr (std::is_same_v<T, half_t>) {
-    value_cast = __half2float(value);
-  } else if constexpr (std::is_same_v<T, bfloat16_t>) {
-    value_cast = __bfloat162float(value);
-  } else {
-    value_cast = static_cast<float>(value);
-  }
-  if constexpr (std::is_same_v<ReduceOp, MaxOp> && !std::is_integral_v<T>) {
+  constexpr bool kReduxF32Type = std::is_same_v<T, float> ||
+                                 std::is_same_v<T, half_t> ||
+                                 std::is_same_v<T, bfloat16_t>;
+  if constexpr (std::is_same_v<ReduceOp, MaxOp> && kReduxF32Type) {
+    float value_cast;
+    if constexpr (std::is_same_v<T, half_t>) {
+      value_cast = __half2float(value.to_half());
+    } else if constexpr (std::is_same_v<T, bfloat16_t>) {
+      value_cast = __bfloat162float(value.to_nv_bfloat16());
+    } else {
+      value_cast = value;
+    }
     float res;
     asm("redux.sync.max.f32 %0, %1, %2;"
         : "=f"(res)
         : "f"(value_cast), "r"(mask));
     return static_cast<T>(res);
-  } else if constexpr (std::is_same_v<ReduceOp, MinOp> &&
-                       !std::is_integral_v<T>) {
+  } else if constexpr (std::is_same_v<ReduceOp, MinOp> && kReduxF32Type) {
+    float value_cast;
+    if constexpr (std::is_same_v<T, half_t>) {
+      value_cast = __half2float(value.to_half());
+    } else if constexpr (std::is_same_v<T, bfloat16_t>) {
+      value_cast = __bfloat162float(value.to_nv_bfloat16());
+    } else {
+      value_cast = value;
+    }
     float res;
     asm("redux.sync.min.f32 %0, %1, %2;"
         : "=f"(res)

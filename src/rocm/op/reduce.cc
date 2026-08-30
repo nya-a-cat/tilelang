@@ -25,6 +25,18 @@ struct Reduce : backend::ReduceLowerer<Reduce> {
     return 1;
   }
 
+  static bool SupportsBatchPackedAllReduce(Target) { return false; }
+
+  static int GetAllReduceWorkspaceStride(int, int, PrimExpr, PrimExpr,
+                                         int fallback_stride, Target) {
+    return fallback_stride;
+  }
+
+  static bool AllReduceHasLeadingBarrier(int, int, PrimExpr, PrimExpr,
+                                         Target) {
+    return true;
+  }
+
   static std::string MakeBatchAllReduce(std::string reducer,
                                         int reducing_threads, int scale,
                                         PrimExpr thread_offset, PrimExpr,

@@ -205,13 +205,45 @@ inline void CheckAllReduceWidth(int reducing_threads, int scale,
       << ", scale=" << scale << ")";
 }
 
+/*! \brief Whether a reduction can use the hierarchical warp-aggregate path.
+ *
+ * The fast path assumes one contiguous reduction group beginning at thread
+ * zero. It first reduces within physical warps, then reduces the per-warp
+ * aggregates. Requiring the declared participant range to equal the reduce
+ * width excludes replicated groups that would otherwise alias the compact
+ * per-warp workspace. Two warps is the first case that needs shared memory;
+ * the hierarchical path replaces its two butterfly barriers with one.
+ */
+inline bool CanUseHierarchicalAllReduce(int reducing_threads, int scale,
+                                        PrimExpr thread_offset,
+                                        PrimExpr participants, int warp_size) {
+  // The CUDA template uses 32-lane shuffle masks and indexes one workspace
+  // slot per physical warp.  Reject any target whose declared warp size does
+  // not match that contract instead of silently generating mismatched code.
+  if (scale != 1 || warp_size != 32 ||
+      reducing_threads < 2 * warp_size ||
+      reducing_threads % warp_size != 0) {
+    return false;
+  }
+  const int num_warps = reducing_threads / warp_size;
+  if (num_warps > warp_size || (num_warps & (num_warps - 1)) != 0) {
+    return false;
+  }
+  const int64_t *offset = as_const_int(thread_offset);
+  const int64_t *participant_count = as_const_int(participants);
+  return offset != nullptr && *offset == 0 && participant_count != nullptr &&
+         *participant_count == reducing_threads;
+}
+
 /*! \brief Expose an implementation-owned leading barrier to ThreadSync.
  *
- * The AllReduce templates enter their shared-memory butterfly with a barrier
- * before touching the workspace.  Once shared-workspace allocations are
- * merged, this barrier also orders reuse against a preceding collective.  Keep
- * that fact explicit in TIR so ThreadSync does not insert a second barrier it
- * cannot otherwise see through call_extern.
+ * The fallback AllReduce templates enter their shared-memory butterfly with a
+ * barrier before touching the workspace. Once shared-workspace allocations
+ * are merged, this barrier also orders reuse against a preceding collective.
+ * Keep that fact explicit in TIR so ThreadSync does not insert a second
+ * barrier it cannot otherwise see through call_extern. The hierarchical path
+ * intentionally has no leading barrier and is left unmarked, so ThreadSync
+ * orders any preceding workspace reuse.
  *
  * A non-zero thread offset is intentionally left unmarked.  Such collectives
  * synchronize only a sub-range of a CTA; ThreadSync must retain its conservative
@@ -221,10 +253,14 @@ inline void CheckAllReduceWidth(int reducing_threads, int scale,
  */
 template <typename Impl>
 inline Stmt MarkAllReduceLeadingBarrier(Stmt stmt, int reducing_threads,
-                                        PrimExpr thread_offset,
+                                        int scale, PrimExpr thread_offset,
                                         PrimExpr participants, Target target) {
   int warp_size = Impl::WarpSize(target);
   if (reducing_threads / 2 < warp_size) {
+    return stmt;
+  }
+  if (!Impl::AllReduceHasLeadingBarrier(reducing_threads, scale,
+                                        thread_offset, participants, target)) {
     return stmt;
   }
   const int64_t *offset = as_const_int(thread_offset);
@@ -1044,24 +1080,30 @@ template <typename Impl> struct ReduceLowerer {
 
           int vsize = Impl::GetPreferredVectorizedSize(op, lower_args.target);
           bool can_batch_pack =
+              Impl::SupportsBatchPackedAllReduce(lower_args.target) &&
               vsize > 1 && batch >= vsize && batch % vsize == 0 &&
               reduce::MakeCodegenReducer(op, vsize).has_value();
           int eff_batch = can_batch_pack ? (batch / vsize) : batch;
           std::string reducer =
               reduce::MakeCodegenReducer(op, can_batch_pack ? vsize : 1)
                   .value();
+          int workspace_stride = Impl::GetAllReduceWorkspaceStride(
+              reducing_threads, thread_step.scale, thread_offset,
+              lower_args.thread_bounds->extent, block_threads,
+              lower_args.target);
           std::string allreduce = Impl::MakeBatchAllReduce(
               reducer, reducing_threads, thread_step.scale, thread_offset,
-              lower_args.thread_bounds->extent, eff_batch, block_threads,
+              lower_args.thread_bounds->extent, eff_batch, workspace_stride,
               lower_args.target);
 
           DataType ws_dtype = can_batch_pack
                                   ? clear_buffer->dtype.with_lanes(vsize)
                                   : clear_buffer->dtype;
           PrimExpr workspace;
-          bool need_workspace = reducing_threads > 32;
+          bool need_workspace =
+              reducing_threads > Impl::WarpSize(lower_args.target);
           if (need_workspace) {
-            int ws_size = block_threads * eff_batch;
+            int ws_size = workspace_stride * eff_batch;
             workspace = lower_args.add_workspace(ws_size, ws_dtype);
           }
 
@@ -1127,7 +1169,8 @@ template <typename Impl> struct ReduceLowerer {
               Stmt allreduce_stmt = Evaluate(
                   Call(DataType::Handle(), builtin::call_extern(), args));
               phases.push_back(reduce::MarkAllReduceLeadingBarrier<Impl>(
-                  std::move(allreduce_stmt), reducing_threads, thread_offset,
+                  std::move(allreduce_stmt), reducing_threads,
+                  thread_step.scale, thread_offset,
                   lower_args.thread_bounds->extent, lower_args.target));
 
               Var unpack_j("unpack_j");
@@ -1172,8 +1215,12 @@ template <typename Impl> struct ReduceLowerer {
               if (need_workspace) {
                 args.push_back(workspace);
               }
-              phases.push_back(Evaluate(
-                  Call(DataType::Handle(), builtin::call_extern(), args)));
+              Stmt allreduce_stmt = Evaluate(
+                  Call(DataType::Handle(), builtin::call_extern(), args));
+              phases.push_back(reduce::MarkAllReduceLeadingBarrier<Impl>(
+                  std::move(allreduce_stmt), reducing_threads,
+                  thread_step.scale, thread_offset,
+                  lower_args.thread_bounds->extent, lower_args.target));
             }
           }
         }
@@ -1236,7 +1283,7 @@ template <typename Impl> struct ReduceLowerer {
                                     "tl.reduce");
         auto thread_offset = lower_args.thread_bounds->min;
         PrimExpr all_threads = lower_args.thread_bounds->extent;
-        if (reducing_threads > 32 &&
+        if (reducing_threads > Impl::WarpSize(lower_args.target) &&
             TargetSupportsNamedBarrier(lower_args.target)) {
           Range thread_range = reduce::ResolveAllReduceThreadRange(
               red_layout, lower_args.thread_bounds, lower_args.target);
@@ -1248,9 +1295,12 @@ template <typename Impl> struct ReduceLowerer {
             thread_step.scale, thread_offset, all_threads, lower_args.target);
         Array<PrimExpr> thread_reduce_args = {
             StringImm(allreduce), BufferLoad(clear_buffer, red_indices)};
-        if (reducing_threads > 32) {
-          int workspace_size =
+        if (reducing_threads > Impl::WarpSize(lower_args.target)) {
+          int block_threads =
               static_cast<int>(*as_const_int(lower_args.thread_bounds->extent));
+          int workspace_size = Impl::GetAllReduceWorkspaceStride(
+              reducing_threads, thread_step.scale, thread_offset, all_threads,
+              block_threads, lower_args.target);
           PrimExpr workspace =
               lower_args.add_workspace(workspace_size, clear_buffer->dtype);
           thread_reduce_args.push_back(workspace);
@@ -1259,8 +1309,8 @@ template <typename Impl> struct ReduceLowerer {
                          thread_reduce_args);
         Stmt allreduce_stmt = BufferStore(clear_buffer, call, red_indices);
         stmts.push_back(reduce::MarkAllReduceLeadingBarrier<Impl>(
-            std::move(allreduce_stmt), reducing_threads, thread_offset,
-            all_threads, lower_args.target));
+            std::move(allreduce_stmt), reducing_threads, thread_step.scale,
+            thread_offset, all_threads, lower_args.target));
       }
 
       PrimExpr predicate = Bool(true);
