@@ -445,6 +445,31 @@ def test_tiled_ws_places_producer_in_first_warp_group():
     assert "if 128 <= tx:" not in script
 
 
+def test_tiled_ws_codegen_keeps_pipeline_mainloops_rolled():
+    """Auto-WS rolls long mainloops but leaves short fixed loops optimizable."""
+
+    func = matmul_pipelined(1024, 1024, 1024, 128, 32, 128, num_stages=2)
+    target = {"kind": "cuda", "arch": "sm_100a"}
+    with tvm.transform.PassContext(), tvm.target.Target(target):
+        artifact = tilelang.lower(func, target=target, enable_device_compile=False)
+    source = artifact.kernel_source
+
+    assert source is not None
+    # Auto-WS creates one producer and one consumer mainloop.  Inner loops
+    # explicitly marked T.unroll keep their normal unroll directives.
+    assert source.count("#pragma unroll 1") == 2
+    assert source.count("for (int k") >= 2
+    assert "#pragma unroll\n" in source
+
+    short_func = matmul_pipelined(1024, 1024, 128, 128, 32, 128, num_stages=2)
+    with tvm.transform.PassContext(), tvm.target.Target(target):
+        short_artifact = tilelang.lower(short_func, target=target, enable_device_compile=False)
+    short_source = short_artifact.kernel_source
+
+    assert short_source is not None
+    assert "#pragma unroll 1" not in short_source
+
+
 @tilelang.testing.requires_cuda
 def test_tiled_ws_accepts_int64_pipeline_indices():
     """Inductor-style TIR may use int64 shapes and loop extents."""

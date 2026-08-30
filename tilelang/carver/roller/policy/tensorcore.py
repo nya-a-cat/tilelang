@@ -9,7 +9,7 @@ from ..node import PrimFuncNode
 from .common import coalesced_factor, factorize, get_all_factors
 from .default import DefaultPolicy
 from ..rasterization import NoRasterization, Rasterization2DColumn
-from ...arch import is_rdna_arch
+from ...arch import has_async_copy, is_cuda_arch, is_rdna_arch
 
 logger = logging.getLogger(__name__)
 
@@ -22,34 +22,59 @@ class TensorCorePolicy(DefaultPolicy):
     use_async_copy: bool = False
     block_reduction_depth: int | None = None
 
-    def _init_with_prim_func(self, func: tvm.tirx.PrimFunc, name: str | None = None):
-        super()._init_with_prim_func(func, name)
+    def _init_with_output_nodes(self, output_nodes):
+        super()._init_with_output_nodes(output_nodes)
         self._legalize_info()
         return self
 
+    def _get_policy_tag(self, name: str):
+        """Return a consistent policy tag across all fused nodes."""
+        values = [node.get_tag(name) for node in self.ordered_nodes]
+        values = [value for value in values if value is not None]
+        if not values:
+            return None
+        first = values[0]
+        if any(value != first for value in values[1:]):
+            raise ValueError(f"conflicting {name} tags in one TensorCorePolicy: {values}")
+        return first
+
     def _legalize_info(self):
-        pipleline_stage = self.prim_func_node.get_tag("pipeline_stage")
-        if pipleline_stage:
-            self.pipeline_stage = pipleline_stage
+        pipeline_stage = self._get_policy_tag("pipeline_stage")
+        has_explicit_pipeline_override = self.tags.get("pipeline_stage") is not None
+        # Fused tensor-core graphs keep multiple accumulator fragments live at
+        # once.  On pre-Hopper CUDA, adding another software-pipeline stage can
+        # cut occupancy through register pressure (for example fused attention),
+        # while Hopper+ moves the mainloop to TMA/warp-specialized machinery.
+        # Keep a caller-provided policy tag authoritative; otherwise use one
+        # stage for fused pre-Hopper graphs and two stages for simple GEMMs and
+        # Hopper-or-newer graphs.
+        prefer_single_stage_fusion = (
+            is_cuda_arch(self.arch) and self.arch.sm_version < 90 and len(self.ordered_nodes) > 1 and not has_explicit_pipeline_override
+        )
+        if prefer_single_stage_fusion:
+            self.pipeline_stage = 1
+        elif pipeline_stage is not None:
+            self.pipeline_stage = int(pipeline_stage)
+            if self.pipeline_stage < 1:
+                raise ValueError(f"pipeline_stage must be at least 1, got {self.pipeline_stage}")
         else:
             if is_rdna_arch(self.arch):
                 self.pipeline_stage = self.arch.tuning.pipeline_stage
-            elif self.arch.compute_capability in {"sm_80", "sm_90", "sm_90a"}:
+            elif has_async_copy(self.arch):
                 self.pipeline_stage = 2
             else:
                 self.pipeline_stage = 1
-        use_async_copy = self.prim_func_node.get_tag("use_async_copy")
-        if use_async_copy:
-            self.use_async_copy = use_async_copy
+
+        use_async_copy = self._get_policy_tag("use_async_copy")
+        if use_async_copy is not None:
+            self.use_async_copy = bool(use_async_copy) and has_async_copy(self.arch) and self.pipeline_stage > 1
         else:
-            if self.arch.compute_capability in {"sm_80", "sm_90", "sm_90a"}:
-                self.use_async_copy = True
-            else:
-                self.use_async_copy = False
+            self.use_async_copy = has_async_copy(self.arch) and self.pipeline_stage > 1
+
         # TODO: block reduction depth is not used for now.
         # As there still exists some performance issues for block reduction.
-        block_reduction_depth = self.prim_func_node.get_tag("block_reduction_depth")
-        if block_reduction_depth:
+        block_reduction_depth = self._get_policy_tag("block_reduction_depth")
+        if block_reduction_depth is not None:
             self.block_reduction_depth = block_reduction_depth
 
     def _compute_tc_strides(
@@ -344,7 +369,7 @@ class TensorCorePolicy(DefaultPolicy):
         # only support single node for now
         conditions.append(len(self.ordered_nodes) > 1)
         # only on Ampere+ arch
-        conditions.append(self.arch.compute_capability < "80")
+        conditions.append(not is_cuda_arch(self.arch) or self.arch.sm_version < 80)
 
         def _check_memory_size():
             overall_gmem_size_in_bytes: int = 0

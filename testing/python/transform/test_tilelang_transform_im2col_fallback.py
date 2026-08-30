@@ -1,9 +1,9 @@
 import pytest
-import tvm
 
 import tilelang
 import tilelang.language as T
 import tilelang.testing
+from tilelang import tvm
 
 
 def _make_im2col_kernel(use_deprecated_alias=False, channels=32, block_K=32, block_M=16, hw=8):
@@ -47,7 +47,7 @@ def _make_im2col_kernel(use_deprecated_alias=False, channels=32, block_K=32, blo
 def _lower_to_cuda_source(func, arch):
     target = {"kind": "cuda", "arch": arch}
     with tvm.transform.PassContext(), tvm.target.Target(target):
-        artifact = tilelang.lower(func, target=target)
+        artifact = tilelang.lower(func, target=target, enable_device_compile=False)
     assert artifact.kernel_source is not None
     return artifact.kernel_source
 
@@ -63,6 +63,24 @@ def test_im2col_uses_simt_fallback_before_hopper():
 def test_im2col_uses_tma_on_hopper():
     src = _lower_to_cuda_source(_make_im2col_kernel(), "sm_90")
     assert "tma_load_im2col" in src
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_120a"])
+def test_im2col_uses_tma_on_blackwell_compile_only(arch):
+    src = _lower_to_cuda_source(_make_im2col_kernel(), arch)
+    assert "tma_load_im2col" in src
+    assert "mbarrier_mem" in src
+    assert "prefetch_tma_descriptor" in src
+    assert "warpgroup_reg_dealloc" in src
+
+
+@pytest.mark.parametrize("arch", ["sm_90", "sm_100", "sm_120"])
+def test_im2col_portable_target_omits_feature_specific_reg_reconfiguration(arch):
+    src = _lower_to_cuda_source(_make_im2col_kernel(), arch)
+    assert "tma_load_im2col" in src
+    assert "mbarrier_mem" in src
+    assert "warpgroup_reg_dealloc" not in src
+    assert "warpgroup_reg_alloc" not in src
 
 
 @tilelang.testing.requires_cuda

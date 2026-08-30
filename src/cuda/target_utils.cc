@@ -121,6 +121,17 @@ bool TargetHasBulkCopy(Target target) {
   return arch >= 90;
 }
 
+bool TargetHasRegReconfiguration(Target target) {
+  if (!TargetHasBulkCopy(target))
+    return false;
+  const std::string arch = target->GetAttr<ffi::String>("arch").value();
+  // PTX setmaxnreg is an architecture/family-specific feature. NVCC accepts
+  // it for exact `a` and family `f` targets, but rejects it for portable base
+  // targets such as sm_90, sm_100, and sm_120.
+  const char feature_suffix = arch.back();
+  return feature_suffix == 'a' || feature_suffix == 'f';
+}
+
 bool TargetSupportsNamedBarrier(Target target) {
   if (!TargetIsCuda(target))
     return false;
@@ -291,7 +302,9 @@ TVM_FFI_STATIC_INIT_BLOCK() {
             *ret = TargetHasStmatrix(target, is_m16n8);
           })
       .def("tl.TargetHasBulkCopy",
-           [](Target target) { return TargetHasBulkCopy(target); });
+           [](Target target) { return TargetHasBulkCopy(target); })
+      .def("tl.TargetHasRegReconfiguration",
+           [](Target target) { return TargetHasRegReconfiguration(target); });
 }
 
 } // namespace tl

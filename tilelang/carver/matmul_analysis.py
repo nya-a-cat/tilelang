@@ -18,7 +18,7 @@ from .analysis import (
 from tvm.target.target import Target
 from tvm.tirx.stmt_functor import pre_order_visit
 from .arch import get_arch, is_tensorcore_supported_precision
-from .arch.cuda import check_sm_version
+from .arch.cuda import check_sm_version, sm_supports_async_copy
 from .arch.rdna import _get_rdna_tuning_config
 from tilelang.rocm.target import target_get_mcpu, target_is_rdna
 import logging
@@ -564,8 +564,8 @@ def get_tensorized_func_and_tags(
         # analysis pipeline stage
         # todo(lei): maybe we can integrate this into policy in the future
         tags["pipeline_stage"] = 1
-        if target.kind.name == "cuda" and check_sm_version(target.attrs.get("arch", "")) in {80, 90}:
-            # enable pipeline stage only for sm_80 devices
+        cuda_sm_version = check_sm_version(target.attrs.get("arch", "")) if target.kind.name == "cuda" else -1
+        if target.kind.name == "cuda" and sm_supports_async_copy(cuda_sm_version):
             tags["pipeline_stage"] = 2
         elif is_rdna_wmma_target(target):
             tags["pipeline_stage"] = _get_rdna_tuning_config(target_get_mcpu(target)).pipeline_stage
@@ -573,7 +573,7 @@ def get_tensorized_func_and_tags(
         # analysis async copy
         # todo(lei): maybe we can integrate this into policy in the future
         tags["use_async_copy"] = False
-        if target.kind.name == "cuda" and tags["pipeline_stage"] == 2 and check_sm_version(target.attrs.get("arch", "")) in {80, 90}:
+        if target.kind.name == "cuda" and tags["pipeline_stage"] > 1 and sm_supports_async_copy(cuda_sm_version):
             # async copy only works in software pipeline.
             tags["use_async_copy"] = True
 

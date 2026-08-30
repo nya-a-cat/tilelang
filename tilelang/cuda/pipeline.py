@@ -21,6 +21,7 @@ from tilelang.contrib.nvcc import (
     have_pdl,
     have_tma,
 )
+from tilelang.cuda.target import target_has_reg_reconfiguration
 from tilelang.transform import PassContext
 
 
@@ -265,7 +266,7 @@ def CUDAPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.MergeIfStmt()(mod)
 
-    if allow_warp_specialized(pass_ctx=pass_ctx, target=target):
+    if allow_warp_specialized(pass_ctx=pass_ctx, target=target) and target_has_reg_reconfiguration(target):
         mod = tilelang.cuda.transform.AnnotateWarpGroupRegAlloc()(mod)
 
     mod = tilelang.transform.MakePackedAPI()(mod)

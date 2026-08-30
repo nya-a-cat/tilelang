@@ -775,10 +775,10 @@ TileStmtKind ClassifyStmt(const Stmt &stmt, Target target) {
         if (auto *copy = tile_op.as<CopyNode>()) {
           return ClassifyCopy(copy, target);
         }
-        // Im2Col lowers to tma_load_im2col on Hopper — treat as TMA
-        // producer so it goes to the producer warp group.
+        // Im2Col lowers to tma_load_im2col on TMA-capable CUDA targets. Treat
+        // it as a TMA producer so it goes to the producer warp group.
         if (tile_op.as<Im2ColOpNode>()) {
-          if (TargetIsHopper(target)) {
+          if (TargetHasBulkCopy(target)) {
             return TileStmtKind::kTmaProducer;
           }
         }
@@ -1970,6 +1970,11 @@ private:
         loop_annos.Set(key, value);
       }
     }
+    // The producer and consumer remain software-pipeline mainloops even
+    // though WS owns their overlap and the active pipeline annotations above
+    // must be removed.  Preserve a non-semantic codegen hint so NVCC does not
+    // fully duplicate a constant-trip mainloop.
+    loop_annos.Set("tl_no_implicit_unroll", Bool(true));
 
     For producer_loop(loop_var, loop_min, loop_extent, ForKind::kSerial,
                       producer_body, Optional<IterVar>(), loop_annos);

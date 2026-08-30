@@ -573,20 +573,17 @@ def have_tensorcore(compute_version=None, target=None):
         isn't specified.
     """
     if compute_version is None:
-        if tvm.cuda(0).exist:
-            compute_version = tvm.cuda(0).compute_version
-        else:
-            if target is None or "arch" not in target.attrs:
-                warnings.warn(
-                    "Tensorcore will be disabled due to no CUDA architecture specified. "
-                    "Specify it with a target config such as {'kind': 'cuda', 'arch': 'sm_90'}.",
-                    stacklevel=2,
-                )
-                return False
-            compute_version = target.attrs["arch"]
-            # Compute version will be in the form "sm_{major}{minor}"
-            major, minor = compute_version.split("_")[1]
-            compute_version = major + "." + minor
+        try:
+            # Keep all target spellings (including sm_100a/sm_103a/sm_120a)
+            # on the single parser used by the rest of the CUDA backend.
+            compute_version = get_target_compute_version(target)
+        except ValueError:
+            warnings.warn(
+                "Tensorcore will be disabled due to no CUDA architecture specified. "
+                "Specify it with a target config such as {'kind': 'cuda', 'arch': 'sm_90'}.",
+                stacklevel=2,
+            )
+            return False
     major, _ = parse_compute_version(compute_version)
     return major >= 7
 

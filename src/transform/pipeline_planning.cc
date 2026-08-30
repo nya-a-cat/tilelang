@@ -127,11 +127,11 @@ void BufferRegionCollector::HandleTileOp(const TileOperator &tile_op) {
       is_global_copy_pattern_ = true;
     }
   }
-  // Im2Col always uses TMA on Hopper.
+  // Im2Col uses TMA on CUDA targets that support tensor bulk copy.
   if (const auto *im2col = tile_op.as<Im2ColOpNode>()) {
     if (IsGlobalLikeBuffer(im2col->src_) && IsSharedBuffer(im2col->dst_)) {
       is_global_copy_pattern_ = true;
-      if (TargetIsHopper(target_)) {
+      if (TargetHasBulkCopy(target_)) {
         is_tma_copy_ = true;
       }
     }
@@ -627,7 +627,7 @@ public:
         return;
       }
       pinfo->copy_stage = true;
-      pinfo->tma_copy = TargetIsHopper(target_);
+      pinfo->tma_copy = TargetHasBulkCopy(target_);
     }
   }
 
