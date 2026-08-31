@@ -36,27 +36,12 @@ download_verified() {
   echo "${sha256}  ${destination}" | sha256sum --check --status
 }
 
-ccache_version="4.13.6"
-ccache_archive="${download_dir}/ccache-${ccache_version}-linux-x86_64-musl-static.tar.xz"
-ccache_url="https://github.com/ccache/ccache/releases/download/v${ccache_version}/ccache-${ccache_version}-linux-x86_64-musl-static.tar.xz"
-ccache_sha256="156ec57c5198cc849d92834023d09910b83dc5504c6cf405d09e6ae7b208a3e5"
-
 ninja_version="1.13.2"
 ninja_archive="${download_dir}/ninja-linux-${ninja_version}.zip"
 ninja_url="https://github.com/ninja-build/ninja/releases/download/v${ninja_version}/ninja-linux.zip"
 ninja_sha256="5749cbc4e668273514150a80e387a957f933c6ed3f5f11e03fb30955e2bbead6"
 
-download_verified "${ccache_url}" "${ccache_sha256}" "${ccache_archive}"
 download_verified "${ninja_url}" "${ninja_sha256}" "${ninja_archive}"
-
-if [[ ! -x "${bin_dir}/ccache" ]] || [[ "$("${bin_dir}/ccache" --version | head -n 1)" != "ccache version ${ccache_version}" ]]; then
-  extract_dir="$(mktemp -d "${cache_root}/ccache-extract.XXXXXX")"
-  trap 'rm -rf -- "${extract_dir}"' EXIT
-  tar -xJf "${ccache_archive}" -C "${extract_dir}"
-  install -m 0755 "${extract_dir}/ccache-${ccache_version}-linux-x86_64-musl-static/ccache" "${bin_dir}/ccache"
-  rm -rf -- "${extract_dir}"
-  trap - EXIT
-fi
 
 if [[ ! -x "${bin_dir}/ninja" ]] || [[ "$("${bin_dir}/ninja" --version)" != "${ninja_version}" ]]; then
   extract_dir="$(mktemp -d "${cache_root}/ninja-extract.XXXXXX")"
@@ -68,7 +53,6 @@ if [[ ! -x "${bin_dir}/ninja" ]] || [[ "$("${bin_dir}/ninja" --version)" != "${n
 fi
 
 export PATH="${bin_dir}:${PATH}"
-ccache --version | head -n 1
 ninja --version
 
 dnf config-manager --add-repo https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
@@ -78,21 +62,23 @@ dnf_args=(
   --setopt=keepcache=True
   --setopt=metadata_expire=-1
 )
-cuda_packages=(
+toolchain_packages=(
+  ccache-3.7.7-1.el8
   cuda-minimal-build-13-0-13.0.3-1
   cuda-driver-devel-13-0-13.0.96-1
   cuda-nvrtc-devel-13-0-13.0.88-1
 )
 
 if [[ "${cache_hit}" == "true" ]]; then
-  dnf "${dnf_args[@]}" --cacheonly install -y "${cuda_packages[@]}"
+  dnf "${dnf_args[@]}" --cacheonly install -y "${toolchain_packages[@]}"
   install_mode="cache_only"
 else
-  dnf "${dnf_args[@]}" install -y "${cuda_packages[@]}"
+  dnf "${dnf_args[@]}" install -y "${toolchain_packages[@]}"
   install_mode="network_fill"
 fi
 
 export PATH="/usr/local/cuda/bin:${PATH}"
+ccache --version | head -n 1
 
 {
   echo "install_mode=${install_mode}"

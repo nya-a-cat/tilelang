@@ -134,9 +134,9 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/ccache
-          key: colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-${{ steps.source.outputs.native_fingerprint }}
+          key: colab-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-${{ steps.source.outputs.native_fingerprint }}
           restore-keys: |
-            colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-
+            colab-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-
           save-always: true
 
       - name: Restore exact native build tree
@@ -189,7 +189,7 @@ jobs:
 
           if [[ "${TILELANG_COLAB_BUILD_MODE}" == "fast-cuda" ]]; then
             {
-              echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=${container_toolchain_dir}/bin:/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=OFF CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=string:tilelang-manylinux-${MANYLINUX_IMAGE_DIGEST}-cuda130 CCACHE_SLOPPINESS=include_file_ctime,include_file_mtime"
+              echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=${container_toolchain_dir}/bin:/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=OFF CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content"
               echo "CIBW_TEST_SKIP=*"
               echo "CIBW_REPAIR_WHEEL_COMMAND_LINUX=ccache --show-stats | tee /host${GITHUB_WORKSPACE}/ccache-stats.txt && cp {wheel} {dest_dir}"
               echo "CIBW_AUDIT_COMMAND="
@@ -197,7 +197,7 @@ jobs:
             } >> "${GITHUB_ENV}"
           else
             {
-              echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=${container_toolchain_dir}/bin:/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=ON CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=string:tilelang-manylinux-${MANYLINUX_IMAGE_DIGEST}-cuda130 CCACHE_SLOPPINESS=include_file_ctime,include_file_mtime"
+              echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=${container_toolchain_dir}/bin:/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=ON CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content"
               echo "CIBW_REPAIR_WHEEL_COMMAND_LINUX=ccache --show-stats | tee /host${GITHUB_WORKSPACE}/ccache-stats.txt && auditwheel -v repair --exclude libtvm_ffi.so --exclude 'libz3.so*' --exclude libcuda.so.1 --exclude '/usr/local/cuda*' -w {dest_dir} {wheel}"
             } >> "${GITHUB_ENV}"
           fi
@@ -222,15 +222,17 @@ jobs:
           test -d build
           printf '%s\n' \
             "fingerprint=${NATIVE_FINGERPRINT} manylinux=${MANYLINUX_IMAGE_DIGEST} cuda=${CUDA_VERSION} mode=${TILELANG_COLAB_BUILD_MODE}" \
-            > build/.tilelang-ci-cache-identity
+            | sudo tee build/.tilelang-ci-cache-identity >/dev/null
 
       - name: Record compiler cache statistics
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -x .cache/ci-toolchain/bin/ccache ]]; then
-            .cache/ci-toolchain/bin/ccache --show-stats | tee ccache-stats.txt
+          if [[ -s ccache-stats.txt ]]; then
+            cat ccache-stats.txt
+          elif command -v ccache >/dev/null 2>&1; then
+            ccache --show-stats | tee ccache-stats.txt
           else
             echo "Host ccache executable unavailable; cache files remain under ${CCACHE_DIR}." | tee ccache-stats.txt
           fi
