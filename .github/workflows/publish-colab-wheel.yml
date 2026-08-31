@@ -11,6 +11,14 @@ on:
         description: Exact source commit built by that run
         required: true
         type: string
+      expected_build_mode:
+        description: Verified artifact policy
+        required: true
+        default: release-fat
+        type: choice
+        options:
+          - release-fat
+          - fast-cuda
 
 permissions:
   actions: read
@@ -28,6 +36,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          EXPECTED_BUILD_MODE: ${{ inputs.expected_build_mode }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -37,17 +46,30 @@ jobs:
           revisions="$(find dist -type f -name source-revisions.txt -print -quit)"
           cache_stats="$(find dist -type f -name ccache-stats.txt -print -quit)"
           build_storage="$(find dist -type f -name build-storage.txt -print -quit)"
+          toolchain_provenance="$(find dist -type f -name toolchain-provenance.txt -print -quit)"
           test -n "${wheel}"
           test -n "${checksum_file}"
           test -n "${revisions}"
           test -n "${cache_stats}"
           test -n "${build_storage}"
+          test -n "${toolchain_provenance}"
           actual_source_sha="$(awk -F= '$1 == "commit" { print $2; exit }' "${revisions}")"
           build_mode="$(awk -F= '$1 == "build_mode" { print $2; exit }' "${revisions}")"
           test_policy="$(awk -F= '$1 == "test_policy" { print $2; exit }' "${revisions}")"
           test "${actual_source_sha}" = "${EXPECTED_HEAD_SHA}"
-          test "${build_mode}" = "release-fat"
-          test "${test_policy}" = "cibuildwheel_import"
+          test "${build_mode}" = "${EXPECTED_BUILD_MODE}"
+          case "${EXPECTED_BUILD_MODE}" in
+            release-fat)
+              test "${test_policy}" = "cibuildwheel_import"
+              ;;
+            fast-cuda)
+              test "${test_policy}" = "compile_only_unrepaired_wheel"
+              ;;
+            *)
+              echo "Unsupported build mode: ${EXPECTED_BUILD_MODE}" >&2
+              exit 2
+              ;;
+          esac
           expected_hash="$(awk 'NR == 1 { print $1 }' "${checksum_file}")"
           actual_hash="$(sha256sum "${wheel}" | awk '{ print $1 }')"
           test "${actual_hash}" = "${expected_hash}"
@@ -58,27 +80,43 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          EXPECTED_BUILD_MODE: ${{ inputs.expected_build_mode }}
         run: |
           set -euo pipefail
-          tag="colab-wheel-${EXPECTED_HEAD_SHA}"
+          if [[ "${EXPECTED_BUILD_MODE}" == "release-fat" ]]; then
+            tag="colab-wheel-${EXPECTED_HEAD_SHA}"
+            title="Colab wheel ${EXPECTED_HEAD_SHA:0:12}"
+            notes="Fork-only CUDA+ROCm wheel for remote Colab validation. The attached provenance records the exact source, submodules, import-test policy, compiler-cache statistics, build storage, and SHA-256."
+          else
+            tag="colab-fast-${EXPECTED_HEAD_SHA}"
+            title="Colab fast CUDA wheel ${EXPECTED_HEAD_SHA:0:12}"
+            notes="Fork-only fast CUDA development wheel. GitHub Actions verified compilation, exact source and dependency identities, compiler-cache statistics, build storage, toolchain provenance, and SHA-256. This unrepaired artifact skips import tests and remains pending GPU validation."
+          fi
           wheel="$(find dist -type f -name '*.whl' -print -quit)"
           checksum="$(find dist -type f -name SHA256SUMS -print -quit)"
           revisions="$(find dist -type f -name source-revisions.txt -print -quit)"
           cache_stats="$(find dist -type f -name ccache-stats.txt -print -quit)"
           build_storage="$(find dist -type f -name build-storage.txt -print -quit)"
+          toolchain_provenance="$(find dist -type f -name toolchain-provenance.txt -print -quit)"
+          tvm_sdk_provenance="$(find dist -type f -name tvm-sdk-provenance.txt -print -quit)"
           test -n "${wheel}"
           test -n "${checksum}"
           test -n "${revisions}"
           test -n "${cache_stats}"
           test -n "${build_storage}"
+          test -n "${toolchain_provenance}"
           if ! gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release create "${tag}" \
               --repo "${GITHUB_REPOSITORY}" \
               --target "${EXPECTED_HEAD_SHA}" \
               --prerelease \
-              --title "Colab wheel ${EXPECTED_HEAD_SHA:0:12}" \
-              --notes "Fork-only CUDA+ROCm wheel for remote Colab validation. The attached provenance records the exact source, submodules, import-test policy, compiler-cache statistics, build storage, and SHA-256."
+              --title "${title}" \
+              --notes "${notes}"
           fi
-          gh release upload "${tag}" "${wheel}" "${checksum}" "${revisions}" "${cache_stats}" "${build_storage}" \
+          assets=("${wheel}" "${checksum}" "${revisions}" "${cache_stats}" "${build_storage}" "${toolchain_provenance}")
+          if [[ -n "${tvm_sdk_provenance}" ]]; then
+            assets+=("${tvm_sdk_provenance}")
+          fi
+          gh release upload "${tag}" "${assets[@]}" \
             --repo "${GITHUB_REPOSITORY}" --clobber
           gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" --json url --jq .url
