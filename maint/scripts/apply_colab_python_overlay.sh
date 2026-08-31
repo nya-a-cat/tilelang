@@ -38,9 +38,11 @@ if [[ ! -f "${package_dir}/__init__.py" || ! -d "${package_dir}/lib" ]]; then
     exit 2
 fi
 
+identity_members=0
 while IFS= read -r member; do
     case "${member}" in
         tilelang/*.py|tilelang/*.pyi|tilelang/*.md) ;;
+        tilelang/_python_overlay_identity.json) ((identity_members += 1)) ;;
         *)
             echo "Unsafe or unsupported overlay member: ${member}" >&2
             exit 2
@@ -51,6 +53,11 @@ while IFS= read -r member; do
         exit 2
     fi
 done < <(tar -tzf "${overlay_archive}")
+
+if [[ "${identity_members}" -ne 1 ]]; then
+    echo "Overlay archive must contain exactly one runtime identity file." >&2
+    exit 2
+fi
 
 native_hash_before="$(
     find "${package_dir}/lib" -type f -print0 \
@@ -63,6 +70,7 @@ native_hash_before="$(
 find "${package_dir}" \
     \( -path "${package_dir}/lib" -o -path "${package_dir}/src" -o -path "${package_dir}/3rdparty" \) -prune \
     -o -type f \( -name '*.py' -o -name '*.pyi' -o -name '*.md' -o -name '*.pyc' \) -delete
+rm -f -- "${package_dir}/_python_overlay_identity.json"
 find "${package_dir}" -depth -type d -name __pycache__ -empty \
     ! -path "${package_dir}/lib/*" \
     ! -path "${package_dir}/src/*" \
@@ -80,10 +88,13 @@ native_hash_after="$(
 test "${native_hash_before}" = "${native_hash_after}"
 
 ${python_bin} - <<'PY'
+import json
 from pathlib import Path
 import tilelang
 
 package_dir = Path(tilelang.__file__).resolve().parent
+identity = json.loads((package_dir / "_python_overlay_identity.json").read_text())
 print(f"TileLang Python overlay active at {package_dir}")
 print(f"TileLang version from native base wheel: {tilelang.__version__}")
+print(f"TileLang Python overlay source: {identity['source_sha']}")
 PY

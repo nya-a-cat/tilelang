@@ -31,6 +31,7 @@ from tilelang.jit.diagnostics import jit_phase
 from tilelang.transform.pass_config import normalize_pass_configs
 from tilelang.contrib.hip_resource_info import dump_to_file, load_from_file
 from tilelang import __version__
+from tilelang._build_identity import get_python_overlay_stamp
 
 
 class KernelCache:
@@ -140,6 +141,9 @@ class KernelCache:
     @staticmethod
     def _get_base_key() -> dict:
         base = {"version": __version__}
+        overlay_stamp = get_python_overlay_stamp()
+        if overlay_stamp:
+            base["python_overlay"] = overlay_stamp
         if env.should_use_kernel_cache_lib_stamp():
             lib_stamp = KernelCache._get_tilelang_lib_stamp()
             if lib_stamp:

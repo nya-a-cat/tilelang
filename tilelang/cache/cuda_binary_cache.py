@@ -12,6 +12,7 @@ from hashlib import sha256
 from typing import Any
 
 from tilelang import __version__
+from tilelang._build_identity import get_python_overlay_stamp
 from tilelang.env import env
 
 
@@ -111,6 +112,9 @@ class CUDABinaryCache:
             "compile_format": compile_format,
             "options": tuple(options or []),
         }
+        overlay_stamp = get_python_overlay_stamp()
+        if overlay_stamp:
+            key_data["python_overlay"] = overlay_stamp
         if env.should_use_kernel_cache_lib_stamp():
             lib_stamp = cls._get_tilelang_lib_stamp()
             if lib_stamp:

@@ -37,6 +37,7 @@ from tilelang.utils.language import get_prim_func_name
 from tilelang.utils.device import get_available_cpu_count
 from tilelang.autotuner.capture import get_autotune_inputs
 from tilelang import __version__
+from tilelang._build_identity import get_python_overlay_stamp
 
 TargetLike = str | dict[str, object] | Target
 
@@ -354,6 +355,9 @@ class AutoTuner:
             "compile_args": hash(self.compile_args),
             "profile_args": hash(self.profile_args),
         }
+        overlay_stamp = get_python_overlay_stamp()
+        if overlay_stamp:
+            key_data["python_overlay"] = overlay_stamp
         # Sort keys to ensure consistency
         key_string = json.dumps(key_data, sort_keys=True)
         return hashlib.sha256(key_string.encode()).hexdigest()

@@ -98,13 +98,31 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p overlay
-          find tilelang -type f \( -name '*.py' -o -name '*.pyi' -o -name '*.md' \) -print0 \
+          jq -n \
+            --arg schema "tilelang-python-overlay-identity-v1" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg source_sha "${SOURCE_SHA}" \
+            --arg native_base_sha "${BASE_SHA}" \
+            '{
+              schema: $schema,
+              repository: $repository,
+              source_sha: $source_sha,
+              native_base_sha: $native_base_sha
+            }' > tilelang/_python_overlay_identity.json
+
+          find tilelang -type f \( \
+              -name '*.py' -o \
+              -name '*.pyi' -o \
+              -name '*.md' -o \
+              -path 'tilelang/_python_overlay_identity.json' \
+            \) -print0 \
             | sort -z > overlay-files.txt
           tar --null -czf overlay/tilelang-python-overlay.tar.gz -T overlay-files.txt
           cp maint/scripts/apply_colab_python_overlay.sh overlay/
           chmod +x overlay/apply_colab_python_overlay.sh
 
           overlay_sha256="$(sha256sum overlay/tilelang-python-overlay.tar.gz | awk '{ print $1 }')"
+          runtime_identity_sha256="$(sha256sum tilelang/_python_overlay_identity.json | awk '{ print $1 }')"
           changed_json="$(jq -Rsc 'split("\n") | map(select(length > 0))' changed-files.txt)"
           jq -n \
             --arg schema "tilelang-colab-python-overlay-v1" \
@@ -113,6 +131,7 @@ jobs:
             --arg native_base_sha "${BASE_SHA}" \
             --arg native_base_tag "${BASE_TAG}" \
             --arg overlay_sha256 "${overlay_sha256}" \
+            --arg runtime_identity_sha256 "${runtime_identity_sha256}" \
             --argjson base_wheel "${BASE_WHEEL}" \
             --argjson changed_files "${changed_json}" \
             '{
@@ -123,6 +142,7 @@ jobs:
               native_base_tag: $native_base_tag,
               base_wheel: $base_wheel,
               overlay_sha256: $overlay_sha256,
+              runtime_identity_sha256: $runtime_identity_sha256,
               changed_files: $changed_files,
               compatibility: "pure-python-source-overlay"
             }' | tee overlay/overlay-manifest.json
