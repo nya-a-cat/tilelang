@@ -68,14 +68,19 @@ class BenchmarkCase:
 
 
 def run(command: list[str], *, capture: bool = False, env: dict[str, str] | None = None) -> str:
-    completed = subprocess.run(
-        command,
-        check=True,
-        text=True,
-        env=env,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.STDOUT if capture else None,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            text=True,
+            env=env,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.STDOUT if capture else None,
+        )
+    except subprocess.CalledProcessError as error:
+        if capture and error.stdout:
+            raise RuntimeError(f"command failed with exit code {error.returncode}:\n{error.stdout}") from error
+        raise
     return completed.stdout.strip() if capture else ""
 
 

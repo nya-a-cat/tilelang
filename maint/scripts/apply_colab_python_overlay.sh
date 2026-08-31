@@ -69,7 +69,8 @@ native_hash_before="$(
 
 find "${package_dir}" \
     \( -path "${package_dir}/lib" -o -path "${package_dir}/src" -o -path "${package_dir}/3rdparty" \) -prune \
-    -o -type f \( -name '*.py' -o -name '*.pyi' -o -name '*.md' -o -name '*.pyc' \) -delete
+    -o -type f \( -name '*.py' -o -name '*.pyi' -o -name '*.md' -o -name '*.pyc' \) \
+    -exec rm -f -- {} +
 rm -f -- "${package_dir}/_python_overlay_identity.json"
 find "${package_dir}" -depth -type d -name __pycache__ -empty \
     ! -path "${package_dir}/lib/*" \
