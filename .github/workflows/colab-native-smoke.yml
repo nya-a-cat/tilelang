@@ -1,0 +1,255 @@
+name: Fast native compile smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact commit or ref to compile
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: colab-native-smoke-${{ inputs.source_ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-compile-smoke:
+    name: Ubuntu 22.04 CUDA native compile only
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CUDA_VERSION: "13.0"
+      MANYLINUX_IMAGE_DIGEST: 012f4a50472412f18bb2b450c1cce7158434cfae4ae878591c2748a13a30c2be
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+          submodules: false
+          persist-credentials: false
+
+      - name: Resolve exact native dependency revisions
+        id: native-deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          cutlass_sha="$(git ls-tree HEAD 3rdparty/cutlass | awk '{ print $3 }')"
+          tvm_sha="$(git ls-tree HEAD 3rdparty/tvm | awk '{ print $3 }')"
+          [[ "${cutlass_sha}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${tvm_sha}" =~ ^[0-9a-f]{40}$ ]]
+          echo "cutlass_sha=${cutlass_sha}" >> "${GITHUB_OUTPUT}"
+          echo "tvm_sha=${tvm_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore exact native dependency trees
+        id: native-deps-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .git/modules/3rdparty
+            3rdparty/cutlass
+            3rdparty/tvm
+          key: tilelang-native-deps-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-deps.outputs.cutlass_sha }}-${{ steps.native-deps.outputs.tvm_sha }}-${{ hashFiles('.gitmodules') }}
+
+      - name: Initialize and verify exact native dependency trees
+        shell: bash
+        env:
+          CUTLASS_SHA: ${{ steps.native-deps.outputs.cutlass_sha }}
+          TVM_SHA: ${{ steps.native-deps.outputs.tvm_sha }}
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          if [[ "${{ steps.native-deps-cache.outputs.cache-hit }}" != "true" ]]; then
+            git submodule update --init --recursive --depth 1 --jobs "$(getconf _NPROCESSORS_ONLN)"
+          else
+            git submodule update --init --recursive --no-fetch
+          fi
+          test "$(git -C 3rdparty/cutlass rev-parse HEAD)" = "${CUTLASS_SHA}"
+          test "$(git -C 3rdparty/tvm rev-parse HEAD)" = "${TVM_SHA}"
+          git submodule status --recursive | tee submodule-revisions.txt
+          if grep -Eq '^[-+U]' submodule-revisions.txt; then
+            echo "Native dependency cache is incomplete or does not match the pinned revisions." >&2
+            exit 2
+          fi
+
+      - name: Save verified native dependency trees
+        if: steps.native-deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .git/modules/3rdparty
+            3rdparty/cutlass
+            3rdparty/tvm
+          key: tilelang-native-deps-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-deps.outputs.cutlass_sha }}-${{ steps.native-deps.outputs.tvm_sha }}-${{ hashFiles('.gitmodules') }}
+
+      - name: Resolve exact native build fingerprints
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          native_fingerprint="$({
+            git ls-tree -r HEAD -- \
+              CMakeLists.txt \
+              cmake \
+              pyproject.toml \
+              src \
+              3rdparty/hip-headers \
+              tilelang/jit/adapter/cython/cython_wrapper.pyx
+            cat submodule-revisions.txt
+          } | sha256sum | awk '{ print $1 }')"
+          tvm_sdk_fingerprint="$({
+            git ls-tree -r HEAD -- \
+              CMakeLists.txt \
+              cmake \
+              pyproject.toml \
+              src/cpu/CMakeLists.txt \
+              src/cuda/CMakeLists.txt \
+              src/metal/CMakeLists.txt \
+              src/rocm/CMakeLists.txt \
+              src/webgpu/CMakeLists.txt \
+              src/runtime/logging.cc \
+              maint/scripts/install_cached_cuda_toolchain.sh \
+              maint/scripts/capture_prebuilt_tvm_sdk.sh
+            git ls-tree HEAD 3rdparty/tvm
+            echo "manylinux=${MANYLINUX_IMAGE_DIGEST}"
+            echo "cuda=${CUDA_VERSION}"
+            echo "backends=CUDA"
+          } | sha256sum | awk '{ print $1 }')"
+          echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
+          echo "native_fingerprint=${native_fingerprint}" >> "${GITHUB_OUTPUT}"
+          echo "tvm_sdk_fingerprint=${tvm_sdk_fingerprint}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore exact relocatable CUDA toolchain
+        id: toolchain-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/ci-toolchain
+          key: colab-toolchain-v2-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-${{ hashFiles('maint/scripts/install_cached_cuda_toolchain.sh', 'maint/scripts/use_cached_cuda_sysroot.sh') }}
+          fail-on-cache-miss: true
+
+      - name: Restore exact prebuilt TVM SDK
+        id: tvm-sdk-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/prebuilt-tvm
+          key: colab-wheel-tvm-sdk-v1-${{ runner.os }}-${{ runner.arch }}-cp310-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-${{ steps.source.outputs.tvm_sdk_fingerprint }}
+          fail-on-cache-miss: true
+
+      - name: Validate exact native build inputs
+        shell: bash
+        env:
+          TVM_SDK_FINGERPRINT: ${{ steps.source.outputs.tvm_sdk_fingerprint }}
+        run: |
+          set -euo pipefail
+          maint/scripts/use_cached_cuda_sysroot.sh \
+            "${GITHUB_WORKSPACE}/.cache/ci-toolchain" \
+            "${{ steps.toolchain-cache.outputs.cache-hit }}"
+          test "$(cat .cache/prebuilt-tvm/.tilelang-ci-cache-identity)" = \
+            "tvm_sdk_fingerprint=${TVM_SDK_FINGERPRINT}"
+          (
+            cd .cache/prebuilt-tvm
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Restore host native compiler cache
+        id: host-native-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/host-native-ccache
+          key: colab-host-native-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.source.outputs.native_fingerprint }}
+          restore-keys: |
+            colab-host-native-ccache-v1-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Configure host native compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          jobs="$(getconf _NPROCESSORS_ONLN)"
+          toolchain_root="${GITHUB_WORKSPACE}/.cache/ci-toolchain"
+          cuda_root="${toolchain_root}/cuda-13.0"
+          host_ccache_dir="${GITHUB_WORKSPACE}/.cache/host-native-ccache"
+          tvm_sdk_dir="${GITHUB_WORKSPACE}/.cache/prebuilt-tvm"
+          mkdir -p "${host_ccache_dir}"
+          {
+            echo "${toolchain_root}/bin"
+            echo "${cuda_root}/bin"
+          } >> "${GITHUB_PATH}"
+          {
+            echo "CMAKE_BUILD_PARALLEL_LEVEL=${jobs}"
+            echo "CMAKE_GENERATOR=Ninja"
+            echo "CUDAToolkit_ROOT=${cuda_root}"
+            echo "CUDA_HOME=${cuda_root}"
+            echo "LD_LIBRARY_PATH=${cuda_root}/lib64:${cuda_root}/lib64/stubs:${tvm_sdk_dir}"
+            echo "CCACHE_DIR=${host_ccache_dir}"
+            echo "CCACHE_MAXSIZE=1G"
+            echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "CCACHE_COMPILERCHECK=content"
+            echo "TILELANG_PREBUILT_TVM_LIB_DIR=${tvm_sdk_dir}"
+            echo "USE_CUDA=ON"
+            echo "USE_ROCM=OFF"
+          } >> "${GITHUB_ENV}"
+          echo "Using ${jobs} host build workers; host ccache exact hit=${{ steps.host-native-cache.outputs.cache-hit }}"
+
+      - name: Compile native CUDA targets
+        id: native-build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ccache --zero-stats
+          python_bin="$(command -v python3)"
+          cmake -S . -B build/native-smoke -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPython_EXECUTABLE="${python_bin}" \
+            -DPython3_EXECUTABLE="${python_bin}" \
+            -DTILELANG_PREBUILT_TVM_LIB_DIR="${TILELANG_PREBUILT_TVM_LIB_DIR}" \
+            -DTILELANG_RELEASE_BUILD=ON \
+            -DTILELANG_USE_CUDA_STUBS=ON \
+            -DUSE_Z3=OFF \
+            -DUSE_PYPI_Z3=OFF
+          cmake --build build/native-smoke \
+            --target tilelang cuda_stub cudart_stub nvrtc_stub \
+            --parallel "${CMAKE_BUILD_PARALLEL_LEVEL}"
+
+      - name: Record native compile evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p native-smoke-evidence
+          {
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "commit=${{ steps.source.outputs.commit }}"
+            echo "mode=host_native_compile_only"
+            echo "runner=ubuntu-22.04"
+            echo "cuda=13.0.88"
+            echo "tvm_sdk_fingerprint=${{ steps.source.outputs.tvm_sdk_fingerprint }}"
+            echo "native_fingerprint=${{ steps.source.outputs.native_fingerprint }}"
+            cmake --version | head -n 1
+            gcc --version | head -n 1
+            nvcc --version
+            ccache --show-stats
+            find build/native-smoke/lib -maxdepth 1 -type f -name '*.so' -print0 \
+              | sort -z \
+              | xargs -0 -r sha256sum
+          } | tee native-smoke-evidence/native-compile.txt
+
+      - name: Save host native compiler cache
+        if: steps.host-native-cache.outputs.cache-hit != 'true' && steps.native-build.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/host-native-ccache
+          key: colab-host-native-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.source.outputs.native_fingerprint }}
+
+      - name: Upload native compile evidence
+        if: steps.native-build.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tilelang-native-smoke-${{ steps.source.outputs.commit }}
+          path: native-smoke-evidence/*
+          if-no-files-found: error
+          retention-days: 7
