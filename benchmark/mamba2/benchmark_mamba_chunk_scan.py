@@ -1,12 +1,16 @@
 import argparse
 import torch
 import tilelang
-from tilelang.autotuner import *
+from tilelang.autotuner import autotune
 import tilelang.language as T
 from einops import rearrange, repeat
-import itertools
 import math
 from tilelang.profiler import do_bench
+
+try:
+    from .schedule_spaces import legacy_schedule_space
+except ImportError:
+    from schedule_spaces import legacy_schedule_space
 
 try:
     from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_fwd
@@ -176,8 +180,7 @@ def chunk_scan_helion(cb, x, dt, dA_cumsum, C, states, D):
 
 
 def get_configs():
-    iter_params = dict(block_M=[64, 128, 256], block_N=[32, 64], block_K=[64, 128, 256], block_Dstate=[128], num_stages=[1, 2, 3, 4, 5])
-    return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
+    return legacy_schedule_space()
 
 
 @autotune(configs=get_configs(), warmup=10, rep=10)

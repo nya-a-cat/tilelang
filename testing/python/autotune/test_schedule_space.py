@@ -1,0 +1,150 @@
+"""CPU-only tests for deterministic autotuning schedule spaces."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from tilelang.autotuner import ScheduleConstraint, ScheduleSpace, TargetProfile, requires_feature, within_target_limit
+from benchmark.mamba2.schedule_spaces import LEGACY_PARAMETER_NAMES, legacy_schedule_space, research_schedule_space
+
+
+def test_cartesian_space_preserves_deterministic_order_and_json_compatibility():
+    space = ScheduleSpace({"block_M": [64, 128], "num_stages": [1, 2]}, fixed={"threads": 128})
+
+    assert space == [
+        {"threads": 128, "block_M": 64, "num_stages": 1},
+        {"threads": 128, "block_M": 64, "num_stages": 2},
+        {"threads": 128, "block_M": 128, "num_stages": 1},
+        {"threads": 128, "block_M": 128, "num_stages": 2},
+    ]
+    assert json.loads(json.dumps(space)) == space
+    assert space.summary()["raw_cardinality"] == 4
+    assert space.summary()["accepted_cardinality"] == 4
+
+
+def test_named_constraints_filter_and_report_first_rejection():
+    space = ScheduleSpace(
+        {"block_M": [64, 128], "num_stages": [1, 2, 3]},
+        constraints=[
+            ScheduleConstraint("small_tiles_use_two_stages", lambda config, _target: config["block_M"] != 64 or config["num_stages"] <= 2),
+            ScheduleConstraint("large_tiles_use_one_stage", lambda config, _target: config["block_M"] != 128 or config["num_stages"] == 1),
+        ],
+    )
+
+    assert space == [
+        {"block_M": 64, "num_stages": 1},
+        {"block_M": 64, "num_stages": 2},
+        {"block_M": 128, "num_stages": 1},
+    ]
+    assert space.rejection_counts == {"small_tiles_use_two_stages": 1, "large_tiles_use_one_stage": 2}
+
+
+def test_explicit_target_features_gate_backend_specific_choices():
+    target = TargetProfile.from_target(
+        {"kind": "cuda", "arch": "sm_90a"},
+        features={"persistent_grid", "bulk_copy"},
+    )
+    space = ScheduleSpace(
+        {
+            "grid_mapping": ["spatial", "persistent"],
+            "copy_policy": ["auto", "bulk"],
+            "threads": [128],
+        },
+        target=target,
+        constraints=[
+            requires_feature("grid_mapping", ["persistent"], "persistent_grid"),
+            requires_feature("copy_policy", ["bulk"], "bulk_copy"),
+        ],
+    )
+
+    assert len(space) == 4
+    assert target.backend == "cuda"
+    assert target.arch == "sm_90a"
+
+
+def test_missing_target_feature_rejects_only_gated_choice():
+    target = TargetProfile.from_target("cuda -arch=sm_80")
+    space = ScheduleSpace(
+        {"copy_policy": ["auto", "bulk"]},
+        target=target,
+        constraints=[requires_feature("copy_policy", ["bulk"], "bulk_copy")],
+    )
+
+    assert space == [{"copy_policy": "auto"}]
+    assert space.rejection_counts == {"copy_policy_requires_bulk_copy": 1}
+
+
+def test_rocm_target_string_is_parsed_without_importing_a_device_runtime():
+    target = TargetProfile.from_target("rocm -mcpu=gfx942", features={"mfma"})
+
+    assert target.backend == "rocm"
+    assert target.arch == "gfx942"
+    assert target.has("mfma")
+
+
+def test_target_resource_limit_filters_threads():
+    target = TargetProfile("webgpu", limits={"max_threads_per_block": 256})
+    space = ScheduleSpace(
+        {"threads": [128, 256, 512]},
+        target=target,
+        constraints=[within_target_limit("threads", "max_threads_per_block")],
+    )
+
+    assert space == [{"threads": 128}, {"threads": 256}]
+
+
+def test_mamba_legacy_space_is_preserved_exactly():
+    space = legacy_schedule_space()
+
+    assert len(space) == 90
+    assert space[0] == {"block_M": 64, "block_N": 32, "block_K": 64, "block_Dstate": 128, "num_stages": 1}
+    assert space[-1] == {"block_M": 256, "block_N": 64, "block_K": 256, "block_Dstate": 128, "num_stages": 5}
+
+
+def test_mamba_research_space_contains_every_legacy_configuration():
+    target = TargetProfile(
+        "cuda",
+        "sm_90a",
+        features=frozenset({"persistent_grid", "async_copy", "warp_specialization"}),
+        limits={"max_threads_per_block": 1024},
+    )
+    legacy = legacy_schedule_space()
+    research = research_schedule_space(target)
+    legacy_projection = {tuple(config[name] for name in LEGACY_PARAMETER_NAMES) for config in legacy}
+    research_projection = {tuple(config[name] for name in LEGACY_PARAMETER_NAMES) for config in research}
+
+    assert research.raw_cardinality == 2_880
+    assert len(research) == 2_880
+    assert legacy_projection <= research_projection
+
+
+def test_mamba_research_space_capability_filter_is_conservative():
+    target = TargetProfile("cuda", "sm_80", limits={"max_threads_per_block": 128})
+    research = research_schedule_space(target)
+
+    assert len(research) == 180
+    assert {config["threads"] for config in research} == {128}
+    assert {config["schedule_grid_mapping"] for config in research} == {"spatial"}
+    assert {config["schedule_copy_policy"] for config in research} == {"auto"}
+    assert {config["schedule_warp_specialization"] for config in research} == {False}
+
+
+def test_space_explosion_is_rejected_before_materialization():
+    with pytest.raises(ValueError, match="exceeding max_candidates=100"):
+        ScheduleSpace({"x": range(11), "y": range(10)}, max_candidates=100)
+
+
+@pytest.mark.parametrize(
+    ("parameters", "message"),
+    [
+        ({"bad-name": [1]}, "valid Python identifier"),
+        ({"threads": []}, "has no values"),
+        ({"threads": [128, 128]}, "duplicate value"),
+        ({"copy_policy": "auto"}, "iterable of choices"),
+    ],
+)
+def test_invalid_spaces_fail_early(parameters, message):
+    with pytest.raises((TypeError, ValueError), match=message):
+        ScheduleSpace(parameters)

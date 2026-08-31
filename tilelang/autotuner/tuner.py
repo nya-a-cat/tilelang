@@ -17,7 +17,7 @@ from tvm.target import Target
 import inspect
 from functools import partial
 from typing import Generic, Literal, Any, ParamSpec, TypeVar
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from tqdm.auto import tqdm
 import logging
 import concurrent.futures
@@ -42,6 +42,8 @@ from tilelang._build_identity import get_python_overlay_stamp
 TargetLike = str | dict[str, object] | Target
 
 ConfigArg = dict[str, Any]
+ConfigFactory = Callable[..., Sequence[ConfigArg]]
+ConfigSpace = Sequence[ConfigArg] | ConfigFactory
 UnitItem = tuple[int, ConfigArg]
 UnitResult = tuple[int, ConfigArg, tilelang.JITKernel | None, Exception | None]
 CompileUnit = tuple[list[UnitItem], dict | None]
@@ -122,7 +124,7 @@ class AutoTuner:
     _lock = threading.Lock()  # For thread safety
     _memory_cache = {}  # In-memory cache dictionary
 
-    def __init__(self, fn: Callable, configs):
+    def __init__(self, fn: Callable, configs: ConfigSpace):
         self.fn = fn
         self.configs = configs
         self.ref_latency_cache = None
@@ -142,7 +144,7 @@ class AutoTuner:
         return self._get_cache_dir()
 
     @classmethod
-    def from_kernel(cls, kernel: Callable, configs):
+    def from_kernel(cls, kernel: Callable, configs: ConfigSpace):
         """Create an AutoTuner instance from a kernel function.
 
         Args:
@@ -1190,7 +1192,7 @@ class AutoTuneImpl(Generic[_P, _T]):
     warmup: int = 25
     rep: int = 100
     timeout: int = 100
-    configs: dict | Callable = None
+    configs: ConfigSpace | None = None
     supply_type: tilelang.TensorSupplyType = tilelang.TensorSupplyType.Auto
     ref_prog: Callable = None
     supply_prog: Callable = None
@@ -1322,7 +1324,7 @@ class AutoTuneImpl(Generic[_P, _T]):
 def autotune(  # This is the new public interface
     func: Callable[_P, _T] | PrimFunc | None = None,
     *,  # Indicates subsequent arguments are keyword-only
-    configs: dict | Callable,
+    configs: ConfigSpace,
     # profile arguments
     warmup: int = 25,
     rep: int = 100,
@@ -1363,8 +1365,10 @@ def autotune(  # This is the new public interface
         If using `@tilelang.jit(...)` to configure, this is the `out_idx` parameter.
         If using `@tilelang.jit` directly on a function, this argument is implicitly
         the function to be decorated (and `out_idx` will be `None`).
-    configs : Dict or Callable
-        Configuration space to explore during auto-tuning.
+    configs : Sequence[Dict] or Callable
+        Configuration space to explore during auto-tuning. ``ScheduleSpace``
+        can be passed directly; a callable may construct a space from runtime
+        kernel arguments.
     warmup : int, optional
         Number of warmup iterations before timing.
     rep : int, optional
