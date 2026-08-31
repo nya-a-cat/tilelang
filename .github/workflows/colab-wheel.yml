@@ -2,12 +2,17 @@ name: Build Colab wheel
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact commit or ref to build
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: colab-wheel-${{ github.ref }}
+  group: colab-wheel-${{ inputs.source_ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,15 +29,19 @@ jobs:
       - name: Checkout exact source and submodules
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ inputs.source_ref }}
           fetch-depth: 1
           submodules: recursive
 
       - name: Record source revisions
+        id: source
         shell: bash
         run: |
+          commit="$(git rev-parse HEAD)"
+          echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
           {
             echo "repository=${GITHUB_REPOSITORY}"
-            echo "commit=$(git rev-parse HEAD)"
+            echo "commit=${commit}"
             git submodule status --recursive
           } | tee source-revisions.txt
 
@@ -53,7 +62,7 @@ jobs:
       - name: Upload Colab artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: tilelang-colab-linux-x86_64-${{ github.sha }}
+          name: tilelang-colab-linux-x86_64-${{ steps.source.outputs.commit }}
           path: wheelhouse/*
           if-no-files-found: error
           retention-days: 7
