@@ -39,8 +39,8 @@ jobs:
         id: manylinux-image-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .cache/manylinux-image
-          key: colab-manylinux-image-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.MANYLINUX_IMAGE_DIGEST }}
+          path: ${{ runner.temp }}/tilelang-manylinux-image
+          key: colab-manylinux-image-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.MANYLINUX_IMAGE_DIGEST }}
 
       - name: Start pinned manylinux image preparation
         shell: bash
@@ -48,7 +48,7 @@ jobs:
           set -euo pipefail
           pinned_image="quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
           local_image="tilelang-manylinux:2_28-${MANYLINUX_IMAGE_DIGEST:0:12}"
-          cache_dir="${GITHUB_WORKSPACE}/.cache/manylinux-image"
+          cache_dir="${RUNNER_TEMP}/tilelang-manylinux-image"
           pull_log="${RUNNER_TEMP}/tilelang-manylinux-pull.log"
           pull_pid="${RUNNER_TEMP}/tilelang-manylinux-pull.pid"
           pull_mode="${RUNNER_TEMP}/tilelang-manylinux-pull.mode"
@@ -282,7 +282,7 @@ jobs:
           set -euo pipefail
           pinned_image="quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
           local_image="tilelang-manylinux:2_28-${MANYLINUX_IMAGE_DIGEST:0:12}"
-          cache_dir="${GITHUB_WORKSPACE}/.cache/manylinux-image"
+          cache_dir="${RUNNER_TEMP}/tilelang-manylinux-image"
           pull_log="${RUNNER_TEMP}/tilelang-manylinux-pull.log"
           pull_pid_file="${RUNNER_TEMP}/tilelang-manylinux-pull.pid"
           pull_mode_file="${RUNNER_TEMP}/tilelang-manylinux-pull.mode"
@@ -340,7 +340,7 @@ jobs:
           else
             echo "Host ccache executable unavailable; cache files remain under ${CCACHE_DIR}." | tee ccache-stats.txt
           fi
-          du -sh .cache/ccache .cache/ci-toolchain .cache/prebuilt-tvm .cache/manylinux-image 2>/dev/null | tee build-storage.txt || true
+          du -sh .cache/ccache .cache/ci-toolchain .cache/prebuilt-tvm "${RUNNER_TEMP}/tilelang-manylinux-image" 2>/dev/null | tee build-storage.txt || true
 
       - name: Capture pinned manylinux image archive
         if: steps.manylinux-image-cache.outputs.cache-hit != 'true' && steps.wheel-build.outcome == 'success'
@@ -348,7 +348,7 @@ jobs:
         run: |
           set -euo pipefail
           local_image="tilelang-manylinux:2_28-${MANYLINUX_IMAGE_DIGEST:0:12}"
-          cache_dir="${GITHUB_WORKSPACE}/.cache/manylinux-image"
+          cache_dir="${RUNNER_TEMP}/tilelang-manylinux-image"
           archive="${cache_dir}/manylinux-image.tar.zst"
           mkdir -p "${cache_dir}"
           rm -f -- "${archive}.tmp"
@@ -370,8 +370,8 @@ jobs:
         if: steps.manylinux-image-cache.outputs.cache-hit != 'true' && steps.wheel-build.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .cache/manylinux-image
-          key: colab-manylinux-image-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.MANYLINUX_IMAGE_DIGEST }}
+          path: ${{ runner.temp }}/tilelang-manylinux-image
+          key: colab-manylinux-image-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.MANYLINUX_IMAGE_DIGEST }}
 
       - name: Save relocatable CUDA toolchain cache
         if: steps.toolchain-cache.outputs.cache-hit != 'true' && steps.wheel-build.outcome == 'success'
