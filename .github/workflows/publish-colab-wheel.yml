@@ -35,15 +35,23 @@ jobs:
           wheel="$(find dist -type f -name '*.whl' -print -quit)"
           checksum_file="$(find dist -type f -name SHA256SUMS -print -quit)"
           revisions="$(find dist -type f -name source-revisions.txt -print -quit)"
+          cache_stats="$(find dist -type f -name ccache-stats.txt -print -quit)"
+          build_storage="$(find dist -type f -name build-storage.txt -print -quit)"
           test -n "${wheel}"
           test -n "${checksum_file}"
           test -n "${revisions}"
+          test -n "${cache_stats}"
+          test -n "${build_storage}"
           actual_source_sha="$(awk -F= '$1 == "commit" { print $2; exit }' "${revisions}")"
+          build_mode="$(awk -F= '$1 == "build_mode" { print $2; exit }' "${revisions}")"
+          test_policy="$(awk -F= '$1 == "test_policy" { print $2; exit }' "${revisions}")"
           test "${actual_source_sha}" = "${EXPECTED_HEAD_SHA}"
+          test "${build_mode}" = "release-fat"
+          test "${test_policy}" = "cibuildwheel_import"
           expected_hash="$(awk 'NR == 1 { print $1 }' "${checksum_file}")"
           actual_hash="$(sha256sum "${wheel}" | awk '{ print $1 }')"
           test "${actual_hash}" = "${expected_hash}"
-          echo "Verified ${wheel}: ${actual_hash}"
+          echo "Verified ${wheel}: ${actual_hash}; mode=${build_mode}; tests=${test_policy}"
 
       - name: Publish prerelease assets in this fork
         shell: bash
@@ -56,17 +64,21 @@ jobs:
           wheel="$(find dist -type f -name '*.whl' -print -quit)"
           checksum="$(find dist -type f -name SHA256SUMS -print -quit)"
           revisions="$(find dist -type f -name source-revisions.txt -print -quit)"
+          cache_stats="$(find dist -type f -name ccache-stats.txt -print -quit)"
+          build_storage="$(find dist -type f -name build-storage.txt -print -quit)"
           test -n "${wheel}"
           test -n "${checksum}"
           test -n "${revisions}"
+          test -n "${cache_stats}"
+          test -n "${build_storage}"
           if ! gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release create "${tag}" \
               --repo "${GITHUB_REPOSITORY}" \
               --target "${EXPECTED_HEAD_SHA}" \
               --prerelease \
               --title "Colab wheel ${EXPECTED_HEAD_SHA:0:12}" \
-              --notes "Fork-only reusable wheel for remote Colab validation. Source and submodule revisions plus SHA-256 are attached."
+              --notes "Fork-only CUDA+ROCm wheel for remote Colab validation. The attached provenance records the exact source, submodules, import-test policy, compiler-cache statistics, build storage, and SHA-256."
           fi
-          gh release upload "${tag}" "${wheel}" "${checksum}" "${revisions}" \
+          gh release upload "${tag}" "${wheel}" "${checksum}" "${revisions}" "${cache_stats}" "${build_storage}" \
             --repo "${GITHUB_REPOSITORY}" --clobber
           gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" --json url --jq .url
