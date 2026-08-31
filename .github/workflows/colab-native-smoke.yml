@@ -1030,6 +1030,14 @@ jobs:
           print(f"selftest_libtilelang_sha256={library_hash}")
           PY
 
+          (
+            cd native-overlay-evidence
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | LC_ALL=C sort -z \
+              | xargs -0 -r sha256sum \
+              > SHA256SUMS
+          )
+
       - name: Save direct native compiler cache
         if: always() && steps.manylinux-native-cache.outputs.cache-hit != 'true' && steps.native-build.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
