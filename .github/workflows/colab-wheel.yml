@@ -170,9 +170,7 @@ jobs:
 
           if [[ "${TILELANG_COLAB_BUILD_MODE}" == "fast-cuda" ]]; then
             {
-              # The fast build reads an immutable checkout. Allow direct-mode
-              # hits for freshly restored headers while retaining content checks.
-              echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=${container_toolchain_dir}/bin:/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=OFF CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content CCACHE_SLOPPINESS=include_file_ctime,include_file_mtime"
+              echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=${container_toolchain_dir}/bin:/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=OFF CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content"
               echo "CIBW_TEST_SKIP=*"
               echo "CIBW_REPAIR_WHEEL_COMMAND_LINUX=ccache --show-stats | tee /host${GITHUB_WORKSPACE}/ccache-stats.txt && cp {wheel} {dest_dir}"
               echo "CIBW_AUDIT_COMMAND="
