@@ -44,15 +44,27 @@ jobs:
           source_sha="$(git rev-parse HEAD)"
           git fetch --no-tags --depth=1 origin "${NATIVE_BASE_REF}"
           base_sha="$(git rev-parse FETCH_HEAD)"
-          base_tag="colab-wheel-${base_sha}"
-
-          base_wheel="$(
-            gh release view "${base_tag}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --json assets \
-              --jq '[.assets[] | select(.name | endswith(".whl"))][0] | {name: .name, url: .url, digest: .digest}'
-          )"
-          test "${base_wheel}" != "null"
+          base_tag=""
+          base_wheel=""
+          for candidate_tag in "colab-fast-${base_sha}" "colab-wheel-${base_sha}"; do
+            if candidate_release="$(
+              gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${candidate_tag}" \
+                2>/dev/null
+            )"; then
+              candidate_wheel="$(
+                jq -c '[.assets[] | select(.name | endswith(".whl"))][0] | {name: .name, url: .browser_download_url, digest: .digest}' \
+                  <<<"${candidate_release}"
+              )"
+              if [[ "${candidate_wheel}" != "null" ]] && \
+                 jq -e '.digest | strings | test("^sha256:[0-9a-f]{64}$")' <<<"${candidate_wheel}" >/dev/null; then
+                base_tag="${candidate_tag}"
+                base_wheel="${candidate_wheel}"
+                break
+              fi
+            fi
+          done
+          test -n "${base_tag}"
+          test -n "${base_wheel}"
 
           echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
           echo "base_sha=${base_sha}" >> "${GITHUB_OUTPUT}"

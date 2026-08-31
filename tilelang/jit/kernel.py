@@ -21,7 +21,7 @@ from tilelang.jit.adapter import (
 from tilelang.profiler import Profiler, TensorSupplyType
 from tilelang.contrib import nvcc as tl_nvcc
 from tilelang.contrib.hip_resource_info import pop_recorded, reset_recorder
-from tilelang.jit.abi import prepare_tvm_ffi_callee_allocated_outputs
+from tilelang.jit.abi import prepare_tvm_ffi_callee_allocated_outputs, prepare_tvm_ffi_caller_allocated_outputs
 from tilelang.jit.diagnostics import jit_phase
 from tilelang.transform import PassConfigKey
 from tilelang.transform.pass_config import normalize_pass_configs
@@ -29,6 +29,7 @@ from tilelang.instrumentation import compile_pass_instrumentation, create_pass_i
 from tilelang.tools.pass_timing import create_pass_timing_tool
 import logging
 import os
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,10 @@ class JITKernel(Generic[_P, _T]):
         """
         self.prim_func = func
         self.verbose = verbose
+        self._caller_allocated_kernel: JITKernel | None = None
+        self._caller_allocated_kernel_lock = threading.Lock()
+        self._last_bound_outputs: tuple[Any, ...] | None = None
+        self._last_bound_output_call: Callable[..., Any] | None = None
 
         self.pass_configs = normalize_pass_configs(pass_configs)
 
@@ -209,6 +214,141 @@ class JITKernel(Generic[_P, _T]):
             The result of the function execution.
         """
         return self.torch_function(*args, **kwds)
+
+    def _get_caller_allocated_kernel(self) -> JITKernel:
+        """Lazily compile the full-parameter ABI used by reusable outputs."""
+        if not self.out_idx:
+            raise ValueError("This kernel has no callee-allocated outputs to bind.")
+
+        kernel = self._caller_allocated_kernel
+        if kernel is not None:
+            return kernel
+
+        with self._caller_allocated_kernel_lock:
+            kernel = self._caller_allocated_kernel
+            if kernel is not None:
+                return kernel
+            if self.prim_func is None:
+                raise RuntimeError("Cannot prepare reusable outputs without the source PrimFunc.")
+
+            caller_allocated_func = prepare_tvm_ffi_caller_allocated_outputs(self.prim_func)
+            # Import lazily because tilelang.cache imports JITKernel while setting
+            # up its backend-specific cache dispatch table.
+            from tilelang.cache import cached
+
+            kernel = cached(
+                func=caller_allocated_func,
+                out_idx=None,
+                target=self.target,
+                target_host=self.target_host,
+                execution_backend=self.execution_backend,
+                verbose=self.verbose,
+                pass_configs=self.pass_configs,
+                compile_flags=self.compile_flags,
+            )
+            self._caller_allocated_kernel = kernel
+            return kernel
+
+    def _normalize_bound_outputs(self, out: Any) -> tuple[Any, ...]:
+        result_count = len(self.out_idx)
+        if result_count == 0:
+            raise ValueError("This kernel has no callee-allocated outputs to bind.")
+
+        if result_count == 1:
+            if isinstance(out, (list, tuple)):
+                if len(out) != 1:
+                    raise ValueError(f"Kernel expected one output buffer, but {len(out)} are provided.")
+                outputs = (out[0],)
+            else:
+                outputs = (out,)
+        else:
+            if not isinstance(out, (list, tuple)):
+                raise TypeError(f"Kernel expected {result_count} output buffers as a list or tuple.")
+            if len(out) != result_count:
+                raise ValueError(f"Kernel expected {result_count} output buffers, but {len(out)} are provided.")
+            outputs = tuple(out)
+
+        if any(output is None for output in outputs):
+            raise TypeError("Output buffers cannot be None.")
+        return outputs
+
+    def _make_bound_output_call(self, outputs: tuple[Any, ...]) -> Callable[..., Any]:
+        """Create a low-overhead callable that writes into fixed output buffers."""
+        caller_allocated_kernel = self._get_caller_allocated_kernel()
+        caller_func = caller_allocated_kernel.torch_function
+        result_idx = tuple(self.out_idx)
+        total_params = len(self.params)
+        expected_inputs = total_params - len(result_idx)
+        output_result = outputs[0] if len(outputs) == 1 else list(outputs)
+
+        # Most kernels place one result last.  Keep this path allocation-light;
+        # it is the path that matters for repeated small eager kernels.
+        if result_idx == tuple(range(expected_inputs, total_params)):
+
+            def bound_output_call(*inputs: Any):
+                if len(inputs) != expected_inputs:
+                    raise ValueError(f"Kernel expected {expected_inputs} inputs, but {len(inputs)} are provided.")
+                caller_func(*inputs, *outputs)
+                return output_result
+
+            return bound_output_call
+
+        output_by_position = dict(zip(result_idx, outputs, strict=True))
+        input_slots = tuple(position for position in range(total_params) if position not in output_by_position)
+
+        def bound_output_call(*inputs: Any):
+            if len(inputs) != expected_inputs:
+                raise ValueError(f"Kernel expected {expected_inputs} inputs, but {len(inputs)} are provided.")
+            full_args: list[Any] = [None] * total_params
+            for position, output in output_by_position.items():
+                full_args[position] = output
+            for position, value in zip(input_slots, inputs, strict=True):
+                full_args[position] = value
+            caller_func(*full_args)
+            return output_result
+
+        return bound_output_call
+
+    def bind_outputs(self, out: Any) -> Callable[..., _T]:
+        """Bind caller-owned output buffers and return a reusable fast callable.
+
+        The first binding lazily compiles a companion entry with the original
+        full parameter list.  Later calls skip output allocation and return the
+        supplied buffer, or a list of supplied buffers for a multi-output
+        kernel.  A bound callable reuses the same storage on every invocation;
+        callers coordinate overlapping launches and buffer lifetimes.
+
+        Parameters
+        ----------
+        out : Any
+            One output buffer, or a list/tuple matching ``out_idx``.
+
+        Returns
+        -------
+        Callable
+            A callable accepting the kernel's non-output arguments.
+        """
+        outputs = self._normalize_bound_outputs(out)
+        cached_outputs = self._last_bound_outputs
+        if cached_outputs is not None and len(cached_outputs) == len(outputs) and all(
+            cached is current for cached, current in zip(cached_outputs, outputs, strict=True)
+        ):
+            cached_call = self._last_bound_output_call
+            if cached_call is not None:
+                return cached_call
+
+        bound_call = self._make_bound_output_call(outputs)
+        self._last_bound_outputs = outputs
+        self._last_bound_output_call = bound_call
+        return bound_call
+
+    def call_into(self, *inputs: Any, out: Any) -> _T:
+        """Execute once with caller-owned output buffers.
+
+        ``bind_outputs`` is the lower-overhead interface for repeated calls.
+        This convenience method caches the most recently bound output identity.
+        """
+        return self.bind_outputs(out)(*inputs)
 
     def _compile_and_create_adapter(
         self,
