@@ -292,6 +292,9 @@ done < <(
         \( -path "${extract_root}/tilelang/lib" -o -path "${extract_root}/tilelang/src" \) -prune \
         -o -type f \( -name '*.py' -o -name '*.pyi' -o -name '*.md' \) -print0
 )
+install -D -m 0644 -- \
+    "${extract_root}/tilelang/_python_overlay_identity.json" \
+    "${staged_package}/_python_overlay_identity.json"
 install -D -m 0755 -- \
     "${extract_root}/tilelang/lib/libtilelang.so" \
     "${staged_package}/lib/libtilelang.so"
