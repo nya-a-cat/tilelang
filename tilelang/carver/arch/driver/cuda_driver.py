@@ -15,7 +15,10 @@ class cudaDeviceAttrNames:
 
     cudaDevAttrMaxThreadsPerBlock: int = 1
     cudaDevAttrMaxRegistersPerBlock: int = 12
+    cudaDevAttrMaxThreadsPerMultiProcessor: int = 39
     cudaDevAttrMaxSharedMemoryPerMultiprocessor: int = 81
+    cudaDevAttrMaxRegistersPerMultiprocessor: int = 82
+    cudaDevAttrMaxBlocksPerMultiprocessor: int = 106
     cudaDevAttrMaxPersistingL2CacheSize: int = 108
 
 

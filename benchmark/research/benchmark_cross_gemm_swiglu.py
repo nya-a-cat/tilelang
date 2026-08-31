@@ -62,12 +62,27 @@ def cuda_target_profile(device: int | None = None) -> TargetProfile:
     major, minor = torch.cuda.get_device_capability(device)
     max_threads_per_block = get_device_attribute(cudaDeviceAttrNames.cudaDevAttrMaxThreadsPerBlock, device)
     max_registers_per_block = get_device_attribute(cudaDeviceAttrNames.cudaDevAttrMaxRegistersPerBlock, device)
+    max_threads_per_compute_unit = get_device_attribute(cudaDeviceAttrNames.cudaDevAttrMaxThreadsPerMultiProcessor, device)
+    max_shared_bytes_per_compute_unit = get_device_attribute(cudaDeviceAttrNames.cudaDevAttrMaxSharedMemoryPerMultiprocessor, device)
+    max_registers_per_compute_unit = get_device_attribute(cudaDeviceAttrNames.cudaDevAttrMaxRegistersPerMultiprocessor, device)
+    max_blocks_per_compute_unit = get_device_attribute(cudaDeviceAttrNames.cudaDevAttrMaxBlocksPerMultiprocessor, device)
     limits = {
         "max_threads_per_block": int(max_threads_per_block or getattr(properties, "max_threads_per_block", 1024)),
         "max_shared_bytes_per_block": int(properties.shared_memory_per_block),
         "max_registers_per_thread": 255,
         "max_registers_per_block": int(max_registers_per_block or 64 * 1024),
         "multiprocessor_count": int(properties.multi_processor_count),
+        "compute_unit_count": int(properties.multi_processor_count),
+        "max_threads_per_compute_unit": int(
+            max_threads_per_compute_unit or getattr(properties, "max_threads_per_multi_processor", max_threads_per_block or 1024)
+        ),
+        "max_shared_bytes_per_compute_unit": int(
+            max_shared_bytes_per_compute_unit or getattr(properties, "shared_memory_per_multiprocessor", properties.shared_memory_per_block)
+        ),
+        "max_registers_per_compute_unit": int(max_registers_per_compute_unit or max_registers_per_block or 64 * 1024),
+        "max_blocks_per_compute_unit": int(max_blocks_per_compute_unit or 1),
+        "warp_size": int(properties.warp_size),
+        "preferred_warps_per_block": 4,
     }
     features = {"async_copy"} if major >= 8 else set()
     return TargetProfile("cuda", f"sm_{major}{minor}", features=frozenset(features), limits=limits)
@@ -99,7 +114,7 @@ def select_ranked_schedule(
     config = ranked[rank]
     summary = cross_gemm_search_summary(workload, target, top_k=max(8, rank + 1))
     return config, {
-        "policy": "resource_rank_v1",
+        "policy": "resource_rank_v2",
         "rank": rank,
         "selected_config": config,
         "selected_estimate": cross_gemm_schedule_estimate(config, workload, target),
@@ -460,7 +475,7 @@ def main() -> None:
             "warmup_calls_per_method": args.warmup,
             "statistic": "median CUDA-event kernel latency",
             "order": "alternating baseline/fused/fused/baseline",
-            "schedule_policy": "resource_rank_v1" if args.schedule_rank is not None else "manual",
+            "schedule_policy": "resource_rank_v2" if args.schedule_rank is not None else "manual",
             "schedule_rank": args.schedule_rank,
         },
         "results": results,

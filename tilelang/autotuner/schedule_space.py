@@ -107,6 +107,56 @@ class TargetProfile:
 
 
 @dataclass(frozen=True)
+class BlockResourceUsage:
+    """Static per-block resources used for pre-compile residency estimates."""
+
+    threads_per_block: int
+    shared_bytes_per_block: int = 0
+    registers_per_block: int = 0
+
+    def __post_init__(self) -> None:
+        values = {
+            "threads_per_block": self.threads_per_block,
+            "shared_bytes_per_block": self.shared_bytes_per_block,
+            "registers_per_block": self.registers_per_block,
+        }
+        for name, value in values.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.threads_per_block == 0:
+            raise ValueError("threads_per_block must be positive")
+
+
+def estimate_resident_blocks_per_compute_unit(usage: BlockResourceUsage, target: TargetProfile) -> int | None:
+    """Estimate concurrent blocks from explicit target limits.
+
+    The estimate enforces every declared resource and stays permissive for
+    missing limits. Its accuracy follows the supplied usage estimates. Register
+    allocation granularity and compiler temporaries remain outside this static
+    pre-compile model.
+    """
+
+    if not isinstance(usage, BlockResourceUsage):
+        raise TypeError("usage must be a BlockResourceUsage")
+    if not isinstance(target, TargetProfile):
+        raise TypeError("target must be a TargetProfile")
+
+    capacities: list[int] = []
+    max_blocks = target.limit("max_blocks_per_compute_unit")
+    if max_blocks is not None:
+        capacities.append(max_blocks)
+    for limit_name, required in (
+        ("max_threads_per_compute_unit", usage.threads_per_block),
+        ("max_shared_bytes_per_compute_unit", usage.shared_bytes_per_block),
+        ("max_registers_per_compute_unit", usage.registers_per_block),
+    ):
+        limit = target.limit(limit_name)
+        if limit is not None and required > 0:
+            capacities.append(limit // required)
+    return min(capacities) if capacities else None
+
+
+@dataclass(frozen=True)
 class ScheduleConstraint:
     """Named predicate used to reject invalid schedule configurations."""
 

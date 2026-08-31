@@ -7,10 +7,12 @@ import json
 import pytest
 
 from tilelang.autotuner import (
+    BlockResourceUsage,
     PassConfigBinding,
     ScheduleConstraint,
     ScheduleSpace,
     TargetProfile,
+    estimate_resident_blocks_per_compute_unit,
     estimated_within_target_limit,
     requires_feature,
     within_target_limit,
@@ -135,6 +137,27 @@ def test_derived_target_resource_limit_filters_and_reports_estimates():
     assert space.rejection_counts == {"shared_bytes_within_max_shared_bytes_per_block": 1}
 
 
+def test_resident_block_estimate_uses_every_declared_compute_unit_limit():
+    target = TargetProfile(
+        "cuda",
+        "sm_75",
+        limits={
+            "max_blocks_per_compute_unit": 16,
+            "max_threads_per_compute_unit": 1024,
+            "max_shared_bytes_per_compute_unit": 64 * 1024,
+            "max_registers_per_compute_unit": 64 * 1024,
+        },
+    )
+    usage = BlockResourceUsage(
+        threads_per_block=128,
+        shared_bytes_per_block=48 * 1024,
+        registers_per_block=16 * 1024,
+    )
+
+    assert estimate_resident_blocks_per_compute_unit(usage, target) == 1
+    assert estimate_resident_blocks_per_compute_unit(usage, TargetProfile("cuda")) is None
+
+
 def test_semantic_fields_materialize_into_per_candidate_pass_configs():
     space = ScheduleSpace(
         {
@@ -236,6 +259,13 @@ def test_cross_gemm_space_filters_resources_and_ranks_reuse_deterministically():
             "max_registers_per_thread": 255,
             "max_registers_per_block": 64 * 1024,
             "multiprocessor_count": 40,
+            "compute_unit_count": 40,
+            "max_threads_per_compute_unit": 1024,
+            "max_shared_bytes_per_compute_unit": 64 * 1024,
+            "max_registers_per_compute_unit": 64 * 1024,
+            "max_blocks_per_compute_unit": 16,
+            "warp_size": 32,
+            "preferred_warps_per_block": 4,
         },
     )
     space = cross_gemm_schedule_space(workload, target)
@@ -249,10 +279,10 @@ def test_cross_gemm_space_filters_resources_and_ranks_reuse_deterministically():
     assert all(cross_gemm_accumulator_registers_per_block(config, workload) <= 64 * 1024 for config in space)
     assert ranked[0] == {
         "block_M": 128,
-        "block_N": 128,
-        "block_K": 32,
+        "block_N": 64,
+        "block_K": 64,
         "num_stages": 0,
-        "threads": 256,
+        "threads": 128,
     }
     assert summary["top_candidates"][0]["config"] == ranked[0]
     assert json.loads(json.dumps(summary)) == summary
@@ -269,6 +299,13 @@ def test_cross_gemm_t4_profile_selects_a_schedule_within_default_shared_memory()
             "max_registers_per_thread": 255,
             "max_registers_per_block": 64 * 1024,
             "multiprocessor_count": 40,
+            "compute_unit_count": 40,
+            "max_threads_per_compute_unit": 1024,
+            "max_shared_bytes_per_compute_unit": 64 * 1024,
+            "max_registers_per_compute_unit": 64 * 1024,
+            "max_blocks_per_compute_unit": 16,
+            "warp_size": 32,
+            "preferred_warps_per_block": 4,
         },
     )
 
@@ -276,12 +313,16 @@ def test_cross_gemm_t4_profile_selects_a_schedule_within_default_shared_memory()
 
     assert ranked[0] == {
         "block_M": 128,
-        "block_N": 128,
-        "block_K": 16,
+        "block_N": 64,
+        "block_K": 64,
         "num_stages": 0,
-        "threads": 256,
+        "threads": 128,
     }
-    assert cross_gemm_shared_bytes(ranked[0], workload) == 44 * 1024
+    assert cross_gemm_shared_bytes(ranked[0], workload) == 48 * 1024
+    estimate = cross_gemm_search_summary(workload, target, top_k=1)["top_candidates"][0]["estimate"]
+    assert estimate["resident_blocks_per_compute_unit"] == 1
+    assert estimate["warps_per_block"] == 4
+    assert estimate["scheduling_waves"] == 3.8
 
 
 def test_space_explosion_is_rejected_before_materialization():

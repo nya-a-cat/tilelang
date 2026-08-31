@@ -8,9 +8,11 @@ import math
 from typing import Any
 
 from tilelang.autotuner import (
+    BlockResourceUsage,
     ScheduleConstraint,
     ScheduleSpace,
     TargetProfile,
+    estimate_resident_blocks_per_compute_unit,
     estimated_within_target_limit,
     within_target_limit,
 )
@@ -109,19 +111,40 @@ def cross_gemm_schedule_estimate(
     config: Mapping[str, Any],
     workload: CrossGemmWorkload,
     target: TargetProfile,
-) -> dict[str, int | float]:
+) -> dict[str, int | float | None]:
     """Return explainable ranking features without predicting wall time."""
 
     block_m = int(config["block_M"])
     block_n = int(config["block_N"])
     grid_ctas = math.ceil(workload.M / block_m) * math.ceil(workload.N / block_n)
-    multiprocessors = target.limit("multiprocessor_count")
+    compute_units = target.limit("compute_unit_count") or target.limit("multiprocessor_count")
     shared_bytes = cross_gemm_shared_bytes(config, workload)
     accumulator_registers = cross_gemm_accumulator_registers(config, workload)
     accumulator_registers_per_block = cross_gemm_accumulator_registers_per_block(config, workload)
+    resource_usage = BlockResourceUsage(
+        threads_per_block=int(config["threads"]),
+        shared_bytes_per_block=shared_bytes,
+        registers_per_block=accumulator_registers_per_block,
+    )
+    resident_blocks = estimate_resident_blocks_per_compute_unit(resource_usage, target)
+    warp_size = target.limit("warp_size")
+    warps_per_block = math.ceil(int(config["threads"]) / warp_size) if warp_size else None
+    preferred_warps = target.limit("preferred_warps_per_block")
+    warp_preference_distance = abs(warps_per_block - preferred_warps) if warps_per_block is not None and preferred_warps else 0
+    resident_warps = resident_blocks * warps_per_block if resident_blocks is not None and warps_per_block is not None else None
+    max_threads_per_compute_unit = target.limit("max_threads_per_compute_unit")
+    max_warps = max_threads_per_compute_unit / warp_size if max_threads_per_compute_unit and warp_size else None
+    estimated_occupancy = resident_warps / max_warps if resident_warps is not None and max_warps else None
+    scheduling_waves = grid_ctas / (compute_units * resident_blocks) if compute_units and resident_blocks else None
     return {
         "grid_ctas": grid_ctas,
-        "waves": grid_ctas / multiprocessors if multiprocessors else 0.0,
+        "waves": grid_ctas / compute_units if compute_units else 0.0,
+        "scheduling_waves": scheduling_waves,
+        "resident_blocks_per_compute_unit": resident_blocks,
+        "warps_per_block": warps_per_block,
+        "warp_preference_distance": warp_preference_distance,
+        "resident_warps_per_compute_unit": resident_warps,
+        "estimated_occupancy": estimated_occupancy,
         "operand_bytes_per_k_output": math.ceil(workload.operand_bits / 8) * (1.0 / block_n + workload.gemm_count / block_m),
         "shared_bytes": shared_bytes,
         "shared_fraction": shared_bytes / target.limit("max_shared_bytes_per_block") if target.limit("max_shared_bytes_per_block") else 0.0,
@@ -153,9 +176,11 @@ def ranked_cross_gemm_schedules(
             float(estimate["accumulator_register_block_fraction"]),
         )
         return (
-            float(estimate["operand_bytes_per_k_output"]),
             pipeline_preference,
             -int(config["block_K"]),
+            int(estimate["warp_preference_distance"]),
+            float(estimate["scheduling_waves"]) if estimate["scheduling_waves"] is not None else math.inf,
+            float(estimate["operand_bytes_per_k_output"]),
             resource_pressure,
             -int(config["threads"]),
         )
