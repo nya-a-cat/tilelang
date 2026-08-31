@@ -6,7 +6,23 @@ import json
 
 import pytest
 
-from tilelang.autotuner import PassConfigBinding, ScheduleConstraint, ScheduleSpace, TargetProfile, requires_feature, within_target_limit
+from tilelang.autotuner import (
+    PassConfigBinding,
+    ScheduleConstraint,
+    ScheduleSpace,
+    TargetProfile,
+    estimated_within_target_limit,
+    requires_feature,
+    within_target_limit,
+)
+from benchmark.research.cross_gemm_schedule_space import (
+    CrossGemmWorkload,
+    cross_gemm_accumulator_registers,
+    cross_gemm_schedule_space,
+    cross_gemm_search_summary,
+    cross_gemm_shared_bytes,
+    ranked_cross_gemm_schedules,
+)
 from benchmark.mamba2.schedule_spaces import (
     LEGACY_PARAMETER_NAMES,
     executable_schedule_space,
@@ -100,6 +116,24 @@ def test_target_resource_limit_filters_threads():
     assert space == [{"threads": 128}, {"threads": 256}]
 
 
+def test_derived_target_resource_limit_filters_and_reports_estimates():
+    target = TargetProfile("cuda", "sm_75", limits={"max_shared_bytes_per_block": 64})
+    space = ScheduleSpace(
+        {"tile": [16, 32, 64]},
+        target=target,
+        constraints=[
+            estimated_within_target_limit(
+                "shared_bytes",
+                "max_shared_bytes_per_block",
+                lambda config, _target: int(config["tile"]) * 2,
+            )
+        ],
+    )
+
+    assert space == [{"tile": 16}, {"tile": 32}]
+    assert space.rejection_counts == {"shared_bytes_within_max_shared_bytes_per_block": 1}
+
+
 def test_semantic_fields_materialize_into_per_candidate_pass_configs():
     space = ScheduleSpace(
         {
@@ -188,6 +222,37 @@ def test_mamba_executable_space_only_emits_kernel_args_and_pass_configs():
     assert all(not any(key.startswith("schedule_") for key in config) for config in space)
     assert {config["pass_configs"]["tl.enable_async_copy"] for config in space} == {False, True}
     assert {config["pass_configs"]["tl.disable_warp_specialized"] for config in space} == {False, True}
+
+
+def test_cross_gemm_space_filters_resources_and_ranks_reuse_deterministically():
+    workload = CrossGemmWorkload(M=256, K=896, N=4864)
+    target = TargetProfile(
+        "cuda",
+        "sm_75",
+        limits={
+            "max_threads_per_block": 1024,
+            "max_shared_bytes_per_block": 64 * 1024,
+            "max_registers_per_thread": 255,
+            "multiprocessor_count": 40,
+        },
+    )
+    space = cross_gemm_schedule_space(workload, target)
+    ranked = ranked_cross_gemm_schedules(workload, target)
+    summary = cross_gemm_search_summary(workload, target, top_k=3)
+
+    assert space.raw_cardinality == 162
+    assert len(space) == 129
+    assert all(cross_gemm_shared_bytes(config, workload) <= 64 * 1024 for config in space)
+    assert all(cross_gemm_accumulator_registers(config, workload) <= 255 for config in space)
+    assert ranked[0] == {
+        "block_M": 128,
+        "block_N": 128,
+        "block_K": 32,
+        "num_stages": 0,
+        "threads": 256,
+    }
+    assert summary["top_candidates"][0]["config"] == ranked[0]
+    assert json.loads(json.dumps(summary)) == summary
 
 
 def test_space_explosion_is_rejected_before_materialization():

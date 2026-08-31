@@ -19,6 +19,7 @@ from typing import Any
 
 ScheduleConfig = dict[str, Any]
 ConstraintPredicate = Callable[[Mapping[str, Any], "TargetProfile | None"], bool]
+ResourceEstimator = Callable[[Mapping[str, Any], "TargetProfile | None"], int]
 ValueTransform = Callable[[Any], Any]
 
 _ARCH_PATTERN = re.compile(r"(?<![A-Za-z0-9])((?:sm|gfx)[_-]?[A-Za-z0-9]+)")
@@ -181,6 +182,36 @@ def within_target_limit(parameter: str, limit: str, *, scale: int = 1) -> Schedu
         return int(config[parameter]) * scale <= target.limit(limit)
 
     return ScheduleConstraint(f"{parameter}_within_{limit}", predicate)
+
+
+def estimated_within_target_limit(
+    resource: str,
+    limit: str,
+    estimator: ResourceEstimator,
+) -> ScheduleConstraint:
+    """Constrain a derived per-candidate resource estimate.
+
+    Missing target limits remain permissive so a schedule space can be built
+    before a concrete device is selected.  Estimators must return a
+    non-negative integer in the same unit as the named target limit.
+    """
+
+    if not resource.strip():
+        raise ValueError("Estimated resource name must be a non-empty string")
+    if not limit.strip():
+        raise ValueError("Estimated target limit must be a non-empty string")
+    if not callable(estimator):
+        raise TypeError("Resource estimator must be callable")
+
+    def predicate(config: Mapping[str, Any], target: TargetProfile | None) -> bool:
+        if target is None or target.limit(limit) is None:
+            return True
+        estimate = estimator(config, target)
+        if isinstance(estimate, bool) or not isinstance(estimate, int) or estimate < 0:
+            raise ValueError(f"Resource estimator {resource!r} returned invalid value {estimate!r}")
+        return estimate <= target.limit(limit)
+
+    return ScheduleConstraint(f"{resource}_within_{limit}", predicate)
 
 
 class ScheduleSpace(list[ScheduleConfig]):

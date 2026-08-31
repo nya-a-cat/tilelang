@@ -11,6 +11,7 @@ from .schedule_space import (  # noqa: F401
     ScheduleConstraint,
     ScheduleSpace,
     TargetProfile,
+    estimated_within_target_limit,
     requires_feature,
     within_target_limit,
 )
