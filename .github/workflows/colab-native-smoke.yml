@@ -28,7 +28,22 @@ jobs:
     env:
       CUDA_VERSION: "13.0"
       MANYLINUX_IMAGE_DIGEST: 012f4a50472412f18bb2b450c1cce7158434cfae4ae878591c2748a13a30c2be
+      CMAKE_WHEEL_VERSION: "4.4.2"
+      CMAKE_WHEEL_SHA256: 27b024e903ef985b37183d754a5c61230b56b41fe0971cd44b71b80c787ec594
+      CMAKE_WHEEL_URL: https://files.pythonhosted.org/packages/5d/b7/b8d0b15f57b37ac5b9e374169471f045da3a715b7f0f3af681011415d972/cmake-4.4.2-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
     steps:
+      - name: Start pinned manylinux image pull
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
+          pull_log="${RUNNER_TEMP}/tilelang-native-manylinux-pull.log"
+          pull_pid="${RUNNER_TEMP}/tilelang-native-manylinux-pull.pid"
+          : > "${pull_log}"
+          nohup docker pull "${image}" > "${pull_log}" 2>&1 &
+          echo "$!" > "${pull_pid}"
+          echo "Started pinned manylinux image pull in process $(cat "${pull_pid}") while source and caches restore."
+
       - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -286,6 +301,13 @@ jobs:
           path: .cache/prebuilt-tvm
           key: colab-wheel-tvm-sdk-v1-${{ runner.os }}-${{ runner.arch }}-cp310-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-${{ steps.source.outputs.tvm_sdk_fingerprint }}
 
+      - name: Restore exact CMake distribution
+        id: native-cmake-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/native-cmake
+          key: tilelang-native-cmake-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.CMAKE_WHEEL_VERSION }}-${{ env.CMAKE_WHEEL_SHA256 }}
+
       - name: Require bootstrapped native caches
         if: steps.toolchain-cache.outputs.cache-hit != 'true' || steps.tvm-sdk-cache.outputs.cache-hit != 'true'
         shell: bash
@@ -309,23 +331,103 @@ jobs:
             sha256sum --check SHA256SUMS
           )
 
-      - name: Restore host native compiler cache
-        id: host-native-cache
+      - name: Prepare exact relocatable CMake
+        id: native-cmake
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_root="${GITHUB_WORKSPACE}/.cache/native-cmake"
+          distribution_root="${cache_root}/root"
+          identity="${cache_root}/identity"
+          expected_identity="cmake=${CMAKE_WHEEL_VERSION};wheel_sha256=${CMAKE_WHEEL_SHA256}"
+          cmake_bin="${distribution_root}/cmake/data/bin/cmake"
+
+          if [[ "${{ steps.native-cmake-cache.outputs.cache-hit }}" == "true" ]]; then
+            test "$(<"${identity}")" = "${expected_identity}"
+            (
+              cd "${distribution_root}"
+              sha256sum --check ../SHA256SUMS
+            )
+          else
+            wheel="${RUNNER_TEMP}/cmake-${CMAKE_WHEEL_VERSION}.whl"
+            partial="${wheel}.part"
+            rm -f -- "${partial}"
+            curl \
+              --fail \
+              --location \
+              --retry 5 \
+              --output "${partial}" \
+              "${CMAKE_WHEEL_URL}"
+            echo "${CMAKE_WHEEL_SHA256}  ${partial}" | sha256sum --check --status
+            mv -- "${partial}" "${wheel}"
+            rm -rf -- "${distribution_root}"
+            mkdir -p "${distribution_root}"
+            python3 - "${wheel}" "${distribution_root}" <<'PY'
+          import stat
+          import sys
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          archive = Path(sys.argv[1])
+          destination_root = Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(archive) as bundle:
+              for info in bundle.infolist():
+                  path = PurePosixPath(info.filename)
+                  if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+                      raise SystemExit(f"Unsafe path in CMake wheel: {info.filename}")
+                  mode = info.external_attr >> 16
+                  if stat.S_ISLNK(mode):
+                      raise SystemExit(f"CMake wheel contains a symbolic link: {info.filename}")
+                  if info.is_dir():
+                      continue
+                  output = destination_root.joinpath(*path.parts)
+                  output.parent.mkdir(parents=True, exist_ok=True)
+                  output.write_bytes(bundle.read(info))
+                  output.chmod((mode & 0o777) or 0o644)
+          PY
+            rm -f -- "${wheel}"
+            (
+              cd "${distribution_root}"
+              find . -type f -print0 \
+                | LC_ALL=C sort -z \
+                | xargs -0 sha256sum \
+                > ../SHA256SUMS
+            )
+            printf '%s\n' "${expected_identity}" > "${identity}"
+          fi
+
+          test -x "${cmake_bin}"
+          test "$("${cmake_bin}" --version | awk 'NR == 1 { print $3 }')" = "${CMAKE_WHEEL_VERSION}"
+          {
+            echo "identity=${expected_identity}"
+            echo "cmake_binary=${cmake_bin}"
+            echo "cmake_binary_sha256=$(sha256sum "${cmake_bin}" | awk '{ print $1 }')"
+          } | tee "${cache_root}/provenance.txt"
+
+      - name: Save exact CMake distribution
+        if: steps.native-cmake-cache.outputs.cache-hit != 'true' && steps.native-cmake.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/native-cmake
+          key: tilelang-native-cmake-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.CMAKE_WHEEL_VERSION }}-${{ env.CMAKE_WHEEL_SHA256 }}
+
+      - name: Restore manylinux native compiler cache
+        id: manylinux-native-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .cache/host-native-ccache
-          key: colab-host-native-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.source.outputs.native_fingerprint }}
+          path: .cache/ccache
+          key: colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-${{ steps.source.outputs.native_fingerprint }}
           restore-keys: |
-            colab-host-native-ccache-v1-${{ runner.os }}-${{ runner.arch }}-
+            colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-
 
-      - name: Configure host native compile
+      - name: Configure pinned manylinux native compile
         shell: bash
         run: |
           set -euo pipefail
           jobs="$(getconf _NPROCESSORS_ONLN)"
           toolchain_root="${GITHUB_WORKSPACE}/.cache/ci-toolchain"
           cuda_root="${toolchain_root}/cuda-13.0"
-          host_ccache_dir="${GITHUB_WORKSPACE}/.cache/host-native-ccache"
+          host_ccache_dir="${GITHUB_WORKSPACE}/.cache/ccache"
           tvm_sdk_dir="${GITHUB_WORKSPACE}/.cache/prebuilt-tvm"
           mkdir -p "${host_ccache_dir}"
           {
@@ -339,23 +441,72 @@ jobs:
             echo "CUDA_HOME=${cuda_root}"
             echo "LD_LIBRARY_PATH=${cuda_root}/lib64:${cuda_root}/lib64/stubs:${tvm_sdk_dir}"
             echo "CCACHE_DIR=${host_ccache_dir}"
-            echo "CCACHE_MAXSIZE=1G"
-            echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+            echo "CCACHE_MAXSIZE=2G"
             echo "CCACHE_NOHASHDIR=true"
             echo "CCACHE_COMPILERCHECK=content"
             echo "TILELANG_PREBUILT_TVM_LIB_DIR=${tvm_sdk_dir}"
             echo "USE_CUDA=ON"
             echo "USE_ROCM=OFF"
+            echo "MANYLINUX_IMAGE=quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
           } >> "${GITHUB_ENV}"
-          echo "Using ${jobs} host build workers; host ccache exact hit=${{ steps.host-native-cache.outputs.cache-hit }}"
+          echo "Using ${jobs} manylinux build workers; compiler cache exact hit=${{ steps.manylinux-native-cache.outputs.cache-hit }}"
+
+      - name: Confirm pinned manylinux image is ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          pull_log="${RUNNER_TEMP}/tilelang-native-manylinux-pull.log"
+          pull_pid_file="${RUNNER_TEMP}/tilelang-native-manylinux-pull.pid"
+          pull_pid="$(cat "${pull_pid_file}")"
+          deadline=$((SECONDS + 300))
+
+          while kill -0 "${pull_pid}" 2>/dev/null; do
+            if (( SECONDS >= deadline )); then
+              kill "${pull_pid}" 2>/dev/null || true
+              cat "${pull_log}" >&2
+              echo "Timed out while pulling the pinned manylinux image." >&2
+              exit 2
+            fi
+            sleep 0.2
+          done
+
+          if ! docker image inspect "${MANYLINUX_IMAGE}" >/dev/null 2>&1; then
+            cat "${pull_log}" >&2
+            echo "Pinned manylinux image pull failed." >&2
+            exit 2
+          fi
+          cat "${pull_log}"
+          docker image inspect \
+            "${MANYLINUX_IMAGE}" \
+            --format 'ready={{.Id}} platform={{.Os}}/{{.Architecture}}'
 
       - name: Compile native CUDA targets
         id: native-build
         shell: bash
         run: |
           set -euo pipefail
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/project" \
+            --workdir /project \
+            --env CMAKE_BUILD_PARALLEL_LEVEL \
+            --env CMAKE_GENERATOR=Ninja \
+            --env CUDAToolkit_ROOT=/project/.cache/ci-toolchain/cuda-13.0 \
+            --env CUDA_HOME=/project/.cache/ci-toolchain/cuda-13.0 \
+            --env CCACHE_DIR=/project/.cache/ccache \
+            --env CCACHE_MAXSIZE=2G \
+            --env CCACHE_BASEDIR=/project \
+            --env CCACHE_NOHASHDIR=true \
+            --env CCACHE_COMPILERCHECK=content \
+            --env TILELANG_PREBUILT_TVM_LIB_DIR=/project/.cache/prebuilt-tvm \
+            --env USE_CUDA=ON \
+            --env USE_ROCM=OFF \
+            "${MANYLINUX_IMAGE}" \
+            /bin/bash --noprofile --norc -c '
+          set -euo pipefail
+          export PATH="/project/.cache/native-cmake/root/cmake/data/bin:/project/.cache/ci-toolchain/bin:/project/.cache/ci-toolchain/cuda-13.0/bin:${PATH}"
+          export LD_LIBRARY_PATH="/project/.cache/ci-toolchain/cuda-13.0/lib64:/project/.cache/ci-toolchain/cuda-13.0/lib64/stubs:/project/.cache/prebuilt-tvm:${LD_LIBRARY_PATH:-}"
+          python_bin="/opt/python/cp310-cp310/bin/python"
           ccache --zero-stats
-          python_bin="$(command -v python3)"
           cmake -S . -B build/native-smoke -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DPython_EXECUTABLE="${python_bin}" \
@@ -368,6 +519,13 @@ jobs:
           cmake --build build/native-smoke \
             --target tilelang cuda_stub cudart_stub nvrtc_stub \
             --parallel "${CMAKE_BUILD_PARALLEL_LEVEL}"
+          {
+            cmake --version | head -n 1
+            gcc --version | head -n 1
+            nvcc --version
+            ccache --show-stats
+          } | tee native-container-toolchain.txt
+          '
 
       - name: Record native compile evidence
         if: always() && steps.native-build.outcome != 'skipped'
@@ -381,11 +539,11 @@ jobs:
             echo "mode=verified_native_hot_patch"
             echo "runner=ubuntu-22.04"
             echo "cuda=13.0.88"
+            echo "manylinux_image=quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
             echo "tvm_sdk_fingerprint=${{ steps.source.outputs.tvm_sdk_fingerprint }}"
             echo "native_fingerprint=${{ steps.source.outputs.native_fingerprint }}"
-            cmake --version | head -n 1
-            gcc --version | head -n 1
-            nvcc --version
+            cat .cache/native-cmake/provenance.txt
+            cat native-container-toolchain.txt
             ccache --show-stats
             if [[ -d build/native-smoke/lib ]]; then
               find build/native-smoke/lib -maxdepth 1 -type f -name '*.so' -print0 \
@@ -404,6 +562,8 @@ jobs:
           BASE_WHEEL_NAME: ${{ steps.refs.outputs.base_wheel_name }}
           BASE_WHEEL_DIGEST: ${{ steps.refs.outputs.base_wheel_digest }}
           COMPARISON_STATUS: ${{ steps.refs.outputs.comparison_status }}
+          TVM_SDK_FINGERPRINT: ${{ steps.source.outputs.tvm_sdk_fingerprint }}
+          NATIVE_FINGERPRINT: ${{ steps.source.outputs.native_fingerprint }}
         run: |
           set -euo pipefail
           mkdir -p \
@@ -728,6 +888,12 @@ jobs:
             --arg elf_soname "${base_soname}" \
             --arg elf_rpath "${base_rpath}" \
             --arg compatibility "native-library-hot-patch-abi-guard-v1" \
+            --arg manylinux_image_digest "${MANYLINUX_IMAGE_DIGEST}" \
+            --arg cmake_version "${CMAKE_WHEEL_VERSION}" \
+            --arg cmake_wheel_sha256 "${CMAKE_WHEEL_SHA256}" \
+            --arg cuda_version "13.0.88" \
+            --arg tvm_sdk_fingerprint "${TVM_SDK_FINGERPRINT}" \
+            --arg native_fingerprint "${NATIVE_FINGERPRINT}" \
             --argjson base_native_file_count "${base_native_file_count}" \
             --argjson changed_files "${changed_json}" \
             --argjson elf_needed "${needed_json}" \
@@ -755,6 +921,14 @@ jobs:
                 soname: $elf_soname,
                 rpath: $elf_rpath,
                 needed: $elf_needed
+              },
+              build_environment: {
+                manylinux_image_digest: $manylinux_image_digest,
+                cmake_version: $cmake_version,
+                cmake_wheel_sha256: $cmake_wheel_sha256,
+                cuda_version: $cuda_version,
+                tvm_sdk_fingerprint: $tvm_sdk_fingerprint,
+                native_fingerprint: $native_fingerprint
               },
               compatibility: $compatibility
             }' | tee native-overlay-evidence/native-overlay-manifest.json
@@ -847,12 +1021,12 @@ jobs:
           print(f"selftest_libtilelang_sha256={library_hash}")
           PY
 
-      - name: Save host native compiler cache
-        if: always() && steps.host-native-cache.outputs.cache-hit != 'true' && steps.native-build.outcome == 'success'
+      - name: Save manylinux native compiler cache
+        if: always() && steps.manylinux-native-cache.outputs.cache-hit != 'true' && steps.native-build.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .cache/host-native-ccache
-          key: colab-host-native-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.source.outputs.native_fingerprint }}
+          path: .cache/ccache
+          key: colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-${{ steps.source.outputs.native_fingerprint }}
 
       - name: Upload native compile evidence
         if: steps.overlay-selftest.outcome == 'success'
