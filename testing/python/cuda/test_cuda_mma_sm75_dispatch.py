@@ -43,6 +43,8 @@ def test_sm75_fp16_emitter_uses_m16n8k8_shape():
     assert emitter.local_size_a == 4
     assert emitter.local_size_b == 2
     assert emitter.local_size_out == 4
+    assert emitter.ldmatrix_a_num == 2
+    assert emitter.ldmatrix_b_num == 1
     assert emitter.warp_rows == 2
     assert emitter.warp_cols == 4
 
@@ -68,6 +70,8 @@ def test_sm75_int8_emitter_uses_m8n8k16_shape():
     assert emitter.local_size_a == 4
     assert emitter.local_size_b == 4
     assert emitter.local_size_out == 2
+    assert emitter.ldmatrix_a_num == 1
+    assert emitter.ldmatrix_b_num == 1
     assert emitter.warp_rows == 4
     assert emitter.warp_cols == 4
     assert emitter.get_store_index_map() is not None
@@ -94,6 +98,8 @@ def test_sm75_uint8_emitter_uses_m8n8k16_shape():
     assert emitter.local_size_a == 4
     assert emitter.local_size_b == 4
     assert emitter.local_size_out == 2
+    assert emitter.ldmatrix_a_num == 1
+    assert emitter.ldmatrix_b_num == 1
 
 
 def test_sm75_int4_emitter_uses_m8n8k32_shape():
@@ -117,6 +123,8 @@ def test_sm75_int4_emitter_uses_m8n8k32_shape():
     assert emitter.local_size_a == 8
     assert emitter.local_size_b == 8
     assert emitter.local_size_out == 2
+    assert emitter.ldmatrix_a_num == 1
+    assert emitter.ldmatrix_b_num == 1
     assert emitter.warp_rows == 4
     assert emitter.warp_cols == 4
     assert emitter.get_store_index_map() is not None
@@ -161,6 +169,8 @@ def test_non_turing_int8_emitter_keeps_sm80_m16n8k32_shape():
     assert emitter.local_size_a == 16
     assert emitter.local_size_b == 16
     assert emitter.local_size_out == 8
+    assert emitter.ldmatrix_a_num == 4
+    assert emitter.ldmatrix_b_num == 4
 
 
 def test_uint4_mma_emitter_is_not_advertised_until_fragment_layouts_support_it():

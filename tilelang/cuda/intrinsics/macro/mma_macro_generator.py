@@ -142,6 +142,25 @@ class TensorCoreIntrinEmitter:
         self.local_size_b = (n_dim * k_dim) // warp_size
         self.local_size_out = (m_dim * n_dim) // warp_size
 
+    @staticmethod
+    def _get_ldmatrix_num(dtype: str, local_size: int) -> int:
+        """Return the number of 32-bit registers loaded per lane."""
+        register_bits = local_size * DataType(dtype).bits
+        if register_bits % 32 != 0:
+            raise ValueError(f"ldmatrix operand must contain whole 32-bit registers, got dtype={dtype}, local_size={local_size}")
+        num = register_bits // 32
+        if num not in (1, 2, 4):
+            raise ValueError(f"ldmatrix only supports x1/x2/x4, got x{num} for dtype={dtype}, local_size={local_size}")
+        return num
+
+    @property
+    def ldmatrix_a_num(self) -> int:
+        return self._get_ldmatrix_num(self.a_dtype, self.local_size_a)
+
+    @property
+    def ldmatrix_b_num(self) -> int:
+        return self._get_ldmatrix_num(self.b_dtype, self.local_size_b)
+
     def _initialize_abbrev(self, a_dtype, b_dtype, accum_dtype):
         self.a_dtype_abbrv = self._get_dtype_abbrv(a_dtype)
         self.b_dtype_abbrv = self._get_dtype_abbrv(b_dtype)
@@ -366,7 +385,9 @@ class TensorCoreIntrinEmitter:
                 wi, wk = warp_m * warp_row_tiles + i * micro_size_x, rk * chunk + ki * micro_size_k
 
                 if ldmatrix_available:
-                    row_off, col_off = get_ldmatrix_offset("A", tx, 0, stride, a_dtype, a_transposed)
+                    num = self.ldmatrix_a_num
+                    address_lane = tx % (8 * num)
+                    row_off, col_off = get_ldmatrix_offset("A", address_lane, 0, stride, a_dtype, a_transposed)
                     src_indices = (
                         tuple(A_other) + (A_base0 + wk + row_off, A_base1 + wi + col_off)
                         if a_transposed
@@ -374,9 +395,9 @@ class TensorCoreIntrinEmitter:
                     )
                     T.ptx_ldmatrix(
                         T.bool(trans),
-                        4,
-                        T.access_ptr(A_buf[src_indices], "r", extent=8),
-                        T.access_ptr(A_local_buf[i * local_size_a], "w", extent=8),
+                        num,
+                        T.access_ptr(A_buf[src_indices], "r", extent=local_size_a),
+                        T.access_ptr(A_local_buf[i * local_size_a], "w", extent=local_size_a),
                     )
                 else:
                     for j in T.serial(local_size_a):
@@ -445,7 +466,6 @@ class TensorCoreIntrinEmitter:
         B_base1 = B_region.region[-1].min
         B_other = [r.min for r in B_region.region[:-2]]
         B_stride_last = B_buf.shape[-1]
-        replicate_b = self.n_dim == 16
         # ldmatrix cannot be used for int8 + trans case.
         ldmatrix_available = not (DataType(b_dtype).bits != 16 and not b_transposed)
 
@@ -482,8 +502,9 @@ class TensorCoreIntrinEmitter:
                 )
 
                 if ldmatrix_available:
-                    num = 4 if replicate_b else 2
-                    row_off, col_off = get_ldmatrix_offset("B", tx, 0, stride, b_dtype, b_transposed)
+                    num = self.ldmatrix_b_num
+                    address_lane = tx % (8 * num)
+                    row_off, col_off = get_ldmatrix_offset("B", address_lane, 0, stride, b_dtype, b_transposed)
                     src_indices = (
                         tuple(B_other) + (B_base0 + wi + row_off, B_base1 + wk + col_off)
                         if b_transposed
@@ -492,8 +513,8 @@ class TensorCoreIntrinEmitter:
                     T.ptx_ldmatrix(
                         T.bool(trans),
                         num,
-                        T.access_ptr(B_buf[src_indices], "r", extent=2 * num),
-                        T.access_ptr(B_local_buf[i * local_size_b], "w", extent=2 * num),
+                        T.access_ptr(B_buf[src_indices], "r", extent=local_size_b),
+                        T.access_ptr(B_local_buf[i * local_size_b], "w", extent=local_size_b),
                     )
 
                 else:
