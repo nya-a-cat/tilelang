@@ -486,47 +486,59 @@ else()
 endif()
 option(TILELANG_RELEASE_BUILD "Strip source paths from log messages (for wheel releases)" ${TILELANG_RELEASE_BUILD_DEFAULT})
 
-# Include tvm after configs have been populated
-add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)
+if(TVM_BUILD_FROM_SOURCE)
+  # Include TVM after configs have been populated.
+  add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)
 
-# Strip the hardcoded /Zi PRIVATE option that tvm-ffi attaches in its
-# tvm_ffi_add_msvc_flags() helper. It overrides our Embedded debug info
-# format and forces a side-channel vc140.pdb that races under parallel
-# builds (C1041) and breaks compiler caches. Done via target property
-# rewrite so 3rdparty/tvm-ffi remains pristine.
-if(MSVC)
-  foreach(_tilelang_ffi_tgt IN ITEMS
-      tvm_ffi_objs tvm_ffi_shared tvm_ffi_static tvm_ffi_testing)
-    if(TARGET ${_tilelang_ffi_tgt})
-      get_target_property(_tilelang_ffi_opts ${_tilelang_ffi_tgt} COMPILE_OPTIONS)
-      if(_tilelang_ffi_opts)
-        list(REMOVE_ITEM _tilelang_ffi_opts "/Zi" "-Zi")
-        set_target_properties(${_tilelang_ffi_tgt}
-          PROPERTIES COMPILE_OPTIONS "${_tilelang_ffi_opts}")
+  # Strip the hardcoded /Zi PRIVATE option that tvm-ffi attaches in its
+  # tvm_ffi_add_msvc_flags() helper. It overrides our Embedded debug info
+  # format and forces a side-channel vc140.pdb that races under parallel
+  # builds (C1041) and breaks compiler caches. Done via target property
+  # rewrite so 3rdparty/tvm-ffi remains pristine.
+  if(MSVC)
+    foreach(_tilelang_ffi_tgt IN ITEMS
+        tvm_ffi_objs tvm_ffi_shared tvm_ffi_static tvm_ffi_testing)
+      if(TARGET ${_tilelang_ffi_tgt})
+        get_target_property(_tilelang_ffi_opts ${_tilelang_ffi_tgt} COMPILE_OPTIONS)
+        if(_tilelang_ffi_opts)
+          list(REMOVE_ITEM _tilelang_ffi_opts "/Zi" "-Zi")
+          set_target_properties(${_tilelang_ffi_tgt}
+            PROPERTIES COMPILE_OPTIONS "${_tilelang_ffi_opts}")
+        endif()
       endif()
-    endif()
-  endforeach()
+    endforeach()
 
-  # TVM links against tvm_ffi_shared on Windows. Do not also export tvm-ffi
-  # inline class members from TileLang-built TVM DLLs, or lld-link reports
-  # duplicate symbols for tvm::ffi types already exported by tvm_ffi.dll.
-  foreach(_tilelang_tvm_obj_tgt IN ITEMS tvm_objs tvm_runtime_objs)
-    if(TARGET ${_tilelang_tvm_obj_tgt})
-      get_target_property(_tilelang_tvm_defs ${_tilelang_tvm_obj_tgt} COMPILE_DEFINITIONS)
-      if(_tilelang_tvm_defs)
-        list(REMOVE_ITEM _tilelang_tvm_defs TVM_FFI_EXPORTS -DTVM_FFI_EXPORTS)
-        set_target_properties(${_tilelang_tvm_obj_tgt}
-          PROPERTIES COMPILE_DEFINITIONS "${_tilelang_tvm_defs}")
+    # TVM links against tvm_ffi_shared on Windows. Do not also export tvm-ffi
+    # inline class members from TileLang-built TVM DLLs, or lld-link reports
+    # duplicate symbols for tvm::ffi types already exported by tvm_ffi.dll.
+    foreach(_tilelang_tvm_obj_tgt IN ITEMS tvm_objs tvm_runtime_objs)
+      if(TARGET ${_tilelang_tvm_obj_tgt})
+        get_target_property(_tilelang_tvm_defs ${_tilelang_tvm_obj_tgt} COMPILE_DEFINITIONS)
+        if(_tilelang_tvm_defs)
+          list(REMOVE_ITEM _tilelang_tvm_defs TVM_FFI_EXPORTS -DTVM_FFI_EXPORTS)
+          set_target_properties(${_tilelang_tvm_obj_tgt}
+            PROPERTIES COMPILE_DEFINITIONS "${_tilelang_tvm_defs}")
+        endif()
       endif()
-    endif()
-  endforeach()
-endif()
+    endforeach()
+  endif()
 
-# Provide the custom LogMessageImpl / LogFatalImpl implementation to TVM,
-# since TVM_LOG_CUSTOMIZE=1 requires them to be supplied by the user.
-target_sources(tvm_runtime_objs PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/logging.cc")
-if(TILELANG_RELEASE_BUILD)
-  target_compile_definitions(tvm_runtime_objs PRIVATE TILELANG_RELEASE_BUILD=1)
+  # Provide the custom LogMessageImpl / LogFatalImpl implementation to TVM,
+  # since TVM_LOG_CUSTOMIZE=1 requires them to be supplied by the user.
+  target_sources(tvm_runtime_objs PRIVATE
+                 "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/logging.cc")
+  if(TILELANG_RELEASE_BUILD)
+    target_compile_definitions(tvm_runtime_objs PRIVATE TILELANG_RELEASE_BUILD=1)
+  endif()
+else()
+  add_library(tvm_runtime SHARED IMPORTED GLOBAL)
+  set_target_properties(tvm_runtime PROPERTIES
+    IMPORTED_LOCATION "${TVM_PREBUILT_RUNTIME_LIBRARY}")
+
+  add_library(tvm_compiler SHARED IMPORTED GLOBAL)
+  set_target_properties(tvm_compiler PROPERTIES
+    IMPORTED_LOCATION "${TVM_PREBUILT_COMPILER_LIBRARY}"
+    INTERFACE_LINK_LIBRARIES tvm_runtime)
 endif()
 
 # Resolve compile warnings in tvm
@@ -558,7 +570,11 @@ if(TILELANG_RELEASE_BUILD)
   target_compile_definitions(tilelang_objs PRIVATE TILELANG_RELEASE_BUILD=1)
 endif()
 
-set(TILELANG_OUTPUT_TARGETS tvm_runtime tvm_compiler)
+if(TVM_BUILD_FROM_SOURCE)
+  set(TILELANG_OUTPUT_TARGETS tvm_runtime tvm_compiler)
+else()
+  set(TILELANG_OUTPUT_TARGETS)
+endif()
 if(WIN32)
   # Windows ships tvm_runtime.dll and tvm_compiler.dll. The compiler DLL also
   # carries TileLang's native registration/object code: TileLang uses TVM
@@ -728,3 +744,10 @@ install(
   RUNTIME DESTINATION tilelang/lib
   ARCHIVE DESTINATION tilelang/lib
 )
+
+if(NOT TVM_BUILD_FROM_SOURCE)
+  install(PROGRAMS
+    "${TVM_PREBUILT_RUNTIME_LIBRARY}"
+    "${TVM_PREBUILT_COMPILER_LIBRARY}"
+    DESTINATION tilelang/lib)
+endif()

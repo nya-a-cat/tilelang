@@ -113,13 +113,33 @@ jobs:
               tilelang/jit/adapter/cython/cython_wrapper.pyx
             cat submodule-revisions.txt
           } | sha256sum | awk '{ print $1 }')"
+          tvm_sdk_fingerprint="$({
+            git ls-tree -r HEAD -- \
+              CMakeLists.txt \
+              cmake \
+              pyproject.toml \
+              src/cpu/CMakeLists.txt \
+              src/cuda/CMakeLists.txt \
+              src/metal/CMakeLists.txt \
+              src/rocm/CMakeLists.txt \
+              src/webgpu/CMakeLists.txt \
+              src/runtime/logging.cc \
+              maint/scripts/install_cached_cuda_toolchain.sh \
+              maint/scripts/capture_prebuilt_tvm_sdk.sh
+            git ls-tree HEAD 3rdparty/tvm
+            echo "manylinux=${MANYLINUX_IMAGE_DIGEST}"
+            echo "cuda=${CUDA_VERSION}"
+            echo "backends=CUDA"
+          } | sha256sum | awk '{ print $1 }')"
           echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
           echo "native_fingerprint=${native_fingerprint}" >> "${GITHUB_OUTPUT}"
+          echo "tvm_sdk_fingerprint=${tvm_sdk_fingerprint}" >> "${GITHUB_OUTPUT}"
           {
             echo "repository=${GITHUB_REPOSITORY}"
             echo "commit=${commit}"
             echo "build_mode=${TILELANG_COLAB_BUILD_MODE}"
             echo "native_fingerprint=${native_fingerprint}"
+            echo "tvm_sdk_fingerprint=${tvm_sdk_fingerprint}"
             echo "manylinux_image=quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
             if [[ "${TILELANG_COLAB_BUILD_MODE}" == "fast-cuda" ]]; then
               echo "backends=CUDA"
@@ -147,6 +167,30 @@ jobs:
           restore-keys: |
             colab-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-
 
+      - name: Restore exact prebuilt TVM SDK
+        id: tvm-sdk-cache
+        if: inputs.build_mode == 'fast-cuda'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/prebuilt-tvm
+          key: colab-wheel-tvm-sdk-v1-${{ runner.os }}-${{ runner.arch }}-cp310-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-${{ steps.source.outputs.tvm_sdk_fingerprint }}
+
+      - name: Validate exact prebuilt TVM SDK
+        if: inputs.build_mode == 'fast-cuda' && steps.tvm-sdk-cache.outputs.cache-hit == 'true'
+        shell: bash
+        env:
+          TVM_SDK_FINGERPRINT: ${{ steps.source.outputs.tvm_sdk_fingerprint }}
+        run: |
+          set -euo pipefail
+          expected="tvm_sdk_fingerprint=${TVM_SDK_FINGERPRINT}"
+          actual="$(cat .cache/prebuilt-tvm/.tilelang-ci-cache-identity)"
+          test "${actual}" = "${expected}"
+          (
+            cd .cache/prebuilt-tvm
+            sha256sum --check SHA256SUMS
+          )
+          cat .cache/prebuilt-tvm/tvm-sdk-provenance.txt
+
       - name: Configure cached parallel build
         shell: bash
         run: |
@@ -154,10 +198,18 @@ jobs:
           jobs="$(getconf _NPROCESSORS_ONLN)"
           host_ccache_dir="${GITHUB_WORKSPACE}/.cache/ccache"
           host_toolchain_dir="${GITHUB_WORKSPACE}/.cache/ci-toolchain"
+          host_tvm_sdk_dir="${GITHUB_WORKSPACE}/.cache/prebuilt-tvm"
           container_toolchain_dir="/host${host_toolchain_dir}"
+          container_tvm_sdk_dir="/host${host_tvm_sdk_dir}"
           toolchain_cache_hit="${{ steps.toolchain-cache.outputs.cache-hit }}"
           toolchain_cache_hit="${toolchain_cache_hit:-false}"
-          mkdir -p "${host_ccache_dir}" "${host_toolchain_dir}"
+          tvm_sdk_cache_hit="${{ steps.tvm-sdk-cache.outputs.cache-hit }}"
+          tvm_sdk_cache_hit="${tvm_sdk_cache_hit:-false}"
+          prebuilt_tvm_dir=""
+          if [[ "${tvm_sdk_cache_hit}" == "true" ]]; then
+            prebuilt_tvm_dir="${container_tvm_sdk_dir}"
+          fi
+          mkdir -p "${host_ccache_dir}" "${host_toolchain_dir}" "${host_tvm_sdk_dir}"
 
           {
             echo "CCACHE_DIR=${host_ccache_dir}"
@@ -170,9 +222,9 @@ jobs:
 
           if [[ "${TILELANG_COLAB_BUILD_MODE}" == "fast-cuda" ]]; then
             {
-              echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=${container_toolchain_dir}/bin:/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=OFF CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content"
+              echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=${container_toolchain_dir}/bin:/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=OFF CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content TILELANG_PREBUILT_TVM_LIB_DIR=${prebuilt_tvm_dir}"
               echo "CIBW_TEST_SKIP=*"
-              echo "CIBW_REPAIR_WHEEL_COMMAND_LINUX=ccache --show-stats | tee /host${GITHUB_WORKSPACE}/ccache-stats.txt && cp {wheel} {dest_dir}"
+              echo "CIBW_REPAIR_WHEEL_COMMAND_LINUX=ccache --show-stats | tee /host${GITHUB_WORKSPACE}/ccache-stats.txt && /project/maint/scripts/capture_prebuilt_tvm_sdk.sh ${container_tvm_sdk_dir} ${{ steps.source.outputs.tvm_sdk_fingerprint }} {wheel} && cp {wheel} {dest_dir}"
               echo "CIBW_AUDIT_COMMAND="
               echo "CIBW_AUDIT_REQUIRES="
             } >> "${GITHUB_ENV}"
@@ -183,7 +235,7 @@ jobs:
             } >> "${GITHUB_ENV}"
           fi
 
-          echo "Using ${jobs} build workers; toolchain cache hit=${toolchain_cache_hit}; compiler cache hit=${{ steps.native-cache.outputs.cache-hit }}; mode=${TILELANG_COLAB_BUILD_MODE}"
+          echo "Using ${jobs} build workers; toolchain cache hit=${toolchain_cache_hit}; compiler cache hit=${{ steps.native-cache.outputs.cache-hit }}; TVM SDK cache hit=${tvm_sdk_cache_hit}; mode=${TILELANG_COLAB_BUILD_MODE}"
 
       - name: Build and import-test wheel
         id: wheel-build
@@ -206,7 +258,7 @@ jobs:
           else
             echo "Host ccache executable unavailable; cache files remain under ${CCACHE_DIR}." | tee ccache-stats.txt
           fi
-          du -sh .cache/ccache .cache/ci-toolchain 2>/dev/null | tee build-storage.txt || true
+          du -sh .cache/ccache .cache/ci-toolchain .cache/prebuilt-tvm 2>/dev/null | tee build-storage.txt || true
 
       - name: Save pinned CUDA toolchain package cache
         if: steps.toolchain-cache.outputs.cache-hit != 'true' && steps.wheel-build.outcome == 'success'
@@ -222,6 +274,13 @@ jobs:
           path: .cache/ccache
           key: colab-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-${{ steps.source.outputs.native_fingerprint }}
 
+      - name: Save exact prebuilt TVM SDK
+        if: inputs.build_mode == 'fast-cuda' && steps.tvm-sdk-cache.outputs.cache-hit != 'true' && steps.wheel-build.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/prebuilt-tvm
+          key: colab-wheel-tvm-sdk-v1-${{ runner.os }}-${{ runner.arch }}-cp310-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-${{ steps.source.outputs.tvm_sdk_fingerprint }}
+
       - name: Record checksums
         shell: bash
         run: |
@@ -230,6 +289,9 @@ jobs:
           cp ccache-stats.txt wheelhouse/ccache-stats.txt
           cp build-storage.txt wheelhouse/build-storage.txt
           cp .cache/ci-toolchain/toolchain-provenance.txt wheelhouse/toolchain-provenance.txt
+          if [[ -s .cache/prebuilt-tvm/tvm-sdk-provenance.txt ]]; then
+            cp .cache/prebuilt-tvm/tvm-sdk-provenance.txt wheelhouse/tvm-sdk-provenance.txt
+          fi
           ls -lh wheelhouse
 
       - name: Upload Colab artifact
