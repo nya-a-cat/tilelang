@@ -30,14 +30,16 @@ jobs:
           EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
         run: |
           set -euo pipefail
-          actual_sha="$(gh run view "${SOURCE_RUN_ID}" --repo "${GITHUB_REPOSITORY}" --json headSha --jq .headSha)"
-          test "${actual_sha}" = "${EXPECTED_HEAD_SHA}"
           mkdir -p dist
           gh run download "${SOURCE_RUN_ID}" --repo "${GITHUB_REPOSITORY}" --dir dist
           wheel="$(find dist -type f -name '*.whl' -print -quit)"
           checksum_file="$(find dist -type f -name SHA256SUMS -print -quit)"
+          revisions="$(find dist -type f -name source-revisions.txt -print -quit)"
           test -n "${wheel}"
           test -n "${checksum_file}"
+          test -n "${revisions}"
+          actual_source_sha="$(awk -F= '$1 == "commit" { print $2; exit }' "${revisions}")"
+          test "${actual_source_sha}" = "${EXPECTED_HEAD_SHA}"
           expected_hash="$(awk 'NR == 1 { print $1 }' "${checksum_file}")"
           actual_hash="$(sha256sum "${wheel}" | awk '{ print $1 }')"
           test "${actual_hash}" = "${expected_hash}"
