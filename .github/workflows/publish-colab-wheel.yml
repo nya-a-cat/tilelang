@@ -1,0 +1,67 @@
+name: Publish Colab wheel cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Actions run containing the wheel artifact
+        required: true
+        type: string
+      expected_head_sha:
+        description: Exact source commit built by that run
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish-colab-cache:
+    name: Verify and publish fork release assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download artifact inside GitHub
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(gh run view "${SOURCE_RUN_ID}" --repo "${GITHUB_REPOSITORY}" --json headSha --jq .headSha)"
+          test "${actual_sha}" = "${EXPECTED_HEAD_SHA}"
+          mkdir -p dist
+          gh run download "${SOURCE_RUN_ID}" --repo "${GITHUB_REPOSITORY}" --dir dist
+          checksum_file="$(find dist -type f -name SHA256SUMS -print -quit)"
+          test -n "${checksum_file}"
+          asset_dir="$(dirname "${checksum_file}")"
+          (cd "${asset_dir}" && sha256sum --check SHA256SUMS)
+
+      - name: Publish prerelease assets in this fork
+        id: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          set -euo pipefail
+          tag="colab-wheel-${EXPECTED_HEAD_SHA}"
+          wheel="$(find dist -type f -name '*.whl' -print -quit)"
+          checksum="$(find dist -type f -name SHA256SUMS -print -quit)"
+          revisions="$(find dist -type f -name source-revisions.txt -print -quit)"
+          test -n "${wheel}"
+          test -n "${checksum}"
+          test -n "${revisions}"
+          if ! gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${EXPECTED_HEAD_SHA}" \
+              --prerelease \
+              --title "Colab wheel ${EXPECTED_HEAD_SHA:0:12}" \
+              --notes "Fork-only reusable wheel for remote Colab validation. Source and submodule revisions plus SHA-256 are attached."
+          fi
+          gh release upload "${tag}" "${wheel}" "${checksum}" "${revisions}" \
+            --repo "${GITHUB_REPOSITORY}" --clobber
+          gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" --json url --jq .url
