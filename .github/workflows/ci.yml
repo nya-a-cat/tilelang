@@ -43,7 +43,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          submodules: recursive
+          submodules: ${{ github.event_name == 'workflow_dispatch' && github.repository_owner != 'tile-ai' && 'false' || 'recursive' }}
 
       - name: Setup Python 3.10
         id: setup-pylowest
@@ -61,6 +61,16 @@ jobs:
         run: |
           "${{ steps.setup-pylowest.outputs.python-path }}" -m compileall -q -f tilelang
 
+      - name: Restore fork pre-commit environments
+        id: restore-fork-precommit
+        if: github.event_name == 'workflow_dispatch' && github.repository_owner != 'tile-ai'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.PRE_COMMIT_HOME }}
+            ~/.cache/pipx
+          key: fork-precommit-${{ runner.os }}-py310-${{ hashFiles('.pre-commit-config.yaml') }}
+
       - name: C++ API Style Audit (warning only)
         env:
           PYTHONDONTWRITEBYTECODE: "1"
@@ -68,11 +78,44 @@ jobs:
           "${{ steps.setup-pylowest.outputs.python-path }}" maint/scripts/audit_cpp_api_style.py --github-warnings --limit 20
 
       - name: Pre-commit Lint
+        id: precommit-lint
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          FORK_MANUAL_SCOPE: ${{ github.event_name == 'workflow_dispatch' && github.repository_owner != 'tile-ai' }}
         run: |
-          if ! pipx run pre-commit run --all-files --color=always --show-diff-on-failure; then
+          args=(--all-files)
+          if [[ "${FORK_MANUAL_SCOPE}" == "true" ]]; then
+            git fetch --no-tags origin \
+              "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+            mapfile -d '' changed_files < <(
+              git diff --name-only -z --diff-filter=ACMRT \
+                "origin/${DEFAULT_BRANCH}...HEAD"
+            )
+            if (( ${#changed_files[@]} == 0 )); then
+              echo "No changed files require pre-commit checks."
+              exit 0
+            fi
+            printf 'Checking %d changed files.\n' "${#changed_files[@]}"
+            args=(--files "${changed_files[@]}")
+          fi
+
+          if ! pipx run pre-commit run "${args[@]}" --color=always --show-diff-on-failure; then
             echo "::error::Pre-commit checks failed. Please run 'pre-commit install' and 'pre-commit run --all-files' locally to see the issues."
             exit 1
           fi
+
+      - name: Save fork pre-commit environments
+        if: >-
+          success() &&
+          github.event_name == 'workflow_dispatch' &&
+          github.repository_owner != 'tile-ai' &&
+          steps.restore-fork-precommit.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.PRE_COMMIT_HOME }}
+            ~/.cache/pipx
+          key: fork-precommit-${{ runner.os }}-py310-${{ hashFiles('.pre-commit-config.yaml') }}
 
   tests:
     name: Test for Python ${{ matrix.python-version }} with ${{ matrix.runner.toolkit }} (on ${{ matrix.runner.name }})
