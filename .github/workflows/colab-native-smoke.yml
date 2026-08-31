@@ -500,6 +500,9 @@ jobs:
             --env TILELANG_PREBUILT_TVM_LIB_DIR=/project/.cache/prebuilt-tvm \
             --env USE_CUDA=ON \
             --env USE_ROCM=OFF \
+            --env GIT_CONFIG_COUNT=1 \
+            --env GIT_CONFIG_KEY_0=safe.directory \
+            --env GIT_CONFIG_VALUE_0=/project \
             "${MANYLINUX_IMAGE}" \
             /bin/bash --noprofile --norc -c '
           set -euo pipefail
@@ -543,7 +546,11 @@ jobs:
             echo "tvm_sdk_fingerprint=${{ steps.source.outputs.tvm_sdk_fingerprint }}"
             echo "native_fingerprint=${{ steps.source.outputs.native_fingerprint }}"
             cat .cache/native-cmake/provenance.txt
-            cat native-container-toolchain.txt
+            if [[ -f native-container-toolchain.txt ]]; then
+              cat native-container-toolchain.txt
+            else
+              echo "container_toolchain_record=unavailable_after_compile_failure"
+            fi
             ccache --show-stats
             if [[ -d build/native-smoke/lib ]]; then
               find build/native-smoke/lib -maxdepth 1 -type f -name '*.so' -print0 \
