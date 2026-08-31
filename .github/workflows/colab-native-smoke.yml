@@ -1,4 +1,4 @@
-name: Fast native compile smoke
+name: Build verified native overlay
 
 on:
   workflow_dispatch:
@@ -16,11 +16,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: colab-native-smoke-${{ inputs.source_ref }}-${{ inputs.native_base_ref }}
+  group: colab-native-overlay-${{ inputs.source_ref }}-${{ inputs.native_base_ref }}
   cancel-in-progress: true
 
 jobs:
-  native-compile-smoke:
+  native-overlay:
     if: github.repository == 'nya-a-cat/tilelang'
     name: Ubuntu 22.04 CUDA native hot patch
     runs-on: ubuntu-22.04
@@ -411,13 +411,15 @@ jobs:
           path: .cache/native-cmake
           key: tilelang-native-cmake-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.CMAKE_WHEEL_VERSION }}-${{ env.CMAKE_WHEEL_SHA256 }}
 
-      - name: Restore manylinux native compiler cache
+      - name: Restore direct native compiler cache
         id: manylinux-native-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/ccache
-          key: colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-${{ steps.source.outputs.native_fingerprint }}
+          key: colab-native-direct-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-${{ steps.source.outputs.native_fingerprint }}
           restore-keys: |
+            colab-native-direct-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-
+            colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-${{ steps.source.outputs.native_fingerprint }}
             colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-
 
       - name: Configure pinned manylinux native compile
@@ -449,7 +451,7 @@ jobs:
             echo "USE_ROCM=OFF"
             echo "MANYLINUX_IMAGE=quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
           } >> "${GITHUB_ENV}"
-          echo "Using ${jobs} manylinux build workers; compiler cache exact hit=${{ steps.manylinux-native-cache.outputs.cache-hit }}"
+          echo "Using ${jobs} manylinux build workers; direct compiler cache exact hit=${{ steps.manylinux-native-cache.outputs.cache-hit }}"
 
       - name: Confirm pinned manylinux image is ready
         shell: bash
@@ -1028,12 +1030,12 @@ jobs:
           print(f"selftest_libtilelang_sha256={library_hash}")
           PY
 
-      - name: Save manylinux native compiler cache
+      - name: Save direct native compiler cache
         if: always() && steps.manylinux-native-cache.outputs.cache-hit != 'true' && steps.native-build.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/ccache
-          key: colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-${{ steps.source.outputs.native_fingerprint }}
+          key: colab-native-direct-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-${{ steps.source.outputs.native_fingerprint }}
 
       - name: Upload native compile evidence
         if: steps.overlay-selftest.outcome == 'success'

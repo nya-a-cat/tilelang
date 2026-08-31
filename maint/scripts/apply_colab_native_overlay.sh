@@ -261,7 +261,8 @@ cp -a -- "${package_dir}" "${staged_package}"
 
 find "${staged_package}" \
     \( -path "${staged_package}/lib" -o -path "${staged_package}/src" -o -path "${staged_package}/3rdparty" \) -prune \
-    -o -type f \( -name '*.py' -o -name '*.pyi' -o -name '*.md' -o -name '*.pyc' \) -delete
+    -o -type f \( -name '*.py' -o -name '*.pyi' -o -name '*.md' -o -name '*.pyc' \) \
+    -exec rm -f -- {} +
 rm -f -- \
     "${staged_package}/_python_overlay_identity.json" \
     "${staged_package}/_native_overlay_identity.json"
