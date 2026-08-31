@@ -35,41 +35,17 @@ jobs:
       TILELANG_COLAB_BUILD_MODE: ${{ inputs.build_mode }}
       MANYLINUX_IMAGE_DIGEST: 012f4a50472412f18bb2b450c1cce7158434cfae4ae878591c2748a13a30c2be
     steps:
-      - name: Restore pinned manylinux image archive
-        id: manylinux-image-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/tilelang-manylinux-image
-          key: colab-manylinux-image-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.MANYLINUX_IMAGE_DIGEST }}
-
-      - name: Start pinned manylinux image preparation
+      - name: Start pinned manylinux image pull
         shell: bash
         run: |
           set -euo pipefail
-          pinned_image="quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
-          local_image="tilelang-manylinux:2_28-${MANYLINUX_IMAGE_DIGEST:0:12}"
-          cache_dir="${RUNNER_TEMP}/tilelang-manylinux-image"
+          image="quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
           pull_log="${RUNNER_TEMP}/tilelang-manylinux-pull.log"
           pull_pid="${RUNNER_TEMP}/tilelang-manylinux-pull.pid"
-          pull_mode="${RUNNER_TEMP}/tilelang-manylinux-pull.mode"
           : > "${pull_log}"
-
-          if [[ "${{ steps.manylinux-image-cache.outputs.cache-hit }}" == "true" ]]; then
-            grep -Fx "source_digest=${MANYLINUX_IMAGE_DIGEST}" "${cache_dir}/image-identity.txt"
-            grep -Fx "local_image=${local_image}" "${cache_dir}/image-identity.txt"
-            nohup bash -c '
-              set -euo pipefail
-              cd "$1"
-              sha256sum --check SHA256SUMS
-              zstd -dc manylinux-image.tar.zst | docker load
-            ' _ "${cache_dir}" > "${pull_log}" 2>&1 &
-            echo "cache" > "${pull_mode}"
-          else
-            nohup docker pull "${pinned_image}" > "${pull_log}" 2>&1 &
-            echo "registry" > "${pull_mode}"
-          fi
+          nohup docker pull "${image}" > "${pull_log}" 2>&1 &
           echo "$!" > "${pull_pid}"
-          echo "Started pinned image preparation in process $(cat "${pull_pid}") while source and build caches restore."
+          echo "Started pinned image pull in process $(cat "${pull_pid}") while source and build caches restore."
 
       - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -253,7 +229,7 @@ jobs:
             echo "CCACHE_DIR=${host_ccache_dir}"
             echo "CMAKE_BUILD_PARALLEL_LEVEL=${jobs}"
             echo "CMAKE_GENERATOR=Ninja"
-            echo "CIBW_MANYLINUX_X86_64_IMAGE=tilelang-manylinux:2_28-${MANYLINUX_IMAGE_DIGEST:0:12}"
+            echo "CIBW_MANYLINUX_X86_64_IMAGE=quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
             echo "CIBW_BEFORE_ALL_LINUX=/project/maint/scripts/use_cached_cuda_sysroot.sh ${container_toolchain_dir} ${toolchain_cache_hit}"
             echo "CIBW_BUILD_FRONTEND=build[uv]"
           } >> "${GITHUB_ENV}"
@@ -276,18 +252,13 @@ jobs:
           echo "Using ${jobs} build workers; toolchain cache hit=${toolchain_cache_hit}; compiler cache hit=${{ steps.native-cache.outputs.cache-hit }}; TVM SDK cache hit=${tvm_sdk_cache_hit}; mode=${TILELANG_COLAB_BUILD_MODE}"
 
       - name: Confirm pinned manylinux image is ready
-        id: manylinux-image
         shell: bash
         run: |
           set -euo pipefail
-          pinned_image="quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
-          local_image="tilelang-manylinux:2_28-${MANYLINUX_IMAGE_DIGEST:0:12}"
-          cache_dir="${RUNNER_TEMP}/tilelang-manylinux-image"
+          image="quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
           pull_log="${RUNNER_TEMP}/tilelang-manylinux-pull.log"
           pull_pid_file="${RUNNER_TEMP}/tilelang-manylinux-pull.pid"
-          pull_mode_file="${RUNNER_TEMP}/tilelang-manylinux-pull.mode"
           pull_pid="$(cat "${pull_pid_file}")"
-          mode="$(cat "${pull_mode_file}")"
           deadline=$((SECONDS + 300))
 
           while kill -0 "${pull_pid}" 2>/dev/null; do
@@ -300,24 +271,13 @@ jobs:
             sleep 1
           done
 
-          if [[ "${mode}" == "registry" ]]; then
-            docker image inspect "${pinned_image}" >/dev/null
-            docker tag "${pinned_image}" "${local_image}"
-          fi
-          if ! docker image inspect "${local_image}" >/dev/null 2>&1; then
+          if ! docker image inspect "${image}" >/dev/null 2>&1; then
             cat "${pull_log}" >&2
-            echo "Pinned manylinux image preparation failed." >&2
+            echo "Pinned manylinux image pull failed." >&2
             exit 2
           fi
-
-          image_id="$(docker image inspect "${local_image}" --format '{{.Id}}')"
-          if [[ "${mode}" == "cache" ]]; then
-            expected_id="$(sed -n 's/^image_id=//p' "${cache_dir}/image-identity.txt")"
-            test "${image_id}" = "${expected_id}"
-          fi
           cat "${pull_log}"
-          docker image inspect "${local_image}" --format 'ready={{.Id}} platform={{.Os}}/{{.Architecture}} size={{.Size}}'
-          echo "image_id=${image_id}" >> "${GITHUB_OUTPUT}"
+          docker image inspect "${image}" --format 'ready={{.Id}} platform={{.Os}}/{{.Architecture}}'
 
       - name: Build and import-test wheel
         id: wheel-build
@@ -340,38 +300,7 @@ jobs:
           else
             echo "Host ccache executable unavailable; cache files remain under ${CCACHE_DIR}." | tee ccache-stats.txt
           fi
-          du -sh .cache/ccache .cache/ci-toolchain .cache/prebuilt-tvm "${RUNNER_TEMP}/tilelang-manylinux-image" 2>/dev/null | tee build-storage.txt || true
-
-      - name: Capture pinned manylinux image archive
-        if: steps.manylinux-image-cache.outputs.cache-hit != 'true' && steps.wheel-build.outcome == 'success'
-        shell: bash
-        run: |
-          set -euo pipefail
-          local_image="tilelang-manylinux:2_28-${MANYLINUX_IMAGE_DIGEST:0:12}"
-          cache_dir="${RUNNER_TEMP}/tilelang-manylinux-image"
-          archive="${cache_dir}/manylinux-image.tar.zst"
-          mkdir -p "${cache_dir}"
-          rm -f -- "${archive}.tmp"
-          docker save "${local_image}" | zstd -T0 -3 -o "${archive}.tmp"
-          mv -- "${archive}.tmp" "${archive}"
-          {
-            echo "source_digest=${MANYLINUX_IMAGE_DIGEST}"
-            echo "local_image=${local_image}"
-            echo "image_id=${{ steps.manylinux-image.outputs.image_id }}"
-          } > "${cache_dir}/image-identity.txt"
-          (
-            cd "${cache_dir}"
-            sha256sum manylinux-image.tar.zst image-identity.txt > SHA256SUMS
-            sha256sum --check SHA256SUMS
-            du -sh .
-          )
-
-      - name: Save pinned manylinux image archive
-        if: steps.manylinux-image-cache.outputs.cache-hit != 'true' && steps.wheel-build.outcome == 'success'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/tilelang-manylinux-image
-          key: colab-manylinux-image-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.MANYLINUX_IMAGE_DIGEST }}
+          du -sh .cache/ccache .cache/ci-toolchain .cache/prebuilt-tvm 2>/dev/null | tee build-storage.txt || true
 
       - name: Save relocatable CUDA toolchain cache
         if: steps.toolchain-cache.outputs.cache-hit != 'true' && steps.wheel-build.outcome == 'success'
