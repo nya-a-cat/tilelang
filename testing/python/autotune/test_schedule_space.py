@@ -6,8 +6,13 @@ import json
 
 import pytest
 
-from tilelang.autotuner import ScheduleConstraint, ScheduleSpace, TargetProfile, requires_feature, within_target_limit
-from benchmark.mamba2.schedule_spaces import LEGACY_PARAMETER_NAMES, legacy_schedule_space, research_schedule_space
+from tilelang.autotuner import PassConfigBinding, ScheduleConstraint, ScheduleSpace, TargetProfile, requires_feature, within_target_limit
+from benchmark.mamba2.schedule_spaces import (
+    LEGACY_PARAMETER_NAMES,
+    executable_schedule_space,
+    legacy_schedule_space,
+    research_schedule_space,
+)
 
 
 def test_cartesian_space_preserves_deterministic_order_and_json_compatibility():
@@ -95,6 +100,44 @@ def test_target_resource_limit_filters_threads():
     assert space == [{"threads": 128}, {"threads": 256}]
 
 
+def test_semantic_fields_materialize_into_per_candidate_pass_configs():
+    space = ScheduleSpace(
+        {
+            "threads": [128],
+            "copy_policy": ["auto", "sync", "async"],
+            "warp_specialization": [False, True],
+        },
+        fixed={"pass_configs": {"tl.enable_fast_math": True}},
+        pass_config_bindings=[
+            PassConfigBinding(
+                "copy_policy",
+                "tl.enable_async_copy",
+                transform=lambda policy: policy == "async",
+                omit_values=("auto",),
+            ),
+            PassConfigBinding(
+                "warp_specialization",
+                "tl.disable_warp_specialized",
+                transform=lambda enabled: not enabled,
+            ),
+        ],
+    )
+
+    assert len(space) == 6
+    assert space[0] == {
+        "threads": 128,
+        "pass_configs": {"tl.enable_fast_math": True, "tl.disable_warp_specialized": True},
+    }
+    assert space[-1] == {
+        "threads": 128,
+        "pass_configs": {
+            "tl.enable_fast_math": True,
+            "tl.enable_async_copy": True,
+            "tl.disable_warp_specialized": False,
+        },
+    }
+
+
 def test_mamba_legacy_space_is_preserved_exactly():
     space = legacy_schedule_space()
 
@@ -129,6 +172,22 @@ def test_mamba_research_space_capability_filter_is_conservative():
     assert {config["schedule_grid_mapping"] for config in research} == {"spatial"}
     assert {config["schedule_copy_policy"] for config in research} == {"auto"}
     assert {config["schedule_warp_specialization"] for config in research} == {False}
+
+
+def test_mamba_executable_space_only_emits_kernel_args_and_pass_configs():
+    target = TargetProfile(
+        "cuda",
+        "sm_90a",
+        features=frozenset({"async_copy", "warp_specialization"}),
+        limits={"max_threads_per_block": 1024},
+    )
+    space = executable_schedule_space(target)
+
+    assert space.raw_cardinality == 720
+    assert len(space) == 720
+    assert all(not any(key.startswith("schedule_") for key in config) for config in space)
+    assert {config["pass_configs"]["tl.enable_async_copy"] for config in space} == {False, True}
+    assert {config["pass_configs"]["tl.disable_warp_specialized"] for config in space} == {False, True}
 
 
 def test_space_explosion_is_rejected_before_materialization():

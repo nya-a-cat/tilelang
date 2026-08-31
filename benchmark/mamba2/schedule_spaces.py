@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tilelang.autotuner import ScheduleSpace, TargetProfile, requires_feature, within_target_limit
+from tilelang.autotuner import PassConfigBinding, ScheduleSpace, TargetProfile, requires_feature, within_target_limit
 
 LEGACY_PARAMETER_NAMES = ("block_M", "block_N", "block_K", "block_Dstate", "num_stages")
 
@@ -44,6 +44,42 @@ def research_schedule_space(target: TargetProfile) -> ScheduleSpace:
             requires_feature("schedule_copy_policy", ("async",), "async_copy"),
             requires_feature("schedule_warp_specialization", (True,), "warp_specialization"),
             within_target_limit("threads", "max_threads_per_block"),
+        ),
+        max_candidates=10_000,
+    )
+
+
+def executable_schedule_space(target: TargetProfile) -> ScheduleSpace:
+    """Return the currently materializable subset of the research space.
+
+    Copy and warp-specialization choices lower into per-candidate pass configs;
+    all remaining fields are accepted directly by ``chunk_scan_fwd``.
+    """
+
+    return ScheduleSpace(
+        {
+            **_LEGACY_PARAMETERS,
+            "threads": (128, 256),
+            "schedule_copy_policy": ("sync", "async"),
+            "schedule_warp_specialization": (False, True),
+        },
+        target=target,
+        constraints=(
+            requires_feature("schedule_copy_policy", ("async",), "async_copy"),
+            requires_feature("schedule_warp_specialization", (True,), "warp_specialization"),
+            within_target_limit("threads", "max_threads_per_block"),
+        ),
+        pass_config_bindings=(
+            PassConfigBinding(
+                "schedule_copy_policy",
+                "tl.enable_async_copy",
+                transform=lambda policy: policy == "async",
+            ),
+            PassConfigBinding(
+                "schedule_warp_specialization",
+                "tl.disable_warp_specialized",
+                transform=lambda enabled: not enabled,
+            ),
         ),
         max_candidates=10_000,
     )

@@ -19,6 +19,7 @@ from typing import Any
 
 ScheduleConfig = dict[str, Any]
 ConstraintPredicate = Callable[[Mapping[str, Any], "TargetProfile | None"], bool]
+ValueTransform = Callable[[Any], Any]
 
 _ARCH_PATTERN = re.compile(r"(?<![A-Za-z0-9])((?:sm|gfx)[_-]?[A-Za-z0-9]+)")
 
@@ -121,6 +122,35 @@ class ScheduleConstraint:
         return bool(self.predicate(config, target))
 
 
+def _identity(value: Any) -> Any:
+    return value
+
+
+@dataclass(frozen=True)
+class PassConfigBinding:
+    """Materialize one semantic schedule field as a compiler pass config."""
+
+    parameter: str
+    key: str
+    transform: ValueTransform = _identity
+    omit_values: tuple[Any, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.parameter.isidentifier():
+            raise ValueError(f"Bound schedule parameter {self.parameter!r} must be a valid Python identifier")
+        if not self.key.strip():
+            raise ValueError("Pass config key must be a non-empty string")
+        if not callable(self.transform):
+            raise TypeError("Pass config transform must be callable")
+
+    def materialize(self, value: Any) -> tuple[bool, Any]:
+        """Return ``(emit, value)`` for a semantic field value."""
+
+        if any(value == omitted for omitted in self.omit_values):
+            return False, None
+        return True, self.transform(value)
+
+
 def requires_feature(
     parameter: str,
     values: Iterable[Any],
@@ -168,6 +198,7 @@ class ScheduleSpace(list[ScheduleConfig]):
         *,
         fixed: Mapping[str, Any] | None = None,
         constraints: Iterable[ScheduleConstraint] = (),
+        pass_config_bindings: Iterable[PassConfigBinding] = (),
         target: TargetProfile | None = None,
         max_candidates: int = 100_000,
     ) -> None:
@@ -202,6 +233,17 @@ class ScheduleSpace(list[ScheduleConfig]):
             if not isinstance(constraint, ScheduleConstraint):
                 raise TypeError("constraints must contain ScheduleConstraint instances")
 
+        binding_list = tuple(pass_config_bindings)
+        binding_parameters: set[str] = set()
+        for binding in binding_list:
+            if not isinstance(binding, PassConfigBinding):
+                raise TypeError("pass_config_bindings must contain PassConfigBinding instances")
+            if binding.parameter not in dict(dimensions):
+                raise ValueError(f"Pass config binding refers to unknown parameter {binding.parameter!r}")
+            if binding.parameter in binding_parameters:
+                raise ValueError(f"Schedule parameter {binding.parameter!r} has multiple pass config bindings")
+            binding_parameters.add(binding.parameter)
+
         accepted: list[ScheduleConfig] = []
         rejected: Counter[str] = Counter()
         names = tuple(name for name, _ in dimensions)
@@ -218,12 +260,13 @@ class ScheduleSpace(list[ScheduleConfig]):
                     rejected[constraint.name] += 1
                     break
             else:
-                accepted.append(config)
+                accepted.append(self._materialize_config(config, binding_list))
 
         super().__init__(accepted)
         self.parameters = MappingProxyType({name: values for name, values in dimensions})
         self.fixed = MappingProxyType(fixed_config)
         self.constraints = constraint_list
+        self.pass_config_bindings = binding_list
         self.target = target
         self.raw_cardinality = raw_cardinality
         self.rejection_counts = MappingProxyType(dict(rejected))
@@ -245,4 +288,23 @@ class ScheduleSpace(list[ScheduleConfig]):
             "raw_cardinality": self.raw_cardinality,
             "accepted_cardinality": len(self),
             "rejection_counts": dict(self.rejection_counts),
+            "pass_config_bindings": [{"parameter": binding.parameter, "key": binding.key} for binding in self.pass_config_bindings],
         }
+
+    @staticmethod
+    def _materialize_config(config: ScheduleConfig, bindings: tuple[PassConfigBinding, ...]) -> ScheduleConfig:
+        if not bindings:
+            return config
+        materialized = dict(config)
+        pass_configs = dict(materialized.get("pass_configs", {}))
+        for binding in bindings:
+            value = materialized.pop(binding.parameter)
+            emit, pass_config_value = binding.materialize(value)
+            if not emit:
+                continue
+            if binding.key in pass_configs:
+                raise ValueError(f"Pass config binding for {binding.parameter!r} conflicts with fixed key {binding.key!r}")
+            pass_configs[binding.key] = pass_config_value
+        if pass_configs:
+            materialized["pass_configs"] = pass_configs
+        return materialized

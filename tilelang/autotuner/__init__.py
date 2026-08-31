@@ -7,6 +7,7 @@ from .capture import (
     get_autotune_inputs,  # noqa: F401
 )
 from .schedule_space import (  # noqa: F401
+    PassConfigBinding,
     ScheduleConstraint,
     ScheduleSpace,
     TargetProfile,
