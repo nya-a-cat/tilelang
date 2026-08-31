@@ -28,6 +28,23 @@ import torch.nn.functional as F
 
 import tilelang
 import tilelang.language as T
+from tilelang.autotuner import TargetProfile
+from tilelang.carver.arch.driver.cuda_driver import cudaDeviceAttrNames, get_device_attribute
+
+if __package__:
+    from .cross_gemm_schedule_space import (
+        CrossGemmWorkload,
+        cross_gemm_schedule_estimate,
+        cross_gemm_search_summary,
+        ranked_cross_gemm_schedules,
+    )
+else:
+    from cross_gemm_schedule_space import (
+        CrossGemmWorkload,
+        cross_gemm_schedule_estimate,
+        cross_gemm_search_summary,
+        ranked_cross_gemm_schedules,
+    )
 
 
 DEFAULT_SHAPES = (
@@ -35,6 +52,60 @@ DEFAULT_SHAPES = (
     (512, 896, 4864, "qwen2.5-0.5b"),
     (256, 1536, 8960, "qwen2.5-1.5b"),
 )
+
+
+def cuda_target_profile(device: int | None = None) -> TargetProfile:
+    """Build a resource profile from the selected CUDA device."""
+
+    device = torch.cuda.current_device() if device is None else device
+    properties = torch.cuda.get_device_properties(device)
+    major, minor = torch.cuda.get_device_capability(device)
+    max_threads_per_block = get_device_attribute(cudaDeviceAttrNames.cudaDevAttrMaxThreadsPerBlock, device)
+    max_registers_per_block = get_device_attribute(cudaDeviceAttrNames.cudaDevAttrMaxRegistersPerBlock, device)
+    limits = {
+        "max_threads_per_block": int(max_threads_per_block or getattr(properties, "max_threads_per_block", 1024)),
+        "max_shared_bytes_per_block": int(properties.shared_memory_per_block),
+        "max_registers_per_thread": 255,
+        "max_registers_per_block": int(max_registers_per_block or 64 * 1024),
+        "multiprocessor_count": int(properties.multi_processor_count),
+    }
+    features = {"async_copy"} if major >= 8 else set()
+    return TargetProfile("cuda", f"sm_{major}{minor}", features=frozenset(features), limits=limits)
+
+
+def target_profile_payload(target: TargetProfile) -> dict[str, Any]:
+    """Serialize the exact profile used by the deterministic ranker."""
+
+    return {
+        "backend": target.backend,
+        "arch": target.arch,
+        "features": sorted(target.features),
+        "limits": dict(target.limits),
+    }
+
+
+def select_ranked_schedule(
+    workload: CrossGemmWorkload,
+    target: TargetProfile,
+    rank: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Select and describe one statically ranked schedule."""
+
+    if rank < 0:
+        raise ValueError("schedule rank must be non-negative")
+    ranked = ranked_cross_gemm_schedules(workload, target)
+    if rank >= len(ranked):
+        raise ValueError(f"schedule rank {rank} exceeds {len(ranked)} accepted candidates")
+    config = ranked[rank]
+    summary = cross_gemm_search_summary(workload, target, top_k=max(8, rank + 1))
+    return config, {
+        "policy": "resource_rank_v1",
+        "rank": rank,
+        "selected_config": config,
+        "selected_estimate": cross_gemm_schedule_estimate(config, workload, target),
+        "space": summary["space"],
+        "top_candidates": summary["top_candidates"],
+    }
 
 
 def cross_gemm_swiglu(
@@ -196,6 +267,7 @@ def benchmark_shape(
     warmup: int,
     use_torch_compile: bool,
     variant: str,
+    schedule_selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     torch.manual_seed(0)
     A = torch.randn((M, K), device="cuda", dtype=torch.float16) * 0.02
@@ -276,6 +348,7 @@ def benchmark_shape(
             "num_stages": num_stages,
             "threads": threads,
         },
+        "schedule_selection": schedule_selection,
         "correctness": correctness,
         "latency": summaries,
         "best_baseline": best_baseline,
@@ -305,6 +378,13 @@ def main() -> None:
     parser.add_argument("--block-k", type=int, default=int(os.environ.get("TILELANG_BENCH_BLOCK_K", "32")))
     parser.add_argument("--num-stages", type=int, default=int(os.environ.get("TILELANG_BENCH_NUM_STAGES", "0")))
     parser.add_argument("--threads", type=int, default=int(os.environ.get("TILELANG_BENCH_THREADS", "128")))
+    schedule_rank = os.environ.get("TILELANG_BENCH_SCHEDULE_RANK")
+    parser.add_argument(
+        "--schedule-rank",
+        type=int,
+        default=int(schedule_rank) if schedule_rank is not None else None,
+        help="select this zero-based rank from the deterministic resource-aware schedule space",
+    )
     parser.add_argument("--cycles", type=int, default=int(os.environ.get("TILELANG_BENCH_CYCLES", "20")))
     parser.add_argument("--repeats", type=int, default=int(os.environ.get("TILELANG_BENCH_REPEATS", "100")))
     parser.add_argument("--warmup", type=int, default=int(os.environ.get("TILELANG_BENCH_WARMUP", "20")))
@@ -327,28 +407,38 @@ def main() -> None:
         args.shapes or ([parse_shape(value) for value in environment_shapes.split(";")] if environment_shapes else DEFAULT_SHAPES)
     )
     started = time.time()
-    results = [
-        benchmark_shape(
-            M,
-            K,
-            N,
-            label,
-            block_M=args.block_m,
-            block_N=args.block_n,
-            block_K=args.block_k,
-            num_stages=args.num_stages,
-            threads=args.threads,
-            cycles=args.cycles,
-            repeats=args.repeats,
-            warmup=args.warmup,
-            use_torch_compile=args.torch_compile,
-            variant=args.variant,
+    target_profile = cuda_target_profile()
+    results = []
+    for M, K, N, label in shapes:
+        config = {
+            "block_M": args.block_m,
+            "block_N": args.block_n,
+            "block_K": args.block_k,
+            "num_stages": args.num_stages,
+            "threads": args.threads,
+        }
+        selection = None
+        if args.schedule_rank is not None:
+            workload = CrossGemmWorkload(M=M, K=K, N=N, gemm_count=1 if args.variant == "single" else 2)
+            config, selection = select_ranked_schedule(workload, target_profile, args.schedule_rank)
+        results.append(
+            benchmark_shape(
+                M,
+                K,
+                N,
+                label,
+                **config,
+                cycles=args.cycles,
+                repeats=args.repeats,
+                warmup=args.warmup,
+                use_torch_compile=args.torch_compile,
+                variant=args.variant,
+                schedule_selection=selection,
+            )
         )
-        for M, K, N, label in shapes
-    ]
     geomean_speedup = math.exp(statistics.mean(math.log(item["speedup"]) for item in results))
     payload = {
-        "schema": "tilelang-cross-gemm-swiglu-v1",
+        "schema": "tilelang-cross-gemm-swiglu-v2",
         "repository": "nya-a-cat/tilelang",
         "commit": os.environ.get("TILELANG_SOURCE_SHA") or git_head(),
         "native_base_sha": os.environ.get("TILELANG_NATIVE_BASE_SHA"),
@@ -362,6 +452,7 @@ def main() -> None:
             "tilelang": getattr(tilelang, "__version__", None),
             "gpu": torch.cuda.get_device_name(),
             "compute_capability": list(torch.cuda.get_device_capability()),
+            "target_profile": target_profile_payload(target_profile),
         },
         "protocol": {
             "cycles": args.cycles,
@@ -369,6 +460,8 @@ def main() -> None:
             "warmup_calls_per_method": args.warmup,
             "statistic": "median CUDA-event kernel latency",
             "order": "alternating baseline/fused/fused/baseline",
+            "schedule_policy": "resource_rank_v1" if args.schedule_rank is not None else "manual",
+            "schedule_rank": args.schedule_rank,
         },
         "results": results,
         "geomean_speedup": geomean_speedup,

@@ -58,6 +58,12 @@ def cross_gemm_accumulator_registers(config: Mapping[str, Any], workload: CrossG
     return registers
 
 
+def cross_gemm_accumulator_registers_per_block(config: Mapping[str, Any], workload: CrossGemmWorkload) -> int:
+    """Upper-bound accumulator registers allocated across one thread block."""
+
+    return cross_gemm_accumulator_registers(config, workload) * int(config["threads"])
+
+
 def _tiles_divide_workload(config: Mapping[str, Any], workload: CrossGemmWorkload) -> bool:
     return (
         workload.M % int(config["block_M"]) == 0 and workload.N % int(config["block_N"]) == 0 and workload.K % int(config["block_K"]) == 0
@@ -89,6 +95,11 @@ def cross_gemm_schedule_space(workload: CrossGemmWorkload, target: TargetProfile
                 "max_registers_per_thread",
                 lambda config, _target: cross_gemm_accumulator_registers(config, workload),
             ),
+            estimated_within_target_limit(
+                "accumulator_registers_per_block",
+                "max_registers_per_block",
+                lambda config, _target: cross_gemm_accumulator_registers_per_block(config, workload),
+            ),
         ),
         max_candidates=1_000,
     )
@@ -107,6 +118,7 @@ def cross_gemm_schedule_estimate(
     multiprocessors = target.limit("multiprocessor_count")
     shared_bytes = cross_gemm_shared_bytes(config, workload)
     accumulator_registers = cross_gemm_accumulator_registers(config, workload)
+    accumulator_registers_per_block = cross_gemm_accumulator_registers_per_block(config, workload)
     return {
         "grid_ctas": grid_ctas,
         "waves": grid_ctas / multiprocessors if multiprocessors else 0.0,
@@ -116,6 +128,10 @@ def cross_gemm_schedule_estimate(
         "accumulator_registers_per_thread": accumulator_registers,
         "accumulator_register_fraction": accumulator_registers / target.limit("max_registers_per_thread")
         if target.limit("max_registers_per_thread")
+        else 0.0,
+        "accumulator_registers_per_block": accumulator_registers_per_block,
+        "accumulator_register_block_fraction": accumulator_registers_per_block / target.limit("max_registers_per_block")
+        if target.limit("max_registers_per_block")
         else 0.0,
     }
 
@@ -134,6 +150,7 @@ def ranked_cross_gemm_schedules(
         resource_pressure = max(
             float(estimate["shared_fraction"]),
             float(estimate["accumulator_register_fraction"]),
+            float(estimate["accumulator_register_block_fraction"]),
         )
         return (
             float(estimate["operand_bytes_per_k_output"]),

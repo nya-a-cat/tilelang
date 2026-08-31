@@ -18,6 +18,7 @@ from tilelang.autotuner import (
 from benchmark.research.cross_gemm_schedule_space import (
     CrossGemmWorkload,
     cross_gemm_accumulator_registers,
+    cross_gemm_accumulator_registers_per_block,
     cross_gemm_schedule_space,
     cross_gemm_search_summary,
     cross_gemm_shared_bytes,
@@ -233,6 +234,7 @@ def test_cross_gemm_space_filters_resources_and_ranks_reuse_deterministically():
             "max_threads_per_block": 1024,
             "max_shared_bytes_per_block": 64 * 1024,
             "max_registers_per_thread": 255,
+            "max_registers_per_block": 64 * 1024,
             "multiprocessor_count": 40,
         },
     )
@@ -244,6 +246,7 @@ def test_cross_gemm_space_filters_resources_and_ranks_reuse_deterministically():
     assert len(space) == 129
     assert all(cross_gemm_shared_bytes(config, workload) <= 64 * 1024 for config in space)
     assert all(cross_gemm_accumulator_registers(config, workload) <= 255 for config in space)
+    assert all(cross_gemm_accumulator_registers_per_block(config, workload) <= 64 * 1024 for config in space)
     assert ranked[0] == {
         "block_M": 128,
         "block_N": 128,
@@ -253,6 +256,32 @@ def test_cross_gemm_space_filters_resources_and_ranks_reuse_deterministically():
     }
     assert summary["top_candidates"][0]["config"] == ranked[0]
     assert json.loads(json.dumps(summary)) == summary
+
+
+def test_cross_gemm_t4_profile_selects_a_schedule_within_default_shared_memory():
+    workload = CrossGemmWorkload(M=256, K=896, N=4864)
+    target = TargetProfile(
+        "cuda",
+        "sm_75",
+        limits={
+            "max_threads_per_block": 1024,
+            "max_shared_bytes_per_block": 48 * 1024,
+            "max_registers_per_thread": 255,
+            "max_registers_per_block": 64 * 1024,
+            "multiprocessor_count": 40,
+        },
+    )
+
+    ranked = ranked_cross_gemm_schedules(workload, target)
+
+    assert ranked[0] == {
+        "block_M": 128,
+        "block_N": 128,
+        "block_K": 16,
+        "num_stages": 0,
+        "threads": 256,
+    }
+    assert cross_gemm_shared_bytes(ranked[0], workload) == 44 * 1024
 
 
 def test_space_explosion_is_rejected_before_materialization():
