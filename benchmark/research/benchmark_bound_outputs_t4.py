@@ -25,7 +25,8 @@ import statistics
 import subprocess
 import sys
 import time
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 import urllib.request
 import zipfile
 
@@ -156,11 +157,7 @@ def verify_checksums(checksum_path: Path) -> dict[str, str]:
             raise RuntimeError(f"invalid checksum member: {filename!r}")
         expected[filename] = normalize_sha256(digest, filename)
 
-    actual_files = {
-        path.name: path
-        for path in checksum_path.parent.iterdir()
-        if path.is_file() and path.name != checksum_path.name
-    }
+    actual_files = {path.name: path for path in checksum_path.parent.iterdir() if path.is_file() and path.name != checksum_path.name}
     if set(actual_files) != set(expected):
         raise RuntimeError("artifact checksum inventory mismatch")
     for name, path in actual_files.items():
@@ -551,9 +548,7 @@ def allocation_probe(call: Callable[[], Any]) -> dict[str, int]:
         "calls": 100,
         "unique_output_addresses": len(pointers),
         "allocation_requests": int(after["allocation.all.allocated"] - before["allocation.all.allocated"]),
-        "allocated_bytes_requests": int(
-            after["allocated_bytes.all.allocated"] - before["allocated_bytes.all.allocated"]
-        ),
+        "allocated_bytes_requests": int(after["allocated_bytes.all.allocated"] - before["allocated_bytes.all.allocated"]),
     }
 
 
@@ -614,12 +609,8 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "all_cases": aggregate(results),
         "by_family": family,
         "by_size_class": size_class,
-        "family_balanced_wall_p50_speedup_gmean": geometric_mean(
-            [value["wall_p50_speedup_gmean"] for value in family.values()]
-        ),
-        "family_balanced_gpu_p50_speedup_gmean": geometric_mean(
-            [value["gpu_p50_speedup_gmean"] for value in family.values()]
-        ),
+        "family_balanced_wall_p50_speedup_gmean": geometric_mean([value["wall_p50_speedup_gmean"] for value in family.values()]),
+        "family_balanced_gpu_p50_speedup_gmean": geometric_mean([value["gpu_p50_speedup_gmean"] for value in family.values()]),
     }
 
 
@@ -757,8 +748,7 @@ def benchmark_case(case: BenchmarkCase) -> dict[str, Any]:
         "cache": {
             "callee_key": getattr(kernel, "_tilelang_cache_key", None),
             "caller_key": getattr(companion, "_tilelang_cache_key", None),
-            "distinct_keys": getattr(kernel, "_tilelang_cache_key", None)
-            != getattr(companion, "_tilelang_cache_key", None),
+            "distinct_keys": getattr(kernel, "_tilelang_cache_key", None) != getattr(companion, "_tilelang_cache_key", None),
         },
         "warmup_calls": warmups,
         "batch_iterations": iterations,
@@ -864,8 +854,7 @@ def main() -> None:
         "environment": environment,
         "method": {
             "comparison": (
-                "existing callee allocation vs JITKernel.bind_outputs caller-owned reuse "
-                "vs fixed full-argument TVM-FFI executable dispatch"
+                "existing callee allocation vs JITKernel.bind_outputs caller-owned reuse vs fixed full-argument TVM-FFI executable dispatch"
             ),
             "order": ["callee", "bound", "direct", "direct", "bound", "callee"],
             "cycles": CYCLES,

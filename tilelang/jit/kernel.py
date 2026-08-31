@@ -336,8 +336,10 @@ class JITKernel(Generic[_P, _T]):
         """
         outputs = self._normalize_bound_outputs(out)
         cached_outputs = self._last_bound_outputs
-        if cached_outputs is not None and len(cached_outputs) == len(outputs) and all(
-            cached is current for cached, current in zip(cached_outputs, outputs, strict=True)
+        if (
+            cached_outputs is not None
+            and len(cached_outputs) == len(outputs)
+            and all(cached is current for cached, current in zip(cached_outputs, outputs, strict=True))
         ):
             cached_call = self._last_bound_output_call
             if cached_call is not None:

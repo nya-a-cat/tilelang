@@ -80,9 +80,7 @@ def test_bind_outputs_prefers_direct_caller_allocated_entry():
         direct_calls.append(args)
 
     kernel = _stub_kernel([1], 2, wrapper)
-    kernel._caller_allocated_kernel.adapter = SimpleNamespace(
-        get_caller_allocated_call_entry=lambda: entry_requests.append(True) or direct
-    )
+    kernel._caller_allocated_kernel.adapter = SimpleNamespace(get_caller_allocated_call_entry=lambda: entry_requests.append(True) or direct)
     input_tensor = object()
     output_tensor = object()
 
