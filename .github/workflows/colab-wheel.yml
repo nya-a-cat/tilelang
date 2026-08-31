@@ -177,7 +177,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/ccache
-          key: colab-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-${{ steps.source.outputs.native_fingerprint }}
+          key: colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-${{ steps.source.outputs.native_fingerprint }}
           restore-keys: |
             colab-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-
 
@@ -314,7 +314,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/ccache
-          key: colab-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-${{ steps.source.outputs.native_fingerprint }}
+          key: colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-${{ steps.source.outputs.native_fingerprint }}
 
       - name: Save exact prebuilt TVM SDK
         if: inputs.build_mode == 'fast-cuda' && steps.tvm-sdk-cache.outputs.cache-hit != 'true' && steps.wheel-build.outcome == 'success'
