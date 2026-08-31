@@ -7,17 +7,22 @@ on:
         description: Exact commit or ref to compile
         required: true
         type: string
+      native_base_ref:
+        description: Exact commit with a published Colab base wheel
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: colab-native-smoke-${{ inputs.source_ref }}
+  group: colab-native-smoke-${{ inputs.source_ref }}-${{ inputs.native_base_ref }}
   cancel-in-progress: true
 
 jobs:
   native-compile-smoke:
-    name: Ubuntu 22.04 CUDA native compile only
+    if: github.repository == 'nya-a-cat/tilelang'
+    name: Ubuntu 22.04 CUDA native hot patch
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
@@ -31,6 +36,150 @@ jobs:
           fetch-depth: 1
           submodules: false
           persist-credentials: false
+
+      - name: Resolve exact source and base wheel
+        id: refs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_BASE_REF: ${{ inputs.native_base_ref }}
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REPOSITORY}" = "nya-a-cat/tilelang"
+          source_sha="$(git rev-parse HEAD)"
+          git fetch --no-tags --depth=1 origin "${NATIVE_BASE_REF}"
+          base_sha="$(git rev-parse FETCH_HEAD)"
+
+          comparison_status="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/compare/${base_sha}...${source_sha}" \
+              --jq .status
+          )"
+          case "${comparison_status}" in
+            ahead|identical) ;;
+            *)
+              echo "Source ${source_sha} does not descend from native base ${base_sha}." >&2
+              exit 2
+              ;;
+          esac
+
+          base_tag=""
+          base_wheel_name=""
+          base_wheel_digest=""
+          for candidate_tag in "colab-wheel-${base_sha}" "colab-fast-${base_sha}"; do
+            release_json="$(
+              gh release view "${candidate_tag}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --json targetCommitish,assets 2>/dev/null || true
+            )"
+            if [[ -z "${release_json}" ]]; then
+              continue
+            fi
+            test "$(jq -r .targetCommitish <<<"${release_json}")" = "${base_sha}"
+            wheel_count="$(
+              jq '[.assets[] | select(.name | endswith(".whl"))] | length' \
+                <<<"${release_json}"
+            )"
+            test "${wheel_count}" -eq 1
+            base_tag="${candidate_tag}"
+            base_wheel_name="$(
+              jq -r '[.assets[] | select(.name | endswith(".whl"))][0].name' \
+                <<<"${release_json}"
+            )"
+            base_wheel_digest="$(
+              jq -r '[.assets[] | select(.name | endswith(".whl"))][0].digest // ""' \
+                <<<"${release_json}"
+            )"
+            break
+          done
+
+          if [[ -z "${base_tag}" || -z "${base_wheel_name}" ]]; then
+            echo "No unique published Colab wheel found for ${base_sha} in this fork." >&2
+            exit 2
+          fi
+
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+          echo "base_sha=${base_sha}" >> "${GITHUB_OUTPUT}"
+          echo "base_tag=${base_tag}" >> "${GITHUB_OUTPUT}"
+          echo "base_wheel_name=${base_wheel_name}" >> "${GITHUB_OUTPUT}"
+          echo "base_wheel_digest=${base_wheel_digest}" >> "${GITHUB_OUTPUT}"
+          echo "comparison_status=${comparison_status}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved ${source_sha} on ${base_tag}/${base_wheel_name}."
+
+      - name: Reject incompatible native hot-patch inputs
+        id: compatibility
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          BASE_SHA: ${{ steps.refs.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          mapfile -t changed_files < <(
+            git diff --name-only --diff-filter=ACDMRTUXB "${BASE_SHA}" "${SOURCE_SHA}"
+          )
+          incompatible=()
+          unsupported=()
+
+          for path in "${changed_files[@]}"; do
+            case "${path}" in
+              .gitmodules|3rdparty/*|CMakeLists.txt|*/CMakeLists.txt|cmake/*)
+                incompatible+=("${path}")
+                ;;
+              pyproject.toml|version_provider.py|VERSION)
+                incompatible+=("${path}")
+                ;;
+              tilelang/jit/adapter/cython/cython_wrapper.pyx|src/runtime/logging.cc)
+                incompatible+=("${path}")
+                ;;
+              .github/*|benchmark/*|docs/*|examples/*|maint/*|testing/*|src/*)
+                ;;
+              tilelang/*.py|tilelang/*.pyi|tilelang/*.md)
+                ;;
+              README.md|LICENSE|THIRDPARTYNOTICES.txt)
+                ;;
+              *)
+                unsupported+=("${path}")
+                ;;
+            esac
+          done
+
+          : > changed-files.txt
+          if (( ${#changed_files[@]} > 0 )); then
+            printf '%s\n' "${changed_files[@]}" > changed-files.txt
+          fi
+          if (( ${#incompatible[@]} > 0 )); then
+            echo "These changes require a complete wheel because they alter the build, ABI, or pinned SDK:" >&2
+            printf '  %s\n' "${incompatible[@]}" >&2
+            exit 2
+          fi
+          if (( ${#unsupported[@]} > 0 )); then
+            echo "These paths are outside the audited native hot-patch surface:" >&2
+            printf '  %s\n' "${unsupported[@]}" >&2
+            exit 2
+          fi
+          echo "Native hot patch accepted across ${#changed_files[@]} changed paths."
+
+      - name: Start exact base wheel download
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_TAG: ${{ steps.refs.outputs.base_tag }}
+          BASE_WHEEL_NAME: ${{ steps.refs.outputs.base_wheel_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p base-wheel
+          download_log="${RUNNER_TEMP}/tilelang-base-wheel-download.log"
+          download_pid="${RUNNER_TEMP}/tilelang-base-wheel-download.pid"
+          : > "${download_log}"
+          nohup gh release download "${BASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "${BASE_WHEEL_NAME}" \
+            --pattern SHA256SUMS \
+            --pattern source-revisions.txt \
+            --dir base-wheel \
+            > "${download_log}" 2>&1 &
+          echo "$!" > "${download_pid}"
+          echo "Started exact base wheel download in process $(cat "${download_pid}") while native caches restore."
 
       - name: Resolve exact native dependency revisions
         id: native-deps
@@ -229,7 +378,7 @@ jobs:
           {
             echo "repository=${GITHUB_REPOSITORY}"
             echo "commit=${{ steps.source.outputs.commit }}"
-            echo "mode=host_native_compile_only"
+            echo "mode=verified_native_hot_patch"
             echo "runner=ubuntu-22.04"
             echo "cuda=13.0.88"
             echo "tvm_sdk_fingerprint=${{ steps.source.outputs.tvm_sdk_fingerprint }}"
@@ -245,18 +394,458 @@ jobs:
             fi
           } | tee native-smoke-evidence/native-compile.txt
 
+      - name: Package verified native development overlay
+        id: native-overlay
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          BASE_SHA: ${{ steps.refs.outputs.base_sha }}
+          BASE_TAG: ${{ steps.refs.outputs.base_tag }}
+          BASE_WHEEL_NAME: ${{ steps.refs.outputs.base_wheel_name }}
+          BASE_WHEEL_DIGEST: ${{ steps.refs.outputs.base_wheel_digest }}
+          COMPARISON_STATUS: ${{ steps.refs.outputs.comparison_status }}
+        run: |
+          set -euo pipefail
+          mkdir -p \
+            native-overlay-evidence \
+            native-overlay-stage/tilelang/lib \
+            base-native \
+            candidate-native
+
+          download_log="${RUNNER_TEMP}/tilelang-base-wheel-download.log"
+          download_pid_file="${RUNNER_TEMP}/tilelang-base-wheel-download.pid"
+          download_pid="$(cat "${download_pid_file}")"
+          deadline=$((SECONDS + 180))
+          while kill -0 "${download_pid}" 2>/dev/null; do
+            if (( SECONDS >= deadline )); then
+              kill "${download_pid}" 2>/dev/null || true
+              cat "${download_log}" >&2
+              echo "Timed out while downloading the exact base wheel." >&2
+              exit 2
+            fi
+            sleep 0.2
+          done
+          cat "${download_log}"
+
+          base_wheel="base-wheel/${BASE_WHEEL_NAME}"
+          test -f "${base_wheel}"
+          test -f base-wheel/SHA256SUMS
+          test -f base-wheel/source-revisions.txt
+          test "$(awk -F= '$1 == "commit" { print $2; exit }' base-wheel/source-revisions.txt)" = "${BASE_SHA}"
+
+          expected_wheel_hash="$(awk 'NR == 1 { print $1 }' base-wheel/SHA256SUMS)"
+          actual_wheel_hash="$(sha256sum "${base_wheel}" | awk '{ print $1 }')"
+          test "${actual_wheel_hash}" = "${expected_wheel_hash}"
+          if [[ -n "${BASE_WHEEL_DIGEST}" ]]; then
+            test "${BASE_WHEEL_DIGEST}" = "sha256:${actual_wheel_hash}"
+          fi
+
+          mapfile -t base_wheel_info < <(
+            python3 - "${base_wheel}" base-native <<'PY'
+          import stat
+          import sys
+          import zipfile
+          from email import message_from_bytes
+          from pathlib import Path, PurePosixPath
+
+          wheel_path = Path(sys.argv[1])
+          output_root = Path(sys.argv[2]).resolve()
+          metadata_entries = []
+          library_entries = []
+
+          with zipfile.ZipFile(wheel_path) as wheel:
+              for info in wheel.infolist():
+                  path = PurePosixPath(info.filename)
+                  if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+                      raise SystemExit(f"Unsafe path in base wheel: {info.filename}")
+                  mode = info.external_attr >> 16
+                  if stat.S_ISLNK(mode):
+                      raise SystemExit(f"Base wheel contains a symlink: {info.filename}")
+                  if info.filename.endswith(".dist-info/METADATA"):
+                      metadata_entries.append(info)
+                  if info.is_dir() or not info.filename.startswith("tilelang/lib/"):
+                      continue
+                  if len(path.parts) <= 2:
+                      continue
+                  library_entries.append(info)
+                  relative = Path(*path.parts[2:])
+                  destination = output_root / relative
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.write_bytes(wheel.read(info))
+                  destination.chmod((mode & 0o777) or 0o644)
+
+              tilelang_metadata = []
+              for info in metadata_entries:
+                  metadata = message_from_bytes(wheel.read(info))
+                  if (metadata.get("Name") or "").casefold() == "tilelang":
+                      tilelang_metadata.append(metadata)
+
+          if len(tilelang_metadata) != 1:
+              raise SystemExit("Base wheel must contain exactly one TileLang METADATA record.")
+          if not (output_root / "libtilelang.so").is_file():
+              raise SystemExit("Base wheel is missing tilelang/lib/libtilelang.so.")
+          if not library_entries:
+              raise SystemExit("Base wheel does not contain a native library tree.")
+
+          print(tilelang_metadata[0]["Version"])
+          print(len(library_entries))
+          PY
+          )
+          test "${#base_wheel_info[@]}" -eq 2
+          base_distribution_version="${base_wheel_info[0]}"
+          base_native_file_count="${base_wheel_info[1]}"
+
+          native_tree_digest() {
+            python3 - "$1" <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1]).resolve()
+          files = []
+          for path in root.rglob("*"):
+              if path.is_symlink():
+                  raise SystemExit(f"Native tree contains a symlink: {path}")
+              if path.is_file():
+                  files.append(path)
+
+          h = sha256()
+          for path in sorted(files, key=lambda p: p.relative_to(root).as_posix()):
+              relative = path.relative_to(root).as_posix().encode()
+              data = path.read_bytes()
+              h.update(len(relative).to_bytes(8, "big"))
+              h.update(relative)
+              h.update(len(data).to_bytes(8, "big"))
+              h.update(data)
+          print(h.hexdigest())
+          PY
+          }
+
+          base_native_hash="$(native_tree_digest base-native)"
+          for tvm_library in libtvm_runtime.so libtvm_compiler.so; do
+            test -f "base-native/${tvm_library}"
+            test -f ".cache/prebuilt-tvm/${tvm_library}"
+            if ! cmp -s \
+              "base-native/${tvm_library}" \
+              ".cache/prebuilt-tvm/${tvm_library}"; then
+              echo "Cached ${tvm_library} differs from the exact base wheel." >&2
+              exit 2
+            fi
+          done
+          cp -a -- base-native/. candidate-native/
+          install -m 0755 -- \
+            build/native-smoke/lib/libtilelang.so \
+            candidate-native/libtilelang.so
+
+          command -v patchelf
+          command -v readelf
+          command -v nm
+          base_lib="base-native/libtilelang.so"
+          candidate_lib="candidate-native/libtilelang.so"
+          for dependency in libcuda.so.1 libcuda.so; do
+            if patchelf --print-needed "${candidate_lib}" | grep -Fxq "${dependency}"; then
+              patchelf --remove-needed "${dependency}" "${candidate_lib}"
+            fi
+          done
+
+          base_rpath="$(patchelf --print-rpath "${base_lib}")"
+          if [[ "${base_rpath}" == /* || "${base_rpath}" == *":/"* || "${base_rpath}" == *"${GITHUB_WORKSPACE}"* ]]; then
+            echo "Base wheel contains an unsafe or non-relocatable RPATH: ${base_rpath}" >&2
+            exit 2
+          fi
+          patchelf --set-rpath "${base_rpath}" "${candidate_lib}"
+
+          base_soname="$(patchelf --print-soname "${base_lib}" || true)"
+          if [[ -n "${base_soname}" ]]; then
+            patchelf --set-soname "${base_soname}" "${candidate_lib}"
+          fi
+          test "$(patchelf --print-soname "${candidate_lib}" || true)" = "${base_soname}"
+          test "$(patchelf --print-rpath "${candidate_lib}")" = "${base_rpath}"
+
+          patchelf --print-needed "${base_lib}" | LC_ALL=C sort -u > base-needed.txt
+          patchelf --print-needed "${candidate_lib}" | LC_ALL=C sort -u > candidate-needed.txt
+          if ! diff -u base-needed.txt candidate-needed.txt; then
+            echo "Patched libtilelang.so changes its dynamic dependency set." >&2
+            exit 2
+          fi
+
+          readelf -h "${base_lib}" \
+            | awk -F: '/Class:|Data:|Machine:/ { gsub(/^[ \t]+/, "", $2); print $1 "=" $2 }' \
+            > base-elf-header.txt
+          readelf -h "${candidate_lib}" \
+            | awk -F: '/Class:|Data:|Machine:/ { gsub(/^[ \t]+/, "", $2); print $1 "=" $2 }' \
+            > candidate-elf-header.txt
+          if ! diff -u base-elf-header.txt candidate-elf-header.txt; then
+            echo "Patched libtilelang.so changes the ELF platform identity." >&2
+            exit 2
+          fi
+
+          readelf --version-info "${base_lib}" \
+            | sed -n 's/.*Name: \([^ ]*\).*$/\1/p' \
+            | LC_ALL=C sort -u \
+            > base-required-symbol-versions.txt
+          readelf --version-info "${candidate_lib}" \
+            | sed -n 's/.*Name: \([^ ]*\).*$/\1/p' \
+            | LC_ALL=C sort -u \
+            > candidate-required-symbol-versions.txt
+          comm -23 \
+            candidate-required-symbol-versions.txt \
+            base-required-symbol-versions.txt \
+            > added-required-symbol-versions.txt
+          if [[ -s added-required-symbol-versions.txt ]]; then
+            echo "Patched libtilelang.so requires symbol versions absent from the base library:" >&2
+            cat added-required-symbol-versions.txt >&2
+            exit 2
+          fi
+
+          nm -D --defined-only "${base_lib}" \
+            | awk 'NF { print $NF }' | LC_ALL=C sort -u > base-defined-symbols.txt
+          nm -D --defined-only "${candidate_lib}" \
+            | awk 'NF { print $NF }' | LC_ALL=C sort -u > candidate-defined-symbols.txt
+          : > base-consumer-undefined-symbols.txt
+          while IFS= read -r consumer; do
+            if [[ "${consumer}" == "${base_lib}" ]]; then
+              continue
+            fi
+            if readelf -h "${consumer}" >/dev/null 2>&1; then
+              nm -D --undefined-only "${consumer}" 2>/dev/null \
+                | awk 'NF { print $NF }' \
+                >> base-consumer-undefined-symbols.txt || true
+            fi
+          done < <(find base-native -type f -name '*.so*' | LC_ALL=C sort)
+          LC_ALL=C sort -u -o \
+            base-consumer-undefined-symbols.txt \
+            base-consumer-undefined-symbols.txt
+          comm -12 \
+            base-defined-symbols.txt \
+            base-consumer-undefined-symbols.txt \
+            > required-libtilelang-symbols.txt
+          comm -23 \
+            required-libtilelang-symbols.txt \
+            candidate-defined-symbols.txt \
+            > missing-required-libtilelang-symbols.txt
+          if [[ -s missing-required-libtilelang-symbols.txt ]]; then
+            echo "Patched libtilelang.so removes symbols required by base-wheel consumers:" >&2
+            cat missing-required-libtilelang-symbols.txt >&2
+            exit 2
+          fi
+
+          result_native_hash="$(native_tree_digest candidate-native)"
+          patched_lib_hash="$(sha256sum "${candidate_lib}" | awk '{ print $1 }')"
+
+          if [[ -n "$(find src tilelang -type l -print -quit)" ]]; then
+            echo "Source overlay cannot contain symbolic links." >&2
+            exit 2
+          fi
+          cp -a -- src native-overlay-stage/tilelang/src
+          while IFS= read -r -d '' source_file; do
+            case "${source_file}" in
+              *.py|*.pyi|*.md)
+                install -D -m 0644 -- \
+                  "${source_file}" \
+                  "native-overlay-stage/${source_file}"
+                ;;
+            esac
+          done < <(git ls-files -z tilelang)
+          install -m 0755 -- \
+            "${candidate_lib}" \
+            native-overlay-stage/tilelang/lib/libtilelang.so
+
+          jq -n \
+            --arg schema "tilelang-python-overlay-identity-v1" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg source_sha "${SOURCE_SHA}" \
+            --arg native_base_sha "${BASE_SHA}" \
+            --arg overlay_kind "native-python-source" \
+            '{
+              schema: $schema,
+              repository: $repository,
+              source_sha: $source_sha,
+              native_base_sha: $native_base_sha,
+              overlay_kind: $overlay_kind
+            }' > native-overlay-stage/tilelang/_python_overlay_identity.json
+
+          (
+            cd native-overlay-stage
+            find tilelang -type f -print0 | LC_ALL=C sort -z > ../native-overlay-files.txt
+            tar \
+              --sort=name \
+              --mtime='UTC 1970-01-01' \
+              --owner=0 \
+              --group=0 \
+              --numeric-owner \
+              --no-recursion \
+              --null \
+              -cf - \
+              -T ../native-overlay-files.txt \
+              | gzip -n \
+              > ../native-overlay-evidence/tilelang-native-overlay.tar.gz
+          )
+
+          runtime_identity_hash="$(
+            sha256sum native-overlay-stage/tilelang/_python_overlay_identity.json \
+              | awk '{ print $1 }'
+          )"
+          overlay_hash="$(
+            sha256sum native-overlay-evidence/tilelang-native-overlay.tar.gz \
+              | awk '{ print $1 }'
+          )"
+          changed_json="$(
+            jq -Rsc 'split("\n") | map(select(length > 0))' changed-files.txt
+          )"
+          needed_json="$(
+            jq -Rsc 'split("\n") | map(select(length > 0))' candidate-needed.txt
+          )"
+
+          jq -n \
+            --arg schema "tilelang-colab-native-overlay-v1" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg source_sha "${SOURCE_SHA}" \
+            --arg native_base_sha "${BASE_SHA}" \
+            --arg native_base_tag "${BASE_TAG}" \
+            --arg base_wheel_name "${BASE_WHEEL_NAME}" \
+            --arg base_wheel_release_digest "${BASE_WHEEL_DIGEST}" \
+            --arg base_wheel_sha256 "${actual_wheel_hash}" \
+            --arg base_distribution_version "${base_distribution_version}" \
+            --arg base_native_tree_sha256 "${base_native_hash}" \
+            --arg result_native_tree_sha256 "${result_native_hash}" \
+            --arg patched_libtilelang_sha256 "${patched_lib_hash}" \
+            --arg overlay_sha256 "${overlay_hash}" \
+            --arg runtime_identity_sha256 "${runtime_identity_hash}" \
+            --arg comparison_status "${COMPARISON_STATUS}" \
+            --arg elf_soname "${base_soname}" \
+            --arg elf_rpath "${base_rpath}" \
+            --arg compatibility "native-library-hot-patch-abi-guard-v1" \
+            --argjson base_native_file_count "${base_native_file_count}" \
+            --argjson changed_files "${changed_json}" \
+            --argjson elf_needed "${needed_json}" \
+            '{
+              schema: $schema,
+              repository: $repository,
+              source_sha: $source_sha,
+              native_base_sha: $native_base_sha,
+              native_base_tag: $native_base_tag,
+              base_wheel: {
+                name: $base_wheel_name,
+                release_digest: $base_wheel_release_digest,
+                sha256: $base_wheel_sha256
+              },
+              base_distribution_version: $base_distribution_version,
+              base_native_file_count: $base_native_file_count,
+              base_native_tree_sha256: $base_native_tree_sha256,
+              result_native_tree_sha256: $result_native_tree_sha256,
+              patched_libtilelang_sha256: $patched_libtilelang_sha256,
+              overlay_sha256: $overlay_sha256,
+              runtime_identity_sha256: $runtime_identity_sha256,
+              comparison_status: $comparison_status,
+              changed_files: $changed_files,
+              elf: {
+                soname: $elf_soname,
+                rpath: $elf_rpath,
+                needed: $elf_needed
+              },
+              compatibility: $compatibility
+            }' | tee native-overlay-evidence/native-overlay-manifest.json
+
+          {
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "source_sha=${SOURCE_SHA}"
+            echo "native_base_sha=${BASE_SHA}"
+            echo "native_base_tag=${BASE_TAG}"
+            echo "base_wheel_name=${BASE_WHEEL_NAME}"
+            echo "base_wheel_sha256=${actual_wheel_hash}"
+            echo "base_distribution_version=${base_distribution_version}"
+            echo "base_native_tree_sha256=${base_native_hash}"
+            echo "result_native_tree_sha256=${result_native_hash}"
+            echo "patched_libtilelang_sha256=${patched_lib_hash}"
+            echo "elf_soname=${base_soname}"
+            echo "elf_rpath=${base_rpath}"
+            echo "elf_needed_begin"
+            cat candidate-needed.txt
+            echo "elf_needed_end"
+            echo "required_symbol_versions_begin"
+            cat candidate-required-symbol-versions.txt
+            echo "required_symbol_versions_end"
+            echo "base_consumers_required_symbol_count=$(wc -l < required-libtilelang-symbols.txt)"
+            echo "missing_required_symbol_count=$(wc -l < missing-required-libtilelang-symbols.txt)"
+            echo "added_required_symbol_version_count=$(wc -l < added-required-symbol-versions.txt)"
+          } | tee native-overlay-evidence/elf-compatibility.txt
+
+          cp changed-files.txt native-overlay-evidence/
+          cp base-wheel/source-revisions.txt native-overlay-evidence/base-wheel-source-revisions.txt
+          cp maint/scripts/apply_colab_native_overlay.sh native-overlay-evidence/
+          chmod +x native-overlay-evidence/apply_colab_native_overlay.sh
+          (
+            cd native-overlay-evidence
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | LC_ALL=C sort -z \
+              | xargs -0 sha256sum \
+              > SHA256SUMS
+          )
+          ls -lh native-overlay-evidence
+
+      - name: Self-test native overlay installation
+        id: overlay-selftest
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          BASE_WHEEL_NAME: ${{ steps.refs.outputs.base_wheel_name }}
+        run: |
+          set -euo pipefail
+          python3 -m venv native-overlay-selftest
+          native-overlay-selftest/bin/python -m pip \
+            --disable-pip-version-check \
+            install \
+            --no-deps \
+            "base-wheel/${BASE_WHEEL_NAME}"
+          PYTHON="${GITHUB_WORKSPACE}/native-overlay-selftest/bin/python" \
+            native-overlay-evidence/apply_colab_native_overlay.sh \
+              native-overlay-evidence/tilelang-native-overlay.tar.gz \
+              native-overlay-evidence/native-overlay-manifest.json \
+            | tee native-overlay-evidence/installer-selftest.txt
+
+          native-overlay-selftest/bin/python - \
+            native-overlay-evidence/native-overlay-manifest.json \
+            "${SOURCE_SHA}" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from importlib import metadata
+          from pathlib import Path
+
+          manifest = json.loads(Path(sys.argv[1]).read_text())
+          source_sha = sys.argv[2]
+          dist = metadata.distribution("tilelang")
+          package = Path(dist.locate_file("tilelang")).resolve()
+          identity_path = package / "_python_overlay_identity.json"
+          identity = json.loads(identity_path.read_text())
+          if identity.get("source_sha") != source_sha:
+              raise SystemExit("Installed runtime identity does not match the source commit.")
+          if not (package / "src").is_dir():
+              raise SystemExit("Installed native overlay is missing the complete source tree.")
+          library_hash = hashlib.sha256((package / "lib" / "libtilelang.so").read_bytes()).hexdigest()
+          if library_hash != manifest["patched_libtilelang_sha256"]:
+              raise SystemExit("Installed libtilelang.so does not match the manifest.")
+          print(f"selftest_package={package}")
+          print(f"selftest_version={dist.version}")
+          print(f"selftest_source_sha={source_sha}")
+          print(f"selftest_libtilelang_sha256={library_hash}")
+          PY
+
       - name: Save host native compiler cache
-        if: steps.host-native-cache.outputs.cache-hit != 'true' && steps.native-build.outcome == 'success'
+        if: always() && steps.host-native-cache.outputs.cache-hit != 'true' && steps.native-build.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/host-native-ccache
           key: colab-host-native-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.source.outputs.native_fingerprint }}
 
       - name: Upload native compile evidence
-        if: steps.native-build.outcome == 'success'
+        if: steps.overlay-selftest.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: tilelang-native-smoke-${{ steps.source.outputs.commit }}
-          path: native-smoke-evidence/*
+          name: tilelang-native-overlay-${{ steps.source.outputs.commit }}-on-${{ steps.refs.outputs.base_sha }}
+          path: |
+            native-smoke-evidence/*
+            native-overlay-evidence/*
           if-no-files-found: error
           retention-days: 7
