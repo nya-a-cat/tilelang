@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Download artifact inside GitHub
+      - name: Download and verify artifact inside GitHub
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -34,13 +34,16 @@ jobs:
           test "${actual_sha}" = "${EXPECTED_HEAD_SHA}"
           mkdir -p dist
           gh run download "${SOURCE_RUN_ID}" --repo "${GITHUB_REPOSITORY}" --dir dist
+          wheel="$(find dist -type f -name '*.whl' -print -quit)"
           checksum_file="$(find dist -type f -name SHA256SUMS -print -quit)"
+          test -n "${wheel}"
           test -n "${checksum_file}"
-          asset_dir="$(dirname "${checksum_file}")"
-          (cd "${asset_dir}" && sha256sum --check SHA256SUMS)
+          expected_hash="$(awk 'NR == 1 { print $1 }' "${checksum_file}")"
+          actual_hash="$(sha256sum "${wheel}" | awk '{ print $1 }')"
+          test "${actual_hash}" = "${expected_hash}"
+          echo "Verified ${wheel}: ${actual_hash}"
 
       - name: Publish prerelease assets in this fork
-        id: publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
