@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: Exact commit or ref to compile
+        description: Full 40-character commit SHA or named ref to compile
         required: true
         type: string
 
