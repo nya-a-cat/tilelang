@@ -309,6 +309,64 @@ def set_mode(wrappers: list[TileLangRMSNorm], mode: str) -> None:
         wrapper.mode = mode
 
 
+def validate_rmsnorm_numerics(
+    torch: Any,
+    wrappers: list[TileLangRMSNorm],
+    prompt_rows: int,
+) -> dict[str, Any]:
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(20260901)
+    records: list[dict[str, Any]] = []
+    for rows in sorted({1, prompt_rows}):
+        for wrapper in wrappers:
+            width = int(wrapper.wrapper.reference.weight.numel())
+            dtype = wrapper.wrapper.reference.weight.dtype
+            probe = torch.randn((1, rows, width), device="cuda", dtype=dtype, generator=generator)
+            with torch.inference_mode():
+                stock = wrapper.wrapper.reference(probe)
+                wrapper.mode = "callee"
+                callee = wrapper.forward(probe)
+                wrapper.mode = "bound"
+                bound = wrapper.forward(probe)
+            if not torch.equal(callee, bound):
+                raise RuntimeError(f"callee and bound RMSNorm values differ for {wrapper.module_name}, rows={rows}")
+            torch.testing.assert_close(stock, bound, atol=5e-3, rtol=5e-3)
+            stock_f32 = stock.float()
+            bound_f32 = bound.float()
+            absolute = (stock_f32 - bound_f32).abs()
+            relative = absolute / stock_f32.abs().clamp_min(1e-3)
+            cosine = torch.nn.functional.cosine_similarity(stock_f32.flatten(), bound_f32.flatten(), dim=0)
+            records.append(
+                {
+                    "module": wrapper.module_name,
+                    "rows": rows,
+                    "width": width,
+                    "dtype": str(dtype),
+                    "elements": int(stock.numel()),
+                    "callee_bound_exact": True,
+                    "max_abs_error_vs_stock": float(absolute.max().item()),
+                    "mean_abs_error_vs_stock": float(absolute.mean().item()),
+                    "max_relative_error_vs_stock_floor_0p001": float(relative.max().item()),
+                    "cosine_similarity_vs_stock": float(cosine.item()),
+                }
+            )
+    worst_absolute = max(records, key=lambda record: record["max_abs_error_vs_stock"])
+    worst_relative = max(records, key=lambda record: record["max_relative_error_vs_stock_floor_0p001"])
+    return {
+        "cases": len(records),
+        "atol": 5e-3,
+        "rtol": 5e-3,
+        "all_callee_bound_exact": all(record["callee_bound_exact"] for record in records),
+        "max_abs_error_vs_stock": worst_absolute["max_abs_error_vs_stock"],
+        "max_abs_error_case": {"module": worst_absolute["module"], "rows": worst_absolute["rows"]},
+        "max_relative_error_vs_stock_floor_0p001": worst_relative["max_relative_error_vs_stock_floor_0p001"],
+        "max_relative_error_case": {"module": worst_relative["module"], "rows": worst_relative["rows"]},
+        "maximum_mean_abs_error_vs_stock": max(record["mean_abs_error_vs_stock"] for record in records),
+        "minimum_cosine_similarity_vs_stock": min(record["cosine_similarity_vs_stock"] for record in records),
+        "records": records,
+    }
+
+
 def render_prompt(tokenizer: Any) -> tuple[str, str]:
     try:
         prompt = tokenizer.apply_chat_template(
@@ -410,11 +468,14 @@ def benchmark_model(
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_id,
         revision=revision,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         low_cpu_mem_usage=True,
         attn_implementation="sdpa",
     ).to("cuda")
     model.eval()
+    model.generation_config.temperature = None
+    model.generation_config.top_p = None
+    model.generation_config.top_k = None
     load_seconds = time.perf_counter() - load_started
     registry = RMSNormKernelRegistry(torch, tilelang, language)
     wrappers = replace_rmsnorm_modules(torch, model, registry)
@@ -423,6 +484,7 @@ def benchmark_model(
     encoded = tokenizer(prompt, return_tensors="pt")
     model_inputs = {name: value.to("cuda") for name, value in encoded.items()}
     prompt_tokens = int(model_inputs["input_ids"].shape[1])
+    numerical_validation = validate_rmsnorm_numerics(torch, wrappers, prompt_tokens)
 
     warmups: dict[str, dict[str, Any]] = {}
     for mode in MODES:
@@ -474,6 +536,7 @@ def benchmark_model(
         "stock_bound_tokens_identical": token_sequences["stock"] == token_sequences["bound"],
         "representative_response": raw["bound"][0]["text"],
         "rmsnorm": {
+            "numerical_validation": numerical_validation,
             "wrapper": wrapper_stats(wrappers),
             "kernel_compiles": registry.compile_records,
         },
@@ -515,6 +578,7 @@ def main() -> None:
         raise ValueError(f"unknown model IDs: {unknown_models}")
     os.environ["TILELANG_CACHE_DIR"] = f"/tmp/tilelang-hf-bound-cache-{source_sha[:12]}"
     os.environ["HF_HOME"] = "/tmp/tilelang-hf-cache"
+    os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
     os.environ["TRANSFORMERS_NO_LIBROSA"] = "1"
     os.environ["TRANSFORMERS_NO_TORCHVISION"] = "1"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
