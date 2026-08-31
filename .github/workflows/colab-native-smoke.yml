@@ -563,11 +563,23 @@ jobs:
           test "$(patchelf --print-rpath "${candidate_lib}")" = "${base_rpath}"
 
           patchelf --print-needed "${base_lib}" | LC_ALL=C sort -u > base-needed.txt
+          patchelf --print-needed "${candidate_lib}" | LC_ALL=C sort -u > candidate-needed-before-normalization.txt
+          comm -23 \
+            base-needed.txt \
+            candidate-needed-before-normalization.txt \
+            > base-needed-missing-from-candidate.txt
+          while IFS= read -r dependency; do
+            if [[ -n "${dependency}" ]]; then
+              patchelf --add-needed "${dependency}" "${candidate_lib}"
+            fi
+          done < base-needed-missing-from-candidate.txt
           patchelf --print-needed "${candidate_lib}" | LC_ALL=C sort -u > candidate-needed.txt
           if ! diff -u base-needed.txt candidate-needed.txt; then
             echo "Patched libtilelang.so changes its dynamic dependency set." >&2
             exit 2
           fi
+          test "$(patchelf --print-soname "${candidate_lib}" || true)" = "${base_soname}"
+          test "$(patchelf --print-rpath "${candidate_lib}")" = "${base_rpath}"
 
           readelf -h "${base_lib}" \
             | awk -F: '/Class:|Data:|Machine:/ { gsub(/^[ \t]+/, "", $2); print $1 "=" $2 }' \
@@ -763,6 +775,9 @@ jobs:
             echo "elf_needed_begin"
             cat candidate-needed.txt
             echo "elf_needed_end"
+            echo "restored_base_dependencies_begin"
+            cat base-needed-missing-from-candidate.txt
+            echo "restored_base_dependencies_end"
             echo "required_symbol_versions_begin"
             cat candidate-required-symbol-versions.txt
             echo "required_symbol_versions_end"
