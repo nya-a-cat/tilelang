@@ -206,12 +206,17 @@ def prepare_overlay() -> dict[str, object]:
         "repository": REPOSITORY,
         "source_sha": OVERLAY_SOURCE_SHA,
         "native_base_sha": BASE_SOURCE_SHA,
-        "base_wheel_sha256": BASE_WHEEL_SHA256,
+        "native_base_tag": BASE_RELEASE_TAG,
         "base_distribution_version": EXPECTED_VERSION,
     }
     for key, value in expected.items():
         if manifest.get(key) != value:
             raise RuntimeError(f"unexpected overlay manifest {key}: {manifest.get(key)!r}")
+    base_wheel = manifest.get("base_wheel")
+    if not isinstance(base_wheel, dict):
+        raise RuntimeError("overlay manifest has no base_wheel object")
+    if base_wheel.get("name") != BASE_WHEEL_NAME or base_wheel.get("sha256") != BASE_WHEEL_SHA256:
+        raise RuntimeError("overlay manifest names a different base wheel")
     if sha256_file(overlay_path) != manifest.get("overlay_sha256"):
         raise RuntimeError("overlay archive and manifest disagree")
     installer_path.chmod(0o755)
