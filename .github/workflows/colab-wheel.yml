@@ -100,6 +100,7 @@ jobs:
           host_toolchain_dir="${GITHUB_WORKSPACE}/.cache/ci-toolchain"
           container_toolchain_dir="/host${host_toolchain_dir}"
           toolchain_cache_hit="${{ steps.toolchain-cache.outputs.cache-hit }}"
+          toolchain_cache_hit="${toolchain_cache_hit:-false}"
           mkdir -p "${host_ccache_dir}" "${host_toolchain_dir}"
 
           {
