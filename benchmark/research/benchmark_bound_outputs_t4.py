@@ -364,27 +364,24 @@ def make_softmax_program(rows: int, width: int, symbol: str) -> Any:
     return with_output_attr(main, symbol)
 
 
-def make_gemm_program(size: int, symbol: str) -> Any:
-    block_m = 64
-    block_n = 64
-    block_k = 32
+def make_gemm_program(symbol: str) -> Any:
+    rows, columns, reduction = 64, 64, 32
 
     @TL.prim_func
     def main(
-        A: TL.Tensor((size, size), TL.float16),
-        B: TL.Tensor((size, size), TL.float16),
-        C: TL.Tensor((size, size), TL.float16),
+        A: TL.Tensor((rows, reduction), TL.float32),
+        B: TL.Tensor((reduction, columns), TL.float32),
+        C: TL.Tensor((rows, columns), TL.float32),
     ):
-        with TL.Kernel(TL.ceildiv(size, block_n), TL.ceildiv(size, block_m), threads=128) as (bx, by):
-            a_shared = TL.alloc_shared((block_m, block_k), TL.float16)
-            b_shared = TL.alloc_shared((block_n, block_k), TL.float16)
-            c_local = TL.alloc_fragment((block_m, block_n), TL.float32)
+        with TL.Kernel(1, threads=128):
+            a_shared = TL.alloc_shared((rows, reduction), TL.float32)
+            b_shared = TL.alloc_shared((reduction, columns), TL.float32)
+            c_local = TL.alloc_fragment((rows, columns), TL.float32)
+            TL.copy(A, a_shared)
+            TL.copy(B, b_shared)
             TL.clear(c_local)
-            for ko in TL.Pipelined(TL.ceildiv(size, block_k), num_stages=2):
-                TL.copy(A[by * block_m, ko * block_k], a_shared)
-                TL.copy(B[bx * block_n, ko * block_k], b_shared)
-                TL.gemm(a_shared, b_shared, c_local, transpose_B=True)
-            TL.copy(c_local, C[by * block_m, bx * block_n])
+            TL.gemm(a_shared, b_shared, c_local, policy=TL.GemmWarpPolicy.FullRow)
+            TL.copy(c_local, C)
 
     return with_output_attr(main, symbol)
 
@@ -456,21 +453,21 @@ def build_cases() -> list[BenchmarkCase]:
         )
     )
 
-    size = 128
-    lhs = TORCH.randn(size, size, device=device, dtype=TORCH.float16)
-    rhs = TORCH.randn(size, size, device=device, dtype=TORCH.float16)
+    rows, columns, reduction = 64, 64, 32
+    lhs = TORCH.randn(rows, reduction, device=device, dtype=TORCH.float32)
+    rhs = TORCH.randn(reduction, columns, device=device, dtype=TORCH.float32)
     cases.append(
         BenchmarkCase(
-            name="gemm_f16_128x128x128",
+            name="gemm_f32_64x64x32_sm75",
             family="gemm",
             size_class="small",
-            program=make_gemm_program(size, "bound_output_gemm_128"),
+            program=make_gemm_program("bound_output_gemm_f32_64x64x32"),
             inputs=(lhs, rhs),
-            output=TORCH.empty((size, size), device=device, dtype=TORCH.float16),
-            reference=lhs @ rhs.T,
-            atol=5e-2,
-            rtol=5e-2,
-            logical_work_items=size**3,
+            output=TORCH.empty((rows, columns), device=device, dtype=TORCH.float32),
+            reference=lhs @ rhs,
+            atol=1e-4,
+            rtol=1e-4,
+            logical_work_items=rows * columns * reduction,
         )
     )
     return cases
