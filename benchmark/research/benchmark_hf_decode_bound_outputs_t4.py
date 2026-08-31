@@ -121,6 +121,7 @@ def load_exact_setup_helper(source_sha: str) -> tuple[Any, dict[str, Any]]:
     if spec is None or spec.loader is None:
         raise RuntimeError("unable to load the exact setup helper")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module, {
         "repository_path": HELPER_PATH,
