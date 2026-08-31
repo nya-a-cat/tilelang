@@ -54,6 +54,7 @@ jobs:
               cmake \
               pyproject.toml \
               src \
+              3rdparty/hip-headers \
               tilelang/jit/adapter/cython/cython_wrapper.pyx
             git submodule status --recursive
           } | sha256sum | awk '{ print $1 }')"
@@ -92,6 +93,33 @@ jobs:
           restore-keys: |
             colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-
           save-always: true
+
+      - name: Restore exact native build tree
+        id: native-build-cache
+        if: inputs.build_mode == 'fast-cuda'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build
+          key: colab-wheel-build-v1-${{ runner.os }}-${{ runner.arch }}-cp310-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-${{ inputs.build_mode }}-${{ steps.source.outputs.native_fingerprint }}-${{ hashFiles('maint/scripts/install_cached_cuda_toolchain.sh') }}
+
+      - name: Validate exact native build tree
+        if: inputs.build_mode == 'fast-cuda' && steps.native-build-cache.outputs.cache-hit == 'true'
+        shell: bash
+        env:
+          NATIVE_FINGERPRINT: ${{ steps.source.outputs.native_fingerprint }}
+        run: |
+          set -euo pipefail
+          expected="fingerprint=${NATIVE_FINGERPRINT} manylinux=${MANYLINUX_IMAGE_DIGEST} cuda=${CUDA_VERSION} mode=${TILELANG_COLAB_BUILD_MODE}"
+          actual="$(cat build/.tilelang-ci-cache-identity)"
+          test "${actual}" = "${expected}"
+
+          # Actions creates a fresh checkout on every run. Give identical tracked
+          # inputs a stable old mtime so Ninja can trust the exact cached outputs.
+          git ls-files -z | xargs -0r touch -t 200001010000
+          git submodule foreach --recursive \
+            'git ls-files -z | xargs -0r touch -t 200001010000'
+
+          echo "Validated exact native build tree ${NATIVE_FINGERPRINT}."
 
       - name: Configure cached parallel build
         shell: bash
@@ -138,6 +166,18 @@ jobs:
           package-dir: .
           output-dir: wheelhouse
           config-file: "{package}/pyproject.toml"
+
+      - name: Record exact native build-tree identity
+        if: inputs.build_mode == 'fast-cuda'
+        shell: bash
+        env:
+          NATIVE_FINGERPRINT: ${{ steps.source.outputs.native_fingerprint }}
+        run: |
+          set -euo pipefail
+          test -d build
+          printf '%s\n' \
+            "fingerprint=${NATIVE_FINGERPRINT} manylinux=${MANYLINUX_IMAGE_DIGEST} cuda=${CUDA_VERSION} mode=${TILELANG_COLAB_BUILD_MODE}" \
+            > build/.tilelang-ci-cache-identity
 
       - name: Record compiler cache statistics
         if: always()
