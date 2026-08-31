@@ -19,35 +19,16 @@ hundreds of remark blocks while real diagnostics still surface.
 from __future__ import annotations
 
 import contextlib
-import json
 import re
 import threading
-from dataclasses import asdict, dataclass, field
+
+from .kernel_resource_info import KernelResourceUsage, dump_to_file, load_from_file  # noqa: F401
 
 # A line is a kernel-resource-usage remark iff it carries this exact tag.
 # clang appends the option name as ``[-Rpass-analysis=kernel-resource-usage]``.
 _REMARK_TAG = "[-Rpass-analysis=kernel-resource-usage]"
 # clang prints `<path>:<line>:<col>: remark:     <key>: <value> [-Rpass-...]`
 _REMARK_LINE_RE = re.compile(r"\bremark:\s*(?P<key>[^:]+?):\s*(?P<value>.*?)\s*" + re.escape(_REMARK_TAG) + r"\s*$")
-
-
-@dataclass
-class KernelResourceUsage:
-    """Resource counts as reported by clang's kernel-resource-usage pass.
-
-    Field names mirror the remark labels (lower-cased, normalized) so we
-    can extend without breaking callers.
-    """
-
-    n_regs: int = 0  # VGPRs
-    # Total VGPR-equivalent spill pressure: the explicit `VGPRs Spill` count
-    # plus scratch memory in dwords (`ScratchSize [bytes/lane]` / 4). Matches
-    # how triton accounts for spills (its n_spills is scratch_bytes / 4) but
-    # also folds in clang's explicit spill count when present.
-    n_spills: int = 0
-    scratch_bytes: int = 0  # raw `ScratchSize [bytes/lane]`
-    n_max_threads: int | None = None  # not in remarks; kept for API symmetry
-    extra: dict[str, str] = field(default_factory=dict)  # raw remark key→value
 
 
 _FLAG = "-Rpass-analysis=kernel-resource-usage"
@@ -118,27 +99,3 @@ def filter_and_record(output: str) -> str:
         items[current_name] = current
 
     return "".join(kept_lines)
-
-
-def dump_to_file(usage: dict[str, KernelResourceUsage], path: str) -> None:
-    """Persist parsed resource usage so it survives kernel-cache hits."""
-    data = {name: asdict(u) for name, u in usage.items()}
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-
-
-def load_from_file(path: str) -> dict[str, KernelResourceUsage]:
-    """Inverse of ``dump_to_file``. Tolerant of missing / unknown fields
-    so older cache entries keep working when the dataclass evolves."""
-    with open(path) as f:
-        data = json.load(f)
-    out: dict[str, KernelResourceUsage] = {}
-    for name, entry in data.items():
-        out[name] = KernelResourceUsage(
-            n_regs=int(entry.get("n_regs", 0)),
-            n_spills=int(entry.get("n_spills", 0)),
-            scratch_bytes=int(entry.get("scratch_bytes", 0)),
-            n_max_threads=entry.get("n_max_threads"),
-            extra=dict(entry.get("extra", {})),
-        )
-    return out

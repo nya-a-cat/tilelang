@@ -8,6 +8,7 @@ from tilelang.backend.device_codegen import DeviceCodegen
 from tilelang.backend.host_codegen import STANDARD_HOST_CODEGENS
 from tilelang.backend.module import BackendModule, register_backend
 from tilelang.contrib import nvcc
+from tilelang.contrib.cuda_resource_info import pop_last_recorded, record_usage
 from tilelang.env import CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH, env
 from tilelang.transform import PassConfigKey
 
@@ -78,6 +79,7 @@ def tilelang_callback_cuda_compile(code, target, pass_config=None):
         "-std=c++20",
         "-I" + TILELANG_TEMPLATE_PATH,
         "-I" + CUTLASS_INCLUDE_DIR,
+        "--resource-usage",
     ]
     extra_flags = cfg.get(PassConfigKey.TL_DEVICE_COMPILE_FLAGS, None)
     if extra_flags:
@@ -100,7 +102,6 @@ def tilelang_callback_cuda_compile(code, target, pass_config=None):
     if ptxas_usage_level is not None:
         options.append(f"--ptxas-options=--register-usage-level={ptxas_usage_level}")
     if verbose:
-        options.append("--ptxas-options=--verbose")
         options.append("-w")
 
     cache_key = CUDABinaryCache.make_key(
@@ -113,10 +114,14 @@ def tilelang_callback_cuda_compile(code, target, pass_config=None):
     )
     cached_binary = CUDABinaryCache.load(cache_key, compile_format)
     if cached_binary is not None:
+        record_usage(CUDABinaryCache.load_resource_usage(cache_key, compile_format))
         return bytearray(cached_binary)
 
+    pop_last_recorded()
     binary = nvcc.compile_cuda(code, compile_format, arch, options=options, verbose=verbose)
+    resource_usage = pop_last_recorded()
     CUDABinaryCache.save(cache_key, compile_format, binary)
+    CUDABinaryCache.save_resource_usage(cache_key, compile_format, resource_usage)
     return binary
 
 

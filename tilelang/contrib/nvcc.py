@@ -20,6 +20,7 @@ from tvm.base import py_str
 from tvm.contrib import utils
 from tilelang import logger
 from .cc import get_cplus_compiler
+from .cuda_resource_info import filter_and_record
 
 
 def get_nvcc_subprocess_env() -> dict[str, str] | None:
@@ -199,12 +200,15 @@ def compile_cuda(code, target_format="ptx", arch=None, options=None, path_target
             msg += f"Output:\n{captured}\n"
         raise RuntimeError(msg) from exc
 
+    output_text = filter_and_record(py_str(out))
+
     if verbose:
         logger.info("NVCC compilation command: %s", " ".join(cmd))
-        logger.info("PTXAS verbose output:\n%s", py_str(out))
+        if output_text.strip():
+            logger.info("NVCC diagnostic output:\n%s", output_text)
 
     if proc.returncode != 0:
-        msg = f"{code}\nCompilation error:\n{py_str(out)}\nCommand: {' '.join(cmd)}\n"
+        msg = f"{code}\nCompilation error:\n{output_text}\nCommand: {' '.join(cmd)}\n"
         if os.name == "nt":
             from tilelang.contrib.msvc import get_msvc_environment_error
 

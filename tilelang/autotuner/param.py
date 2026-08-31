@@ -15,6 +15,7 @@ import errno
 
 from tilelang.jit import JITKernel
 from tilelang.jit.adapter.base import CachedTextSource
+from tilelang.contrib.kernel_resource_info import dump_to_file, load_from_file
 import cloudpickle
 import os
 import shutil
@@ -41,6 +42,7 @@ KERNEL_LIB_PATH = "kernel_lib.so"
 KERNEL_CUBIN_PATH = "kernel.cubin"
 KERNEL_PY_PATH = "kernel.py"
 PARAMS_PATH = "params.pkl"
+RESOURCE_USAGE_PATH = "resource_usage.json"
 TargetLike = str | dict[str, object] | Target
 
 
@@ -386,7 +388,7 @@ class AutotuneResult:
             logger.error(f"Error loading kernel parameters from disk: {e}")
 
         if host_kernel_source and device_kernel_source and kernel_params:
-            return JITKernel.from_database(
+            kernel = JITKernel.from_database(
                 func=func,
                 host_kernel_source=CachedTextSource(text=host_kernel_source),
                 device_kernel_source=CachedTextSource(text=device_kernel_source),
@@ -400,8 +402,14 @@ class AutotuneResult:
                 compile_flags=compile_flags,
                 backend_context=backend_context,
             )
-        else:
-            return None
+            resource_usage_path = os.path.join(cache_path, RESOURCE_USAGE_PATH)
+            if os.path.exists(resource_usage_path):
+                try:
+                    kernel._resource_usage = load_from_file(resource_usage_path)
+                except Exception as err:
+                    logger.warning(f"Error loading autotune resource usage from disk: {err}")
+            return kernel
+        return None
 
     def save_to_disk(self, path: Path, verbose: bool = False):
         """Persist autotune result to disk using atomic directory rename.
@@ -466,6 +474,10 @@ class AutotuneResult:
 
             # save kernel
             self._save_kernel_to_disk(staging_path, self.kernel, verbose)
+
+            resource_usage = getattr(self.kernel, "_resource_usage", None) or {}
+            if resource_usage:
+                dump_to_file(resource_usage, str(staging_path / RESOURCE_USAGE_PATH))
 
             missing_files = self._get_missing_complete_result_files(staging_path, self.kernel.execution_backend)
             if missing_files:

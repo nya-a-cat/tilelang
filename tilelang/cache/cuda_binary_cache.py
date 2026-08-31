@@ -13,6 +13,7 @@ from typing import Any
 
 from tilelang import __version__
 from tilelang._build_identity import get_python_overlay_stamp
+from tilelang.contrib.kernel_resource_info import KernelResourceUsage, from_dict, to_dict
 from tilelang.env import env
 
 
@@ -20,6 +21,7 @@ class CUDABinaryCache:
     """Cache cubin/fatbin bytes independently from host executable artifacts."""
 
     cache_root_dir = "cuda-binaries"
+    resource_usage_suffix = ".resource_usage.json"
 
     @staticmethod
     def _sanitize_path_component(component: str) -> str:
@@ -132,6 +134,41 @@ class CUDABinaryCache:
         return path + ".sha256"
 
     @classmethod
+    def _resource_usage_path(cls, key: str, compile_format: str) -> str:
+        return cls.get_path(key, compile_format) + cls.resource_usage_suffix
+
+    @classmethod
+    def load_resource_usage(cls, key: str, compile_format: str) -> dict[str, KernelResourceUsage]:
+        """Load optional compiler metadata associated with a cached binary."""
+        if not env.is_cache_enabled():
+            return {}
+        path = cls._resource_usage_path(key, compile_format)
+        try:
+            with open(path) as file:
+                return from_dict(json.load(file))
+        except FileNotFoundError:
+            return {}
+        except (OSError, TypeError, ValueError):
+            with contextlib.suppress(OSError):
+                os.remove(path)
+            return {}
+
+    @classmethod
+    def save_resource_usage(cls, key: str, compile_format: str, usage: dict[str, KernelResourceUsage]) -> None:
+        """Atomically persist compiler metadata beside a cached binary."""
+        if not env.is_cache_enabled():
+            return
+        path = cls._resource_usage_path(key, compile_format)
+        if not usage:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+            return
+        cache_root = cls._get_cache_root()
+        os.makedirs(cache_root, exist_ok=True)
+        data = json.dumps(to_dict(usage), indent=2, sort_keys=True).encode()
+        cls._write_atomic(path, data)
+
+    @classmethod
     def load(cls, key: str, compile_format: str) -> bytes | None:
         if not env.is_cache_enabled():
             return None
@@ -154,7 +191,7 @@ class CUDABinaryCache:
         # Corrupted entry (e.g. truncated by a crashed writer): feeding it to
         # cuModuleLoadData would fail with CUDA_ERROR_INVALID_IMAGE on every
         # future run. Drop it so the caller recompiles and rewrites it.
-        for stale in (path, cls._sidecar_path(path)):
+        for stale in (path, cls._sidecar_path(path), path + cls.resource_usage_suffix):
             with contextlib.suppress(OSError):
                 os.remove(stale)
         return None

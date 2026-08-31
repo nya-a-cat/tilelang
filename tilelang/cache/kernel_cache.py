@@ -29,7 +29,7 @@ from tilelang.jit import JITKernel
 from tilelang.jit.adapter.base import CachedTextSource
 from tilelang.jit.diagnostics import jit_phase
 from tilelang.transform.pass_config import normalize_pass_configs
-from tilelang.contrib.hip_resource_info import dump_to_file, load_from_file
+from tilelang.contrib.kernel_resource_info import dump_to_file, load_from_file
 from tilelang import __version__
 from tilelang._build_identity import get_python_overlay_stamp
 
@@ -603,7 +603,7 @@ class KernelCache:
                 self.logger.debug(f"Saving kernel parameters to disk: {params_path}")
             KernelCache._safe_write_file(params_path, "wb", lambda file: cloudpickle.dump(kernel.params, file))
 
-            # Persist HIP kernel-resource-usage remarks
+            # Persist compiler resource usage captured during device compilation.
             usage = getattr(kernel, "_resource_usage", None) or {}
             if usage:
                 dump_to_file(usage, os.path.join(staging_path, self.resource_usage_path))
@@ -723,8 +723,8 @@ class KernelCache:
             shutil.rmtree(cache_path, ignore_errors=True)
             return None
         if kernel is not None:
-            # Restore parsed kernel-resource-usage if a previous compile
-            # persisted it; absent file is fine (older caches, non-HIP).
+            # Restore parsed compiler resource usage if a previous compile
+            # persisted it; absent file is fine for older cache entries.
             ru_path = os.path.join(cache_path, self.resource_usage_path)
             if os.path.exists(ru_path):
                 try:
