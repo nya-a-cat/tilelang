@@ -40,6 +40,7 @@ ARTIFACT_URL_ENV = "TILELANG_PYTHON_OVERLAY_URL"
 ARTIFACT_SHA256_ENV = "TILELANG_PYTHON_OVERLAY_SHA256"
 ARTIFACT_ID_ENV = "TILELANG_PYTHON_OVERLAY_ARTIFACT_ID"
 SOURCE_SHA_ENV = "TILELANG_PYTHON_OVERLAY_SOURCE_SHA"
+CASE_FILTER_ENV = "TILELANG_BOUND_OUTPUT_CASES"
 RESULT_MARKER = "TILELANG_BOUND_OUTPUTS_RESULT="
 RESULT_PATH = Path("/content/tilelang-bound-outputs-t4.json")
 CYCLES = 25
@@ -376,13 +377,13 @@ def make_gemm_program(size: int, symbol: str) -> Any:
     ):
         with TL.Kernel(TL.ceildiv(size, block_n), TL.ceildiv(size, block_m), threads=128) as (bx, by):
             a_shared = TL.alloc_shared((block_m, block_k), TL.float16)
-            b_shared = TL.alloc_shared((block_k, block_n), TL.float16)
+            b_shared = TL.alloc_shared((block_n, block_k), TL.float16)
             c_local = TL.alloc_fragment((block_m, block_n), TL.float32)
             TL.clear(c_local)
             for ko in TL.Pipelined(TL.ceildiv(size, block_k), num_stages=2):
                 TL.copy(A[by * block_m, ko * block_k], a_shared)
-                TL.copy(B[ko * block_k, bx * block_n], b_shared)
-                TL.gemm(a_shared, b_shared, c_local)
+                TL.copy(B[bx * block_n, ko * block_k], b_shared)
+                TL.gemm(a_shared, b_shared, c_local, transpose_B=True)
             TL.copy(c_local, C[by * block_m, bx * block_n])
 
     return with_output_attr(main, symbol)
@@ -466,7 +467,7 @@ def build_cases() -> list[BenchmarkCase]:
             program=make_gemm_program(size, "bound_output_gemm_128"),
             inputs=(lhs, rhs),
             output=TORCH.empty((size, size), device=device, dtype=TORCH.float16),
-            reference=lhs @ rhs,
+            reference=lhs @ rhs.T,
             atol=5e-2,
             rtol=5e-2,
             logical_work_items=size**3,
@@ -801,7 +802,15 @@ def main() -> None:
         "nvidia_smi_start": nvidia_snapshot(),
     }
 
-    results = [benchmark_case(case) for case in build_cases()]
+    cases = build_cases()
+    requested_cases = [name for name in os.environ.get(CASE_FILTER_ENV, "").split(",") if name]
+    if requested_cases:
+        available = {case.name: case for case in cases}
+        missing = sorted(set(requested_cases) - set(available))
+        if missing:
+            raise RuntimeError(f"unknown benchmark cases: {missing}")
+        cases = [available[name] for name in requested_cases]
+    results = [benchmark_case(case) for case in cases]
     aggregates = aggregate_results(results)
     environment["nvidia_smi_end"] = nvidia_snapshot()
     payload = {
@@ -830,6 +839,7 @@ def main() -> None:
             "maximum_transient_callee_output_bytes": MAX_TRANSIENT_OUTPUT_BYTES,
             "speedup_definition": "median(callee_wall_us) / median(bound_wall_us)",
             "aggregation": "geometric mean across cases, plus equal-weight geometric mean across operator families",
+            "selected_cases": [case.name for case in cases],
         },
         "aggregates": aggregates,
         "results": results,
@@ -837,7 +847,7 @@ def main() -> None:
         "evidence_boundary": (
             "One free Colab T4 screen of one exact Python overlay on one checksummed native wheel. "
             "It validates API semantics, output identity, numerical correctness, eager wall overhead, "
-            "GPU event time, allocation requests, and CUDA Graph controls for six fixed cases. "
+            f"GPU event time, allocation requests, and CUDA Graph controls for {len(cases)} fixed cases. "
             "It does not establish a multi-GPU, model-level, or 1.50x TileLang-wide claim."
         ),
     }
