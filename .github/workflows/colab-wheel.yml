@@ -94,16 +94,16 @@ jobs:
             echo "CCACHE_DIR=${host_ccache_dir}"
             echo "CMAKE_BUILD_PARALLEL_LEVEL=${jobs}"
             echo "CMAKE_GENERATOR=Ninja"
-            echo "CIBW_BEFORE_BUILD_LINUX=dnf install -y ccache ninja-build && ccache -o cache_dir=/host${host_ccache_dir} -o max_size=2G -o base_dir=/project -o hash_dir=false -o compiler_check=content && ccache -z"
+            echo "CIBW_BEFORE_ALL_LINUX=set -eux; dnf config-manager --add-repo https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo; dnf install -y cuda-minimal-build-13-0 cuda-driver-devel-13-0 cuda-nvrtc-devel-13-0 ccache ninja-build; dnf clean all"
           } >> "${GITHUB_ENV}"
 
           if [[ "${TILELANG_COLAB_BUILD_MODE}" == "fast-cuda" ]]; then
             {
-              echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=OFF CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs}"
+              echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=OFF CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content"
               echo "CIBW_TEST_SKIP=*"
             } >> "${GITHUB_ENV}"
           else
-            echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=ON CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs}" >> "${GITHUB_ENV}"
+            echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=ON CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content" >> "${GITHUB_ENV}"
           fi
 
           echo "Using ${jobs} build workers; cache hit=${{ steps.native-cache.outputs.cache-hit }}; mode=${TILELANG_COLAB_BUILD_MODE}"
