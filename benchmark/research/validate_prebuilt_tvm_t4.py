@@ -31,6 +31,65 @@ RESULT_PATH = Path("/content/tilelang-prebuilt-tvm-t4-validation.json")
 LENGTH = 4096
 THREADS = 256
 CHILD_MARKER = "TILELANG_CHILD_RESULT="
+CHILD_SOURCE = r"""
+import hashlib
+import json
+import os
+import time
+
+import torch
+import tilelang
+import tilelang.language as T
+
+LENGTH = 4096
+THREADS = 256
+
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is unavailable in the T4 validation child")
+
+
+@T.prim_func
+def add_one(A: T.Tensor((LENGTH,), T.float32), B: T.Tensor((LENGTH,), T.float32)):
+    with T.Kernel(T.ceildiv(LENGTH, THREADS), threads=THREADS) as (bx,):
+        for tx in T.Parallel(THREADS):
+            index = bx * THREADS + tx
+            if index < LENGTH:
+                B[index] = A[index] + 1.0
+
+
+program = add_one.with_attr("global_symbol", "validate_prebuilt_tvm_add_one")
+started = time.perf_counter()
+kernel = tilelang.compile(
+    program,
+    out_idx=None,
+    target="cuda",
+    execution_backend="tvm_ffi",
+    verbose=True,
+)
+compile_seconds = time.perf_counter() - started
+
+x = torch.arange(LENGTH, device="cuda", dtype=torch.float32)
+output = torch.empty_like(x)
+for _ in range(100):
+    kernel(x, output)
+torch.cuda.synchronize()
+torch.testing.assert_close(output, x + 1.0, rtol=0.0, atol=0.0)
+
+result = {
+    "compile_seconds": compile_seconds,
+    "cache_key": getattr(kernel, "_tilelang_cache_key", None),
+    "cache_path": getattr(kernel, "_tilelang_cache_path", None),
+    "kernel_source_sha256": hashlib.sha256(kernel.kernel_source.encode()).hexdigest(),
+    "launches": 100,
+    "correctness": "exact",
+    "output_sum": float(output.sum().item()),
+    "tilelang_version": tilelang.__version__,
+    "torch_version": torch.__version__,
+    "device_name": torch.cuda.get_device_name(0),
+    "device_capability": list(torch.cuda.get_device_capability(0)),
+}
+print("TILELANG_CHILD_RESULT=" + json.dumps(result, sort_keys=True, separators=(",", ":")), flush=True)
+"""
 
 
 def run(command: list[str], *, capture: bool = False, env: dict[str, str] | None = None) -> str:
@@ -184,7 +243,11 @@ def child_validation() -> None:
 def run_child(label: str) -> tuple[dict[str, object], str]:
     child_env = os.environ.copy()
     child_env["TILELANG_CACHE_DIR"] = CACHE_DIR
-    output = run([sys.executable, str(Path(__file__).resolve()), "--child"], capture=True, env=child_env)
+    child_path = Path("/tmp/tilelang-prebuilt-tvm-validation-child.py")
+    if child_path.exists() and child_path.read_text() != CHILD_SOURCE:
+        raise RuntimeError(f"unexpected existing child source: {child_path}")
+    child_path.write_text(CHILD_SOURCE)
+    output = run([sys.executable, str(child_path)], capture=True, env=child_env)
     marker_lines = [line for line in output.splitlines() if line.startswith(CHILD_MARKER)]
     if len(marker_lines) != 1:
         raise RuntimeError(f"{label} child did not emit exactly one result marker:\n{output}")
