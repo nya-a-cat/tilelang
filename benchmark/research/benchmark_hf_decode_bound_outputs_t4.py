@@ -160,9 +160,7 @@ class RMSNormKernelRegistry:
                 scale = T.rsqrt(total[0] / width + epsilon)
                 for index in T.Parallel(width):
                     B[bx, index] = T.cast(
-                        T.cast(values[index], "float32")
-                        * scale
-                        * T.cast(Weight[index], "float32"),
+                        T.cast(values[index], "float32") * scale * T.cast(Weight[index], "float32"),
                         dtype,
                     )
 
@@ -276,7 +274,7 @@ class TileLangRMSNorm:
             self.registry.record_caller_kernel(kernel)
             prepared = (output, bound)
             self.bound_calls[key] = prepared
-            setattr(bound, "_tilelang_first_bind_seconds", bind_seconds)
+            bound._tilelang_first_bind_seconds = bind_seconds
         output, bound = prepared
         result = bound(flat, weight)
         if result is not output:
@@ -379,14 +377,7 @@ def wrapper_stats(wrappers: list[TileLangRMSNorm]) -> dict[str, Any]:
     return {
         "modules": len(wrappers),
         "calls": {mode: sum(wrapper.call_counts[mode] for wrapper in wrappers) for mode in MODES},
-        "shape_calls": {
-            mode: dict(
-                sorted(
-                    sum((wrapper.shape_counts[mode] for wrapper in wrappers), Counter()).items()
-                )
-            )
-            for mode in MODES
-        },
+        "shape_calls": {mode: dict(sorted(sum((wrapper.shape_counts[mode] for wrapper in wrappers), Counter()).items())) for mode in MODES},
         "bound_buffers": sum(len(wrapper.bound_calls) for wrapper in wrappers),
         "bound_buffer_bytes": bound_buffer_bytes,
         "first_bind_seconds_total": sum(bind_seconds),
@@ -449,10 +440,7 @@ def benchmark_model(
             raw[mode].append(sample)
 
     summaries = {mode: summarize_mode(samples) for mode, samples in raw.items()}
-    token_sequences = {
-        mode: sorted({sample["generated_token_sha256"] for sample in samples})
-        for mode, samples in raw.items()
-    }
+    token_sequences = {mode: sorted({sample["generated_token_sha256"] for sample in samples}) for mode, samples in raw.items()}
     if len(token_sequences["callee"]) != 1 or token_sequences["callee"] != token_sequences["bound"]:
         raise RuntimeError(f"callee and bound timed generations diverged for {model_id}")
 
@@ -519,9 +507,7 @@ def main() -> None:
         raise ValueError(f"{NEW_TOKENS_ENV} must be between 1 and 128")
     if not 1 <= CYCLES <= 20:
         raise ValueError(f"{CYCLES_ENV} must be between 1 and 20")
-    requested_models = tuple(
-        value for value in os.environ.get(MODEL_FILTER_ENV, "").split(",") if value
-    )
+    requested_models = tuple(value for value in os.environ.get(MODEL_FILTER_ENV, "").split(",") if value)
     selected_model_ids = requested_models or MODEL_IDS
     unknown_models = sorted(set(selected_model_ids) - set(MODEL_IDS))
     if unknown_models:
@@ -585,22 +571,13 @@ def main() -> None:
         "native_libraries": setup.native_libraries(),
         "nvidia_smi_start": setup.nvidia_snapshot(),
     }
-    results = [
-        benchmark_model(torch, tilelang, T, transformers, huggingface_hub, model_id)
-        for model_id in selected_model_ids
-    ]
+    results = [benchmark_model(torch, tilelang, T, transformers, huggingface_hub, model_id) for model_id in selected_model_ids]
     environment["nvidia_smi_end"] = setup.nvidia_snapshot()
     aggregate = {
         "models": len(results),
-        "bound_vs_callee_seconds_p50_gmean": geometric_mean(
-            [result["speedup"]["bound_vs_callee_seconds_p50"] for result in results]
-        ),
-        "bound_vs_stock_seconds_p50_gmean": geometric_mean(
-            [result["speedup"]["bound_vs_stock_seconds_p50"] for result in results]
-        ),
-        "all_callee_bound_tokens_identical": all(
-            result["callee_bound_tokens_identical"] for result in results
-        ),
+        "bound_vs_callee_seconds_p50_gmean": geometric_mean([result["speedup"]["bound_vs_callee_seconds_p50"] for result in results]),
+        "bound_vs_stock_seconds_p50_gmean": geometric_mean([result["speedup"]["bound_vs_stock_seconds_p50"] for result in results]),
+        "all_callee_bound_tokens_identical": all(result["callee_bound_tokens_identical"] for result in results),
     }
     payload = {
         "schema": "tilelang-hf-bound-output-t4-v1",
