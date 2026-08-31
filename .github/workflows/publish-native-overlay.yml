@@ -1,0 +1,149 @@
+name: Publish verified native overlay
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full source commit SHA embedded in the overlay
+        required: true
+        type: string
+      native_base_sha:
+        description: Full source commit SHA of the published base wheel
+        required: true
+        type: string
+      build_run_id:
+        description: Successful Build verified native overlay run ID
+        required: true
+        type: string
+      artifact_digest:
+        description: Expected Actions artifact digest including sha256 prefix
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-native-overlay-${{ inputs.source_sha }}-${{ inputs.native_base_sha }}
+  cancel-in-progress: false
+
+jobs:
+  publish-native-overlay:
+    if: github.repository == 'nya-a-cat/tilelang'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact overlay source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          submodules: false
+          persist-credentials: false
+
+      - name: Verify run and artifact provenance
+        id: provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          NATIVE_BASE_SHA: ${{ inputs.native_base_sha }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          EXPECTED_DIGEST: ${{ inputs.artifact_digest }}
+        run: |
+          set -euo pipefail
+          [[ "${SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${NATIVE_BASE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${BUILD_RUN_ID}" =~ ^[0-9]+$ ]]
+          [[ "${EXPECTED_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}")"
+          test "$(jq -r .conclusion <<<"${run_json}")" = success
+          test "$(jq -r .head_sha <<<"${run_json}")" = "${SOURCE_SHA}"
+          test "$(jq -r .path <<<"${run_json}")" = ".github/workflows/colab-native-smoke.yml"
+
+          artifact_name="tilelang-native-overlay-${SOURCE_SHA}-on-${NATIVE_BASE_SHA}"
+          artifact_json="$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}/artifacts" \
+              --jq ".artifacts | map(select(.name == \"${artifact_name}\" and .expired == false))"
+          )"
+          test "$(jq length <<<"${artifact_json}")" -eq 1
+          test "$(jq -r '.[0].digest' <<<"${artifact_json}")" = "${EXPECTED_DIGEST}"
+
+          echo "artifact_name=${artifact_name}" >> "${GITHUB_OUTPUT}"
+          echo "release_tag=colab-native-${SOURCE_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "Verified run ${BUILD_RUN_ID}, ${artifact_name}, and ${EXPECTED_DIGEST}."
+
+      - name: Download exact verified artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.provenance.outputs.artifact_name }}
+          path: release-assets
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+
+      - name: Verify release and overlay contents
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          NATIVE_BASE_SHA: ${{ inputs.native_base_sha }}
+          RELEASE_TAG: ${{ steps.provenance.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' manifests < <(
+            find release-assets -type f -name native-overlay-manifest.json -print0
+          )
+          test "${#manifests[@]}" -eq 1
+          manifest="${manifests[0]}"
+          evidence_dir="$(dirname "${manifest}")"
+          test -f "${evidence_dir}/SHA256SUMS"
+          (
+            cd "${evidence_dir}"
+            sha256sum --check SHA256SUMS
+          )
+
+          test "$(jq -r .schema "${manifest}")" = tilelang-colab-native-overlay-v1
+          test "$(jq -r .repository "${manifest}")" = "${GITHUB_REPOSITORY}"
+          test "$(jq -r .source_sha "${manifest}")" = "${SOURCE_SHA}"
+          test "$(jq -r .native_base_sha "${manifest}")" = "${NATIVE_BASE_SHA}"
+          test "$(jq -r .compatibility "${manifest}")" = native-library-hot-patch-abi-guard-v1
+
+          release_json="$(gh release view "${RELEASE_TAG}" --json tagName,targetCommitish,isDraft,isPrerelease)"
+          test "$(jq -r .tagName <<<"${release_json}")" = "${RELEASE_TAG}"
+          test "$(jq -r .targetCommitish <<<"${release_json}")" = "${SOURCE_SHA}"
+          test "$(jq -r .isDraft <<<"${release_json}")" = false
+          test "$(jq -r .isPrerelease <<<"${release_json}")" = true
+
+          mapfile -d '' assets < <(find release-assets -type f -print0 | LC_ALL=C sort -z)
+          test "${#assets[@]}" -ge 8
+          printf '%s\0' "${assets[@]}" | xargs -0 sha256sum | tee release-asset-sha256.txt
+
+      - name: Upload verified assets to fork prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.provenance.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' assets < <(find release-assets -type f -print0 | LC_ALL=C sort -z)
+          assets+=(release-asset-sha256.txt)
+          gh release upload "${RELEASE_TAG}" "${assets[@]}"
+
+      - name: Reverify published assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.provenance.outputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          expected_count="$(( $(find release-assets -type f | wc -l) + 1 ))"
+          release_json="$(gh release view "${RELEASE_TAG}" --json assets,isPrerelease,targetCommitish)"
+          test "$(jq '.assets | length' <<<"${release_json}")" -eq "${expected_count}"
+          test "$(jq -r .isPrerelease <<<"${release_json}")" = true
+          test "$(jq -r .targetCommitish <<<"${release_json}")" = "${SOURCE_SHA}"
+          jq -r '.assets[] | [.name, .size, .state] | @tsv' <<<"${release_json}"
