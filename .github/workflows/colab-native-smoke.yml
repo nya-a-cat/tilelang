@@ -129,7 +129,6 @@ jobs:
         with:
           path: .cache/ci-toolchain
           key: colab-toolchain-v2-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-${{ hashFiles('maint/scripts/install_cached_cuda_toolchain.sh', 'maint/scripts/use_cached_cuda_sysroot.sh') }}
-          fail-on-cache-miss: true
 
       - name: Restore exact prebuilt TVM SDK
         id: tvm-sdk-cache
@@ -137,7 +136,13 @@ jobs:
         with:
           path: .cache/prebuilt-tvm
           key: colab-wheel-tvm-sdk-v1-${{ runner.os }}-${{ runner.arch }}-cp310-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-${{ steps.source.outputs.tvm_sdk_fingerprint }}
-          fail-on-cache-miss: true
+
+      - name: Require bootstrapped native caches
+        if: steps.toolchain-cache.outputs.cache-hit != 'true' || steps.tvm-sdk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "::error::Fast native compile needs exact CUDA sysroot and TVM SDK caches. Run Build Colab wheel in fast-cuda mode once for this source ref, then retry."
+          exit 2
 
       - name: Validate exact native build inputs
         shell: bash
@@ -216,7 +221,7 @@ jobs:
             --parallel "${CMAKE_BUILD_PARALLEL_LEVEL}"
 
       - name: Record native compile evidence
-        if: always()
+        if: always() && steps.native-build.outcome != 'skipped'
         shell: bash
         run: |
           set -euo pipefail
@@ -233,9 +238,11 @@ jobs:
             gcc --version | head -n 1
             nvcc --version
             ccache --show-stats
-            find build/native-smoke/lib -maxdepth 1 -type f -name '*.so' -print0 \
-              | sort -z \
-              | xargs -0 -r sha256sum
+            if [[ -d build/native-smoke/lib ]]; then
+              find build/native-smoke/lib -maxdepth 1 -type f -name '*.so' -print0 \
+                | sort -z \
+                | xargs -0 -r sha256sum
+            fi
           } | tee native-smoke-evidence/native-compile.txt
 
       - name: Save host native compiler cache
