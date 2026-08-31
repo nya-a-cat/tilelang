@@ -147,33 +147,6 @@ jobs:
           restore-keys: |
             colab-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-
 
-      - name: Restore exact native build tree
-        id: native-build-cache
-        if: inputs.build_mode == 'fast-cuda'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .cache/native-build
-          key: colab-wheel-build-v2-${{ runner.os }}-${{ runner.arch }}-cp310-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-${{ inputs.build_mode }}-${{ steps.source.outputs.native_fingerprint }}-${{ hashFiles('maint/scripts/install_cached_cuda_toolchain.sh') }}
-
-      - name: Validate exact native build tree
-        if: inputs.build_mode == 'fast-cuda' && steps.native-build-cache.outputs.cache-hit == 'true'
-        shell: bash
-        env:
-          NATIVE_FINGERPRINT: ${{ steps.source.outputs.native_fingerprint }}
-        run: |
-          set -euo pipefail
-          expected="fingerprint=${NATIVE_FINGERPRINT} manylinux=${MANYLINUX_IMAGE_DIGEST} cuda=${CUDA_VERSION} mode=${TILELANG_COLAB_BUILD_MODE}"
-          actual="$(cat .cache/native-build/.tilelang-ci-cache-identity)"
-          test "${actual}" = "${expected}"
-
-          # Actions creates a fresh checkout on every run. Give identical tracked
-          # inputs a stable old mtime so Ninja can trust the exact cached outputs.
-          git ls-files -z | xargs -0r touch -t 200001010000
-          git submodule foreach --recursive \
-            'git ls-files -z | xargs -0r touch -t 200001010000'
-
-          echo "Validated exact native build tree ${NATIVE_FINGERPRINT}."
-
       - name: Configure cached parallel build
         shell: bash
         run: |
@@ -181,12 +154,10 @@ jobs:
           jobs="$(getconf _NPROCESSORS_ONLN)"
           host_ccache_dir="${GITHUB_WORKSPACE}/.cache/ccache"
           host_toolchain_dir="${GITHUB_WORKSPACE}/.cache/ci-toolchain"
-          host_build_dir="${GITHUB_WORKSPACE}/.cache/native-build"
           container_toolchain_dir="/host${host_toolchain_dir}"
-          container_build_dir="/host${host_build_dir}"
           toolchain_cache_hit="${{ steps.toolchain-cache.outputs.cache-hit }}"
           toolchain_cache_hit="${toolchain_cache_hit:-false}"
-          mkdir -p "${host_ccache_dir}" "${host_toolchain_dir}" "${host_build_dir}"
+          mkdir -p "${host_ccache_dir}" "${host_toolchain_dir}"
 
           {
             echo "CCACHE_DIR=${host_ccache_dir}"
@@ -199,7 +170,6 @@ jobs:
 
           if [[ "${TILELANG_COLAB_BUILD_MODE}" == "fast-cuda" ]]; then
             {
-              echo "CIBW_CONFIG_SETTINGS_LINUX=build-dir=${container_build_dir}"
               echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=${container_toolchain_dir}/bin:/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=OFF CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content"
               echo "CIBW_TEST_SKIP=*"
               echo "CIBW_REPAIR_WHEEL_COMMAND_LINUX=ccache --show-stats | tee /host${GITHUB_WORKSPACE}/ccache-stats.txt && cp {wheel} {dest_dir}"
@@ -224,19 +194,6 @@ jobs:
           output-dir: wheelhouse
           config-file: "{package}/pyproject.toml"
 
-      - name: Record exact native build-tree identity
-        id: build-tree-identity
-        if: inputs.build_mode == 'fast-cuda'
-        shell: bash
-        env:
-          NATIVE_FINGERPRINT: ${{ steps.source.outputs.native_fingerprint }}
-        run: |
-          set -euo pipefail
-          test -d .cache/native-build
-          printf '%s\n' \
-            "fingerprint=${NATIVE_FINGERPRINT} manylinux=${MANYLINUX_IMAGE_DIGEST} cuda=${CUDA_VERSION} mode=${TILELANG_COLAB_BUILD_MODE}" \
-            | sudo tee .cache/native-build/.tilelang-ci-cache-identity >/dev/null
-
       - name: Record compiler cache statistics
         if: always()
         shell: bash
@@ -249,7 +206,7 @@ jobs:
           else
             echo "Host ccache executable unavailable; cache files remain under ${CCACHE_DIR}." | tee ccache-stats.txt
           fi
-          du -sh .cache/ccache .cache/ci-toolchain .cache/native-build 2>/dev/null | tee build-storage.txt || true
+          du -sh .cache/ccache .cache/ci-toolchain 2>/dev/null | tee build-storage.txt || true
 
       - name: Save pinned CUDA toolchain package cache
         if: steps.toolchain-cache.outputs.cache-hit != 'true' && steps.wheel-build.outcome == 'success'
@@ -264,13 +221,6 @@ jobs:
         with:
           path: .cache/ccache
           key: colab-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-${{ steps.source.outputs.native_fingerprint }}
-
-      - name: Save exact native build tree
-        if: inputs.build_mode == 'fast-cuda' && steps.native-build-cache.outputs.cache-hit != 'true' && steps.build-tree-identity.outcome == 'success'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .cache/native-build
-          key: colab-wheel-build-v2-${{ runner.os }}-${{ runner.arch }}-cp310-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-${{ inputs.build_mode }}-${{ steps.source.outputs.native_fingerprint }}-${{ hashFiles('maint/scripts/install_cached_cuda_toolchain.sh') }}
 
       - name: Record checksums
         shell: bash
