@@ -35,12 +35,57 @@ jobs:
       TILELANG_COLAB_BUILD_MODE: ${{ inputs.build_mode }}
       MANYLINUX_IMAGE_DIGEST: 012f4a50472412f18bb2b450c1cce7158434cfae4ae878591c2748a13a30c2be
     steps:
-      - name: Checkout exact source and submodules
+      - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 1
-          submodules: recursive
+          submodules: false
+          persist-credentials: false
+
+      - name: Resolve exact native dependency revisions
+        id: native-deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          cutlass_sha="$(git ls-tree HEAD 3rdparty/cutlass | awk '{ print $3 }')"
+          tvm_sha="$(git ls-tree HEAD 3rdparty/tvm | awk '{ print $3 }')"
+          [[ "${cutlass_sha}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${tvm_sha}" =~ ^[0-9a-f]{40}$ ]]
+          echo "cutlass_sha=${cutlass_sha}" >> "${GITHUB_OUTPUT}"
+          echo "tvm_sha=${tvm_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore exact native dependency trees
+        id: native-deps-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .git/modules/3rdparty
+            3rdparty/cutlass
+            3rdparty/tvm
+          key: tilelang-native-deps-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-deps.outputs.cutlass_sha }}-${{ steps.native-deps.outputs.tvm_sha }}-${{ hashFiles('.gitmodules') }}
+
+      - name: Initialize and verify exact native dependency trees
+        shell: bash
+        env:
+          CUTLASS_SHA: ${{ steps.native-deps.outputs.cutlass_sha }}
+          TVM_SHA: ${{ steps.native-deps.outputs.tvm_sha }}
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          if [[ "${{ steps.native-deps-cache.outputs.cache-hit }}" != "true" ]]; then
+            git submodule update --init --recursive --depth 1 --jobs "$(getconf _NPROCESSORS_ONLN)"
+          else
+            git submodule update --init --recursive --no-fetch
+          fi
+
+          test "$(git -C 3rdparty/cutlass rev-parse HEAD)" = "${CUTLASS_SHA}"
+          test "$(git -C 3rdparty/tvm rev-parse HEAD)" = "${TVM_SHA}"
+          git submodule status --recursive | tee submodule-revisions.txt
+          if grep -Eq '^[-+U]' submodule-revisions.txt; then
+            echo "Native dependency cache is incomplete or does not match the pinned revisions." >&2
+            exit 2
+          fi
 
       - name: Record source revisions
         id: source
@@ -56,7 +101,7 @@ jobs:
               src \
               3rdparty/hip-headers \
               tilelang/jit/adapter/cython/cython_wrapper.pyx
-            git submodule status --recursive
+            cat submodule-revisions.txt
           } | sha256sum | awk '{ print $1 }')"
           echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
           echo "native_fingerprint=${native_fingerprint}" >> "${GITHUB_OUTPUT}"
@@ -73,7 +118,7 @@ jobs:
               echo "backends=CUDA,ROCm"
               echo "test_policy=cibuildwheel_import"
             fi
-            git submodule status --recursive
+            cat submodule-revisions.txt
           } | tee source-revisions.txt
 
       - name: Restore pinned CUDA toolchain package cache
