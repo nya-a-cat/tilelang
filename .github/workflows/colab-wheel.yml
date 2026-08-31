@@ -81,6 +81,7 @@ jobs:
         with:
           path: .cache/ci-toolchain
           key: colab-toolchain-v1-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-${{ hashFiles('maint/scripts/install_cached_cuda_toolchain.sh') }}
+          save-always: true
 
       - name: Restore native compiler cache
         id: native-cache
@@ -90,6 +91,7 @@ jobs:
           key: colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-${{ steps.source.outputs.native_fingerprint }}
           restore-keys: |
             colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-
+          save-always: true
 
       - name: Configure cached parallel build
         shell: bash
