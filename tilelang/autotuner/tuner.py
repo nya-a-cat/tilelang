@@ -127,6 +127,7 @@ class AutoTuner:
     def __init__(self, fn: Callable, configs: ConfigSpace):
         self.fn = fn
         self.configs = configs
+        self.last_search_summary: dict[str, int | None] | None = None
         self.ref_latency_cache = None
         self.jit_input_tensors = None
         self.ref_input_tensors = None
@@ -321,7 +322,12 @@ class AutoTuner:
                     "Please provide concrete inputs with `with set_autotune_inputs(...)`."
                 )
 
-    def generate_cache_key(self, parameters: dict[str, Any], extra_parameters: dict[str, Any]) -> str | None:
+    def generate_cache_key(
+        self,
+        parameters: dict[str, Any],
+        extra_parameters: dict[str, Any],
+        configs: Sequence[ConfigArg] | None = None,
+    ) -> str | None:
         """Generate a cache key for the auto-tuning process."""
 
         # Arbitrary callbacks do not have a reliable persistent identity:
@@ -353,7 +359,7 @@ class AutoTuner:
             "op_parameters": tuple(op_parameters),
             "extra_parameters": extra_parameters,
             "func_source": func_source,
-            "configs": self.configs,
+            "configs": self.configs if configs is None else configs,
             "compile_args": hash(self.compile_args),
             "profile_args": hash(self.profile_args),
         }
@@ -363,6 +369,14 @@ class AutoTuner:
         # Sort keys to ensure consistency
         key_string = json.dumps(key_data, sort_keys=True)
         return hashlib.sha256(key_string.encode()).hexdigest()
+
+    @staticmethod
+    def _select_configs(configs: Sequence[ConfigArg], max_trials: int | None) -> list[ConfigArg]:
+        """Materialize the exact, ordered candidate set admitted for compilation."""
+        if max_trials is not None and (isinstance(max_trials, bool) or not isinstance(max_trials, int) or max_trials <= 0):
+            raise ValueError(f"max_trials must be a positive integer or None, got {max_trials!r}")
+        materialized = list(configs)
+        return materialized if max_trials is None else materialized[:max_trials]
 
     def _save_result_to_disk(self, key, result: AutotuneResult):
         result.save_to_disk(self.cache_dir / key, self.compile_args.verbose)
@@ -824,6 +838,7 @@ class AutoTuner:
         benchmark_multi_gpu: bool = False,
         early_stop: bool = False,
         early_stop_factor: float = 2.0,
+        max_trials: int | None = None,
     ):
         """Run the auto-tuning process.
 
@@ -838,6 +853,7 @@ class AutoTuner:
             benchmark_multi_gpu: Whether to benchmark configurations across multiple CUDA GPUs.
             early_stop: Whether to skip full benchmark when estimate exceeds best * early_stop_factor.
             early_stop_factor: Multiplier for best latency to compute early stop threshold.
+            max_trials: Maximum number of ordered configurations to compile and benchmark. ``None`` explores all configurations.
 
         Returns:
             AutotuneResult: Results of the auto-tuning process.
@@ -869,12 +885,27 @@ class AutoTuner:
                 )
                 extra_parameters[var_name] = cell.cell_contents
 
-        if isinstance(self.configs, Callable):
+        resolved_configs = self.configs
+        if isinstance(resolved_configs, Callable):
             kernel_args, kernel_kwargs = self._kernel_parameters
             kernel_kwargs = dict(kernel_kwargs)
-            self.configs = self.configs(*kernel_args, **kernel_kwargs)
+            resolved_configs = resolved_configs(*kernel_args, **kernel_kwargs)
 
-        key = self.generate_cache_key(parameters, extra_parameters)
+        active_configs = self._select_configs(resolved_configs, max_trials)
+        self.last_search_summary = {
+            "available_trials": len(resolved_configs),
+            "selected_trials": len(active_configs),
+            "max_trials": max_trials,
+        }
+        if max_trials is not None:
+            logger.info(
+                "Auto-tuning compile budget selected %d of %d ordered configurations (max_trials=%d).",
+                len(active_configs),
+                len(resolved_configs),
+                max_trials,
+            )
+
+        key = self.generate_cache_key(parameters, extra_parameters, configs=active_configs)
 
         with self._lock:
             if key is not None and env.is_cache_enabled() and not env.is_autotune_cache_disabled():
@@ -907,7 +938,7 @@ class AutoTuner:
         self.jit_elaborate = elaborate_func
 
         config_args = []
-        for config in self.configs:
+        for config in active_configs:
             new_kwargs = {}
             per_config_pass_configs = config.get("pass_configs", None)
             keys = config.keys()
@@ -990,13 +1021,13 @@ class AutoTuner:
             nonlocal best_latency, best_config, best_kernel
             if latency < best_latency:
                 best_latency = latency
-                best_config = dict(self.configs[idx])
+                best_config = dict(active_configs[idx])
                 best_kernel = jit_kernel
                 if shared_best_latency_ref is not None:
                     shared_best_latency_ref[0] = latency
 
             progress_bar.set_postfix({"best_latency": best_latency})
-            tqdm.write(f"Tuned Latency {latency} with config {self.configs[idx]} at index {idx}")
+            tqdm.write(f"Tuned Latency {latency} with config {active_configs[idx]} at index {idx}")
 
         benchmark_worker_devices = benchmark_device_list if benchmark_multi_gpu_active else [benchmark_device_list[0]]
         benchmark_task_queues = [queue.Queue() for _ in benchmark_worker_devices]
@@ -1034,10 +1065,10 @@ class AutoTuner:
             progress_bar.update(1)
 
             if status == "timeout":
-                logger.warning(f"A timeout occurred while testing config {self.configs[idx]}, checkout autotuner.log for more details")
+                logger.warning(f"A timeout occurred while testing config {active_configs[idx]}, checkout autotuner.log for more details")
                 return
             if status == "error":
-                logger.warning(f"An error occurred while testing config {self.configs[idx]}, checkout autotuner.log for more details")
+                logger.warning(f"An error occurred while testing config {active_configs[idx]}, checkout autotuner.log for more details")
                 if error_text:
                     logger.debug(f"Error: {error_text}")
                 return
@@ -1107,7 +1138,7 @@ class AutoTuner:
                     compile_progress.update(len(unit_results))
                     for idx, config, jit_kernel, error in unit_results:
                         if error is not None:
-                            logger.debug(f"Compilation failed for config {self.configs[idx]} at index {idx} with error: {error}")
+                            logger.debug(f"Compilation failed for config {active_configs[idx]} at index {idx} with error: {error}")
                             continue
                         assert jit_kernel is not None
                         _enqueue_benchmark_task(jit_kernel=jit_kernel, config=config, idx=idx)
@@ -1205,6 +1236,7 @@ class AutoTuneImpl(Generic[_P, _T]):
     do_not_specialize: tuple[str, ...] | list[str] | None = None
     early_stop: bool = False
     early_stop_factor: float = 2.0
+    max_trials: int | None = None
 
     def __post_init__(self):
         self._tuner_cache = {}
@@ -1267,6 +1299,7 @@ class AutoTuneImpl(Generic[_P, _T]):
             self.timeout,
             early_stop=self.early_stop,
             early_stop_factor=self.early_stop_factor,
+            max_trials=self.max_trials,
         )
         return autotuner
 
@@ -1342,6 +1375,7 @@ def autotune(  # This is the new public interface
     do_not_specialize: tuple[str, ...] | list[str] | None = None,
     early_stop: bool = False,
     early_stop_factor: float = 2.0,
+    max_trials: int | None = None,
 ):
     """
     Just-In-Time (JIT) compiler decorator for TileLang functions.
@@ -1374,6 +1408,8 @@ def autotune(  # This is the new public interface
     rep : int, optional
         Number of repetitions for timing measurements.
     timeout : int, optional
+    max_trials : int, optional
+        Maximum number of configurations to compile and benchmark, preserving the supplied order. ``None`` explores the full space.
     target : Union[str, dict, Target], optional
         Compilation target for TVM (e.g., "cuda", "llvm"). Defaults to "auto".
     target_host : Union[str, dict, Target], optional
@@ -1422,6 +1458,7 @@ def autotune(  # This is the new public interface
                 do_not_specialize=do_not_specialize,
                 early_stop=early_stop,
                 early_stop_factor=early_stop_factor,
+                max_trials=max_trials,
             )
 
         return decorator

@@ -4,6 +4,8 @@ import inspect
 import threading
 from dataclasses import replace
 
+import pytest
+
 from tilelang.autotuner import AutoTuner
 from tilelang.autotuner.param import CompileArgs, ProfileArgs
 
@@ -46,3 +48,29 @@ def test_cache_key_is_disabled_for_profile_callbacks():
 
     for callback_field in ("ref_prog", "supply_prog", "manual_check_prog"):
         assert _cache_key(profile_args=ProfileArgs(**{callback_field: callback})) is None
+
+
+def test_compile_budget_selects_an_exact_prefix_without_mutating_configs():
+    configs = [{"block_size": size} for size in (64, 128, 256)]
+
+    selected = AutoTuner._select_configs(configs, max_trials=2)
+
+    assert selected == configs[:2]
+    assert configs == [{"block_size": 64}, {"block_size": 128}, {"block_size": 256}]
+
+
+@pytest.mark.parametrize("max_trials", [0, -1, True, 1.5, "2"])
+def test_compile_budget_rejects_invalid_limits(max_trials):
+    with pytest.raises(ValueError, match="max_trials must be a positive integer or None"):
+        AutoTuner._select_configs([{"block_size": 128}], max_trials=max_trials)
+
+
+def test_compile_budget_uses_the_selected_candidates_in_cache_identity():
+    configs = [{"block_size": size} for size in (64, 128, 256)]
+    tuner = AutoTuner(_kernel, configs=configs)
+    parameters = inspect.signature(_kernel).parameters
+
+    two_trial_key = tuner.generate_cache_key(parameters, {}, configs=tuner._select_configs(configs, max_trials=2))
+    full_key = tuner.generate_cache_key(parameters, {}, configs=tuner._select_configs(configs, max_trials=None))
+
+    assert two_trial_key != full_key
