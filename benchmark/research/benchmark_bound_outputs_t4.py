@@ -144,6 +144,8 @@ def verify_checksums(checksum_path: Path) -> dict[str, str]:
         filename = filename.lstrip("*")
         if filename.startswith("./"):
             filename = filename[2:]
+        if filename.startswith("overlay/"):
+            filename = filename[len("overlay/") :]
         if filename in expected or "/" in filename or filename in ("", ".", ".."):
             raise RuntimeError(f"invalid checksum member: {filename!r}")
         expected[filename] = normalize_sha256(digest, filename)
