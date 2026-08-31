@@ -163,12 +163,14 @@ jobs:
             cat submodule-revisions.txt
           } | tee source-revisions.txt
 
-      - name: Restore pinned CUDA toolchain package cache
+      - name: Restore relocatable CUDA toolchain cache
         id: toolchain-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/ci-toolchain
-          key: colab-toolchain-v1-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-${{ hashFiles('maint/scripts/install_cached_cuda_toolchain.sh') }}
+          key: colab-toolchain-v2-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-${{ hashFiles('maint/scripts/install_cached_cuda_toolchain.sh', 'maint/scripts/use_cached_cuda_sysroot.sh') }}
+          restore-keys: |
+            colab-toolchain-v1-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-${{ hashFiles('maint/scripts/install_cached_cuda_toolchain.sh') }}
 
       - name: Restore native compiler cache
         id: native-cache
@@ -228,13 +230,13 @@ jobs:
             echo "CMAKE_BUILD_PARALLEL_LEVEL=${jobs}"
             echo "CMAKE_GENERATOR=Ninja"
             echo "CIBW_MANYLINUX_X86_64_IMAGE=quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
-            echo "CIBW_BEFORE_ALL_LINUX=/project/maint/scripts/install_cached_cuda_toolchain.sh ${container_toolchain_dir} ${toolchain_cache_hit}"
+            echo "CIBW_BEFORE_ALL_LINUX=/project/maint/scripts/use_cached_cuda_sysroot.sh ${container_toolchain_dir} ${toolchain_cache_hit}"
             echo "CIBW_BUILD_FRONTEND=build[uv]"
           } >> "${GITHUB_ENV}"
 
           if [[ "${TILELANG_COLAB_BUILD_MODE}" == "fast-cuda" ]]; then
             {
-              echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=${container_toolchain_dir}/bin:/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=OFF CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content TILELANG_PREBUILT_TVM_LIB_DIR=${prebuilt_tvm_dir}"
+              echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=${container_toolchain_dir}/bin:${container_toolchain_dir}/cuda-13.0/bin:\$PATH LD_LIBRARY_PATH=${container_toolchain_dir}/cuda-13.0/lib64:${container_toolchain_dir}/cuda-13.0/lib64/stubs:\$LD_LIBRARY_PATH CUDAToolkit_ROOT=${container_toolchain_dir}/cuda-13.0 CUDA_HOME=${container_toolchain_dir}/cuda-13.0 USE_CUDA=ON USE_ROCM=OFF CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content TILELANG_PREBUILT_TVM_LIB_DIR=${prebuilt_tvm_dir}"
               echo "CIBW_TEST_SKIP=*"
               echo "CIBW_REPAIR_WHEEL_COMMAND_LINUX=ccache --show-stats | tee /host${GITHUB_WORKSPACE}/ccache-stats.txt && /project/maint/scripts/capture_prebuilt_tvm_sdk.sh ${container_tvm_sdk_dir} ${{ steps.source.outputs.tvm_sdk_fingerprint }} {wheel} && cp {wheel} {dest_dir}"
               echo "CIBW_AUDIT_COMMAND="
@@ -242,7 +244,7 @@ jobs:
             } >> "${GITHUB_ENV}"
           else
             {
-              echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=${container_toolchain_dir}/bin:/usr/local/cuda/bin:\$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:\$LD_LIBRARY_PATH USE_CUDA=ON USE_ROCM=ON CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content"
+              echo "CIBW_ENVIRONMENT_LINUX=PYTHONDEVMODE=1 PYTHONUNBUFFERED=1 PATH=${container_toolchain_dir}/bin:${container_toolchain_dir}/cuda-13.0/bin:\$PATH LD_LIBRARY_PATH=${container_toolchain_dir}/cuda-13.0/lib64:${container_toolchain_dir}/cuda-13.0/lib64/stubs:\$LD_LIBRARY_PATH CUDAToolkit_ROOT=${container_toolchain_dir}/cuda-13.0 CUDA_HOME=${container_toolchain_dir}/cuda-13.0 USE_CUDA=ON USE_ROCM=ON CMAKE_GENERATOR=Ninja CMAKE_BUILD_PARALLEL_LEVEL=${jobs} CCACHE_DIR=/host${host_ccache_dir} CCACHE_MAXSIZE=2G CCACHE_BASEDIR=/project CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content"
               echo "CIBW_REPAIR_WHEEL_COMMAND_LINUX=ccache --show-stats | tee /host${GITHUB_WORKSPACE}/ccache-stats.txt && auditwheel -v repair --exclude libtvm_ffi.so --exclude 'libz3.so*' --exclude libcuda.so.1 --exclude '/usr/local/cuda*' -w {dest_dir} {wheel}"
             } >> "${GITHUB_ENV}"
           fi
@@ -300,12 +302,12 @@ jobs:
           fi
           du -sh .cache/ccache .cache/ci-toolchain .cache/prebuilt-tvm 2>/dev/null | tee build-storage.txt || true
 
-      - name: Save pinned CUDA toolchain package cache
+      - name: Save relocatable CUDA toolchain cache
         if: steps.toolchain-cache.outputs.cache-hit != 'true' && steps.wheel-build.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/ci-toolchain
-          key: colab-toolchain-v1-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-${{ hashFiles('maint/scripts/install_cached_cuda_toolchain.sh') }}
+          key: colab-toolchain-v2-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-${{ hashFiles('maint/scripts/install_cached_cuda_toolchain.sh', 'maint/scripts/use_cached_cuda_sysroot.sh') }}
 
       - name: Save native compiler cache
         if: steps.native-cache.outputs.cache-hit != 'true' && steps.wheel-build.outcome == 'success'
