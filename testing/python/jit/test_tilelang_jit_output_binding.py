@@ -68,6 +68,33 @@ def test_bind_outputs_reconstructs_interleaved_multi_output_arguments():
     assert calls == [(input_0, output_1, input_2, output_3, input_4)]
 
 
+def test_bind_outputs_prefers_direct_caller_allocated_entry():
+    wrapper_calls = []
+    direct_calls = []
+    entry_requests = []
+
+    def wrapper(*args):
+        wrapper_calls.append(args)
+
+    def direct(*args):
+        direct_calls.append(args)
+
+    kernel = _stub_kernel([1], 2, wrapper)
+    kernel._caller_allocated_kernel.adapter = SimpleNamespace(
+        get_caller_allocated_call_entry=lambda: entry_requests.append(True) or direct
+    )
+    input_tensor = object()
+    output_tensor = object()
+
+    bound = kernel.bind_outputs(output_tensor)
+
+    assert bound(input_tensor) is output_tensor
+    assert kernel.bind_outputs(output_tensor) is bound
+    assert entry_requests == [True]
+    assert wrapper_calls == []
+    assert direct_calls == [(input_tensor, output_tensor)]
+
+
 def test_bind_outputs_validates_output_and_input_counts():
     no_output = _stub_kernel([], 1, lambda *_: None)
     with pytest.raises(ValueError, match="no callee-allocated outputs"):

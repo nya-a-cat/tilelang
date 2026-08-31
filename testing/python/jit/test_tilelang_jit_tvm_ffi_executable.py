@@ -82,6 +82,7 @@ def test_executable_is_initialized_once_and_reused():
 
     assert adapter._get_executable() is executable
     assert adapter.get_exportable_executable() is executable
+    assert adapter.get_caller_allocated_call_entry() is executable
     assert adapter.executable is executable
     assert len(created) == 1
 

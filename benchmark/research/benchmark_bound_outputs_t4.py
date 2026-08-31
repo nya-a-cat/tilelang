@@ -670,14 +670,40 @@ def benchmark_case(case: BenchmarkCase) -> dict[str, Any]:
     if companion_attrs is not None and "tilelang_out_idx" in companion_attrs:
         raise RuntimeError("caller-allocated companion retained the callee output attribute")
 
-    calls = {"callee": call_callee, "bound": lambda: bound(*case.inputs)}
+    executable = companion.adapter.get_exportable_executable()
+    fixed_full_args = (*case.inputs, case.output)
+
+    def call_direct() -> Any:
+        executable(*fixed_full_args)
+        return case.output
+
+    direct_result = call_direct()
+    if direct_result is not case.output:
+        raise RuntimeError("direct executable call did not preserve the caller-owned output")
+    TORCH.cuda.synchronize()
+    TORCH.testing.assert_close(case.output, case.reference, atol=case.atol, rtol=case.rtol)
+
+    # A prepared call must continue to follow PyTorch's active stream.  The
+    # TVM-FFI executable performs that exchange while converting the fixed
+    # Torch tensors, so exercise one non-default stream before timing it.
+    stream = TORCH.cuda.Stream()
+    with TORCH.cuda.stream(stream):
+        call_direct()
+    stream.synchronize()
+    TORCH.testing.assert_close(case.output, case.reference, atol=case.atol, rtol=case.rtol)
+
+    calls = {
+        "callee": call_callee,
+        "bound": lambda: bound(*case.inputs),
+        "direct": call_direct,
+    }
     warmups = {label: warm_for(call, WARMUP_SECONDS) for label, call in calls.items()}
     output_bytes = int(case.output.numel() * case.output.element_size())
     iteration_cap = min(MAX_BATCH_ITERS, max(32, MAX_TRANSIENT_OUTPUT_BYTES // max(output_bytes, 1)))
-    iterations = max(calibrate(call_callee, iteration_cap), calibrate(calls["bound"], iteration_cap))
+    iterations = max(calibrate(call, iteration_cap) for call in calls.values())
 
-    raw: dict[str, list[dict[str, Any]]] = {"callee": [], "bound": []}
-    order = ("callee", "bound", "bound", "callee")
+    raw: dict[str, list[dict[str, Any]]] = {label: [] for label in calls}
+    order = ("callee", "bound", "direct", "direct", "bound", "callee")
     for cycle in range(CYCLES):
         for order_index, label in enumerate(order):
             wall_us, gpu_us = measure_batch(calls[label], iterations)
@@ -693,6 +719,12 @@ def benchmark_case(case: BenchmarkCase) -> dict[str, Any]:
     speedup = {
         "wall_p50": summaries["callee"]["wall_p50_us"] / summaries["bound"]["wall_p50_us"],
         "gpu_p50": summaries["callee"]["gpu_p50_us"] / summaries["bound"]["gpu_p50_us"],
+    }
+    dispatch_speedup = {
+        "bound_to_direct_wall_p50": summaries["bound"]["wall_p50_us"] / summaries["direct"]["wall_p50_us"],
+        "bound_to_direct_gpu_p50": summaries["bound"]["gpu_p50_us"] / summaries["direct"]["gpu_p50_us"],
+        "callee_to_direct_wall_p50": summaries["callee"]["wall_p50_us"] / summaries["direct"]["wall_p50_us"],
+        "callee_to_direct_gpu_p50": summaries["callee"]["gpu_p50_us"] / summaries["direct"]["gpu_p50_us"],
     }
     allocation = {label: allocation_probe(call) for label, call in calls.items()}
 
@@ -734,6 +766,7 @@ def benchmark_case(case: BenchmarkCase) -> dict[str, Any]:
         "cycles": CYCLES,
         "summaries": summaries,
         "speedup": speedup,
+        "dispatch_speedup": dispatch_speedup,
         "allocation_probe": allocation,
         "cuda_graph": graphs,
         "raw_samples": raw,
@@ -743,6 +776,8 @@ def benchmark_case(case: BenchmarkCase) -> dict[str, Any]:
         f"case={case.name} iterations={iterations} "
         f"wall={summaries['callee']['wall_p50_us']:.3f}->{summaries['bound']['wall_p50_us']:.3f}us "
         f"speedup={speedup['wall_p50']:.3f}x "
+        f"direct={summaries['direct']['wall_p50_us']:.3f}us "
+        f"bound_to_direct={dispatch_speedup['bound_to_direct_wall_p50']:.3f}x "
         f"gpu={summaries['callee']['gpu_p50_us']:.3f}->{summaries['bound']['gpu_p50_us']:.3f}us",
         flush=True,
     )
@@ -811,7 +846,7 @@ def main() -> None:
     aggregates = aggregate_results(results)
     environment["nvidia_smi_end"] = nvidia_snapshot()
     payload = {
-        "schema": "tilelang-bound-outputs-t4-v1",
+        "schema": "tilelang-bound-outputs-t4-v2",
         "status": "success",
         "created_unix": time.time(),
         "repository": REPOSITORY,
@@ -828,13 +863,19 @@ def main() -> None:
         "installer_log": installer_log,
         "environment": environment,
         "method": {
-            "comparison": "existing callee allocation vs JITKernel.bind_outputs caller-owned reuse",
-            "order": ["callee", "bound", "bound", "callee"],
+            "comparison": (
+                "existing callee allocation vs JITKernel.bind_outputs caller-owned reuse "
+                "vs fixed full-argument TVM-FFI executable dispatch"
+            ),
+            "order": ["callee", "bound", "direct", "direct", "bound", "callee"],
             "cycles": CYCLES,
             "warmup_seconds_per_mode_per_case": WARMUP_SECONDS,
             "minimum_batch_seconds": MIN_BATCH_SECONDS,
             "maximum_transient_callee_output_bytes": MAX_TRANSIENT_OUTPUT_BYTES,
-            "speedup_definition": "median(callee_wall_us) / median(bound_wall_us)",
+            "speedup_definition": (
+                "allocation speedup = median(callee_wall_us) / median(bound_wall_us); "
+                "dispatch speedup = median(bound_wall_us) / median(direct_wall_us)"
+            ),
             "aggregation": "geometric mean across cases, plus equal-weight geometric mean across operator families",
             "selected_cases": [case.name for case in cases],
         },
@@ -844,7 +885,8 @@ def main() -> None:
         "evidence_boundary": (
             "One free Colab T4 screen of one exact Python overlay on one checksummed native wheel. "
             "It validates API semantics, output identity, numerical correctness, eager wall overhead, "
-            f"GPU event time, allocation requests, and CUDA Graph controls for {len(cases)} fixed cases. "
+            "GPU event time, allocation requests, direct fixed-argument dispatch, active-stream semantics, "
+            f"and CUDA Graph controls for {len(cases)} fixed cases. "
             "It does not establish a multi-GPU, model-level, or 1.50x TileLang-wide claim."
         ),
     }

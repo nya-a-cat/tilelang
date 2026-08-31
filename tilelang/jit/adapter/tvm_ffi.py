@@ -143,6 +143,16 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
     def get_exportable_executable(self) -> tvm.runtime.Executable:
         return self._get_executable()
 
+    def get_caller_allocated_call_entry(self) -> Callable[..., Any]:
+        """Return the executable used by a full-parameter companion ABI.
+
+        TVM-FFI performs Torch tensor and current-stream exchange inside the
+        executable call itself.  A caller-allocated companion therefore does
+        not need the Python wrapper that normally rebuilds the same complete
+        positional list on every invocation.
+        """
+        return self._get_executable()
+
     def _uses_ffi_callee_allocated_output_abi(self) -> bool:
         """Whether lowering gives this kernel the callee-allocated main ABI."""
         if not self.result_idx:

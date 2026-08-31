@@ -99,6 +99,16 @@ class BaseKernelAdapter(ABC):
     def __call__(self, *args: Any, **kwds: Any) -> Any:
         return self.func(*args, **kwds)
 
+    def get_caller_allocated_call_entry(self) -> Callable[..., Any] | None:
+        """Return a low-overhead entry accepting every PrimFunc parameter.
+
+        Adapters may override this when their native callable already accepts
+        caller-owned outputs in the original parameter order and preserves the
+        framework's active stream semantics.  Returning ``None`` keeps the
+        regular high-level adapter wrapper.
+        """
+        return None
+
     def get_kernel_source(self, kernel_only: bool = True) -> str:
         if kernel_only:
             return self.mod.imports[0].inspect_source()

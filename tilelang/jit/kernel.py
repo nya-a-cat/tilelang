@@ -276,6 +276,12 @@ class JITKernel(Generic[_P, _T]):
         """Create a low-overhead callable that writes into fixed output buffers."""
         caller_allocated_kernel = self._get_caller_allocated_kernel()
         caller_func = caller_allocated_kernel.torch_function
+        caller_adapter = getattr(caller_allocated_kernel, "adapter", None)
+        get_call_entry = getattr(caller_adapter, "get_caller_allocated_call_entry", None)
+        if get_call_entry is not None:
+            direct_caller_func = get_call_entry()
+            if direct_caller_func is not None:
+                caller_func = direct_caller_func
         result_idx = tuple(self.out_idx)
         total_params = len(self.params)
         expected_inputs = total_params - len(result_idx)
