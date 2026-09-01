@@ -20,6 +20,7 @@
 #include "../op/parallel.h"
 #include "arith/ir_mutator_with_analyzer.h"
 #include "common/access_ptr_utils.h"
+#include "common/vector_lane_scalarizer.h"
 #include "loop_partition.h"
 #include "loop_vectorize.h"
 
@@ -39,61 +40,6 @@ int GetConstAccessMask(const PrimExpr &expr) {
 bool AccessMaskMayUse(const PrimExpr &expr, int required_mask) {
   return (GetConstAccessMask(expr) & required_mask) != 0;
 }
-
-// Extract a scalar lane from vector expressions used in bounds predicates.
-// This intentionally expands Ramp/Broadcast/Shuffle by structure instead of
-// using Shuffle::ExtractElement, because the arithmetic prover handles the
-// resulting scalar integer expressions more reliably.
-struct VectorLaneScalarizer : public ExprMutator {
-  explicit VectorLaneScalarizer(int lane) : lane_(lane) {}
-
-private:
-  int lane_;
-
-  PrimExpr VisitExpr_(const RampNode *op) final {
-    PrimExpr base = VisitExpr(op->base);
-    PrimExpr stride = VisitExpr(op->stride);
-    return base + stride * IntImm(stride.dtype(), lane_);
-  }
-
-  PrimExpr VisitExpr_(const BroadcastNode *op) final {
-    return VisitExpr(op->value);
-  }
-
-  PrimExpr VisitExpr_(const ShuffleNode *op) final {
-    ICHECK_LT(lane_, op->indices.size());
-    const int64_t *idx = as_const_int(op->indices[lane_]);
-    ICHECK(idx)
-        << "Vector condition scalarization requires constant Shuffle indices: "
-        << GetRef<Shuffle>(op);
-    int64_t src_lane = *idx;
-    for (const PrimExpr &vec : op->vectors) {
-      ICHECK(!vec.dtype().is_scalable_vector());
-      int lanes = vec.dtype().lanes();
-      if (src_lane < lanes) {
-        if (vec.dtype().is_scalar()) {
-          ICHECK_EQ(src_lane, 0);
-          return VisitExpr(vec);
-        }
-        return VectorLaneScalarizer(static_cast<int>(src_lane))(vec);
-      }
-      src_lane -= lanes;
-    }
-    ICHECK(false) << "Shuffle index out of range: " << GetRef<Shuffle>(op);
-    return PrimExpr();
-  }
-
-  PrimExpr VisitExpr_(const CastNode *op) final {
-    PrimExpr value = VisitExpr(op->value);
-    DataType dtype =
-        op->dtype.is_fixed_length_vector() ? op->dtype.element_of() : op->dtype;
-    if (value.dtype() == dtype) {
-      return value;
-    } else {
-      return Cast(dtype, value);
-    }
-  }
-};
 
 // SafeMemChecker for a BufferLoad/BufferStore node:
 // 1. Identify BufferLoad and BufferStore nodes.
@@ -191,7 +137,7 @@ struct SafeMemChecker : public StmtExprVisitor {
     int lanes = simplified.dtype().lanes();
     for (int lane = 0; lane < lanes; lane++) {
       PrimExpr scalar =
-          analyzer_->Simplify(VectorLaneScalarizer(lane)(simplified));
+          analyzer_->Simplify(ScalarizeFixedVectorLane(simplified, lane));
       ICHECK(scalar.dtype() == DataType::Bool(1))
           << "scalarized condition is not a boolean: " << scalar;
       PushScalarCondition(scalar);

@@ -66,7 +66,12 @@ bool IsExprInvariantInVectorBoundary(const PrimExpr &expr, Var var,
 
 bool IndicesCanVectorize(const PrimExpr &expr, Var var,
                          const PrimExpr &iter_var_size,
-                         int target_vectorized_size, arith::Analyzer *analyzer);
+                         int target_vectorized_size, arith::Analyzer *analyzer,
+                         bool allow_grouped_contiguous = false);
+
+// Whether the loop vectorizer may compress repeated adjacent local-buffer
+// indices into one contiguous load followed by a lane shuffle.
+bool GroupedLocalLoadVectorizationEnabled();
 
 } // namespace tl
 } // namespace tvm

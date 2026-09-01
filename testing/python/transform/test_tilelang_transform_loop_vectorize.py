@@ -23,6 +23,13 @@ def _run_vectorized_loop_legalizer(func):
         return tl.transform.LegalizeVectorizedLoop()(mod)
 
 
+def _run_loop_vectorizer(func, pass_config=None):
+    mod = tvm.IRModule({"main": func})
+    with _TARGET, tvm.transform.PassContext(config=pass_config or {}):
+        mod = tl.transform.LegalizeVectorizedLoop()(mod)
+        return tl.transform.VectorizeLoop()(mod)
+
+
 def _vectorized_extents(func):
     extents = []
 
@@ -273,6 +280,50 @@ def test_reinterpret_is_transparent_to_vectorization_planning():
     transformed = _run_vectorized_loop_legalizer(main)
 
     assert _vectorized_extents(transformed["main"]) == [extent]
+
+
+def test_grouped_local_load_is_compacted_before_lane_expansion():
+    """Repeated local indices use one compact load and an explicit shuffle."""
+    extent = 4
+
+    @T.prim_func
+    def main(
+        input: T.Tensor((extent // 2,), T.uint8),
+        output: T.Tensor((extent,), T.uint8),
+    ):
+        with T.Kernel(1, threads=extent):
+            local = T.alloc_local((extent // 2,), T.uint8)
+            for i in T.vectorized(extent // 2):
+                local[i] = input[i]
+            for i in T.vectorized(extent):
+                output[i] = local[i // 2]
+
+    transformed = _run_loop_vectorizer(main)
+    local_load_lanes = []
+    shuffle_lanes = []
+
+    def collect(node):
+        if isinstance(node, tvm.tirx.BufferLoad) and node.buffer.scope() == "local":
+            local_load_lanes.append(node.dtype.lanes)
+        elif isinstance(node, tvm.tirx.Shuffle):
+            shuffle_lanes.append(node.dtype.lanes)
+
+    post_order_visit(transformed["main"].body, collect)
+    assert extent // 2 in local_load_lanes
+    assert extent in shuffle_lanes
+
+    legacy = _run_loop_vectorizer(
+        main,
+        {"tl.disable_grouped_local_load_vectorization": True},
+    )
+    legacy_local_load_lanes = []
+
+    def collect_legacy(node):
+        if isinstance(node, tvm.tirx.BufferLoad) and node.buffer.scope() == "local":
+            legacy_local_load_lanes.append(node.dtype.lanes)
+
+    post_order_visit(legacy["main"].body, collect_legacy)
+    assert extent // 2 not in legacy_local_load_lanes
 
 
 def test_overflow_promotion_preserves_atomic_vector_lanes():

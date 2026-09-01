@@ -314,6 +314,17 @@ class PassConfigKey(str, Enum):
     operation. Set this flag to True only for backend A/B testing or rollback.
     """
 
+    TL_DISABLE_GROUPED_LOCAL_LOAD_VECTORIZATION = (
+        "tl.disable_grouped_local_load_vectorization"
+    )
+    """Restore scalarized handling of repeated adjacent local-buffer loads.
+
+    The default loop vectorizer compacts grouped indices such as
+    ``[base, base, base + 1, base + 1]`` into one contiguous load and expands
+    its lanes with a shuffle. Set this flag to True for backend A/B testing or
+    rollback.
+    """
+
     # TIR related configs: TIR_XX
 
     TIR_ENABLE_EQUIV_TERMS_IN_CSE = "tir.enable_equiv_terms_in_cse_tir"

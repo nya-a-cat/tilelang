@@ -25,6 +25,7 @@
 #include "../op/utils.h"
 #include "arith/scalable_expression.h"
 #include "backend/common/target_utils.h"
+#include "common/vector_lane_scalarizer.h"
 #include "tir/analysis/check_contains.h"
 
 namespace tvm {
@@ -32,6 +33,18 @@ namespace tl {
 
 using namespace tirx;
 using namespace ffi;
+
+static constexpr const char *kDisableGroupedLocalLoadVectorization =
+    "tl.disable_grouped_local_load_vectorization";
+TVM_REGISTER_PASS_CONFIG_OPTION(kDisableGroupedLocalLoadVectorization, Bool);
+
+bool GroupedLocalLoadVectorizationEnabled() {
+  auto ctxt = tvm::transform::PassContext::Current();
+  return !ctxt->GetConfig(kDisableGroupedLocalLoadVectorization,
+                          ffi::Optional<Bool>())
+              .value_or(Bool(false))
+              ->value;
+}
 
 /*!
  * \brief Perform data type legalization on the given BufferLoadNode pointer.
@@ -840,6 +853,60 @@ public:
       return this->VisitExpr(index);
     };
     Array<PrimExpr> indices = op->indices.Map(fmutate);
+
+    // A local byte may feed several adjacent result lanes, as in int4
+    // dequantization where index j / 2 produces [0, 0, 1, 1].  Load the unique
+    // contiguous bytes once and expand them with a shuffle.  Restrict this to
+    // scalar local/fragment buffers; shared/global gather semantics stay on
+    // the conservative path.
+    if (GroupedLocalLoadVectorizationEnabled() &&
+        op->buffer->dtype.is_scalar() && indices.size() == 1 &&
+        (IsLocalBuffer(op->buffer, /*allow_var=*/true) ||
+         IsFragmentBuffer(op->buffer))) {
+      PrimExpr vector_index = indices[0];
+      int lanes = vector_index.dtype().lanes();
+      if (lanes >= 4) {
+        PrimExpr first =
+            analyzer_.Simplify(ScalarizeFixedVectorLane(vector_index, 0));
+        for (int group_size = 2; group_size <= lanes / 2; group_size *= 2) {
+          if (lanes % group_size != 0) {
+            continue;
+          }
+          bool matches = true;
+          for (int lane = 1; lane < lanes; ++lane) {
+            PrimExpr actual = analyzer_.Simplify(
+                ScalarizeFixedVectorLane(vector_index, lane));
+            PrimExpr expected = analyzer_.Simplify(
+                first + make_const(first.dtype(), lane / group_size));
+            if (!analyzer_.CanProveEqual(actual, expected)) {
+              matches = false;
+              break;
+            }
+          }
+          if (!matches) {
+            continue;
+          }
+
+          int compact_lanes = lanes / group_size;
+          PrimExpr alignment = make_const(first.dtype(), compact_lanes);
+          if (!analyzer_.CanProveEqual(FloorMod(first, alignment),
+                                       make_zero(first.dtype()))) {
+            continue;
+          }
+          BufferLoad compact = GetRef<BufferLoad>(op);
+          BufferLoadNode *writer = compact.CopyOnWrite();
+          writer->indices = {
+              Ramp(first, make_const(first.dtype(), 1), compact_lanes)};
+          LegalizeBufferLoadDType(writer);
+
+          Array<PrimExpr> shuffle_indices;
+          for (int lane = 0; lane < lanes; ++lane) {
+            shuffle_indices.push_back(Integer(lane / group_size));
+          }
+          return Shuffle({compact}, shuffle_indices);
+        }
+      }
+    }
 
     if (!indices.same_as(op->indices)) {
       BufferLoadNode *writer = load.CopyOnWrite();

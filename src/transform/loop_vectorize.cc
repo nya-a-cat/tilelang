@@ -32,6 +32,7 @@
 #include "backend/common/target_utils.h"
 #include "common/int64_promoter.h"
 #include "common/loop_vectorization_utils.h"
+#include "common/vector_lane_scalarizer.h"
 #include "support/check.h"
 #include <iostream>
 #include <optional>
@@ -420,7 +421,13 @@ private:
         elem_offset += info.indices[i] * strides[i];
       }
       if (!IndicesCanVectorize(elem_offset, inner_for_->loop_var,
-                               inner_for_->extent, vector_size, analyzer_)) {
+                               inner_for_->extent, vector_size, analyzer_,
+                               !info.is_store && info.buffer.defined() &&
+                                   info.buffer->dtype.is_scalar() &&
+                                   (IsLocalBuffer(info.buffer,
+                                                  /*allow_var=*/true) ||
+                                    IsFragmentBuffer(info.buffer)) &&
+                                   GroupedLocalLoadVectorizationEnabled())) {
         int old_vector_size = vector_size;
         vector_size = arith::ZeroAwareGCD(vector_size, info.vector_size);
         if (verbose) {
@@ -1000,8 +1007,12 @@ private:
     // 4. Try to find max vectorize size for this buffer
     while (buffer_vec_size > 1 &&
            !IndicesCanVectorize(elem_offset, inner_for_->loop_var,
-                                inner_for_->extent, buffer_vec_size,
-                                analyzer_)) {
+                                inner_for_->extent, buffer_vec_size, analyzer_,
+                                !is_store && buffer->dtype.is_scalar() &&
+                                    (IsLocalBuffer(buffer,
+                                                   /*allow_var=*/true) ||
+                                     IsFragmentBuffer(buffer)) &&
+                                    GroupedLocalLoadVectorizationEnabled())) {
       buffer_vec_size /= 2;
     }
     return {buffer_vec_size, /*requires_scalarization=*/false};
@@ -1218,8 +1229,8 @@ int MaxVectorLoadBits(const Target &target, bool global_only_access) {
 
 bool IndicesCanVectorize(const PrimExpr &expr, Var var,
                          const PrimExpr &iter_var_size,
-                         int target_vectorized_size,
-                         arith::Analyzer *analyzer) {
+                         int target_vectorized_size, arith::Analyzer *analyzer,
+                         bool allow_grouped_contiguous) {
   ICHECK(target_vectorized_size >= 1);
   if (target_vectorized_size == 1)
     return true;
@@ -1273,8 +1284,37 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
     // Broadcast value
     if (expr_vectorized.dtype().lanes() == 1)
       return true;
-    else
+    if (!allow_grouped_contiguous ||
+        expr_vectorized.dtype().lanes() != target_vectorized_size) {
       return false;
+    }
+
+    // Accept adjacent repeated groups such as [base, base, base+1, base+1].
+    // The execution vectorizer rewrites this into one contiguous compact load
+    // and a shuffle, so no repeated memory access is introduced.
+    PrimExpr first =
+        analyzer->Simplify(ScalarizeFixedVectorLane(expr_vectorized, 0));
+    for (int group_size = 2; group_size <= target_vectorized_size / 2;
+         group_size *= 2) {
+      if (target_vectorized_size % group_size != 0) {
+        continue;
+      }
+      bool matches = true;
+      for (int lane = 1; lane < target_vectorized_size; ++lane) {
+        PrimExpr actual =
+            analyzer->Simplify(ScalarizeFixedVectorLane(expr_vectorized, lane));
+        PrimExpr expected = analyzer->Simplify(
+            first + make_const(first.dtype(), lane / group_size));
+        if (!analyzer->CanProveEqual(actual, expected)) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) {
+        return true;
+      }
+    }
+    return false;
   } else {
     return is_one(ramp_node->stride);
   }

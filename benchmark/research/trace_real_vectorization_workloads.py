@@ -40,6 +40,7 @@ CONFIG_KEY = "tl.vectorize_local_parallel"
 INPLACE_CONFIG_KEY = "tl.storage_rewrite_detect_inplace"
 REGISTER_USAGE_CONFIG_KEY = "tl.ptxas_register_usage_level"
 DISABLE_REINTERPRET_CONFIG_KEY = "tl.disable_reinterpret_vectorization"
+DISABLE_GROUPED_LOCAL_LOAD_CONFIG_KEY = "tl.disable_grouped_local_load_vectorization"
 MODES = tuple(
     mode.strip()
     for mode in os.environ.get(
@@ -53,7 +54,13 @@ WORKLOAD_NAMES = tuple(
     for name in os.environ.get("TILELANG_REAL_VECTOR_WORKLOADS", "").split(",")
     if name.strip()
 )
-BASE_MODES = {"planner", "legacy", "planner_inplace", "planner_reinterpret_legacy"}
+BASE_MODES = {
+    "planner",
+    "legacy",
+    "planner_inplace",
+    "planner_reinterpret_legacy",
+    "planner_grouped_load_legacy",
+}
 REGISTER_USAGE_MODE_RE = re.compile(r"planner_ru(?P<level>\d+)$")
 DEFAULT_ARCHES = "sm_75,sm_80,sm_90a,sm_100a,sm_120a"
 RESULT_PATH = Path(
@@ -119,7 +126,8 @@ if (
 ):
     raise ValueError(
         "TILELANG_REAL_VECTOR_MODES must contain planner and legacy; optional modes are "
-        "planner_inplace, planner_reinterpret_legacy, and planner_ru0 through planner_ru10"
+        "planner_inplace, planner_reinterpret_legacy, planner_grouped_load_legacy, "
+        "and planner_ru0 through planner_ru10"
     )
 if MAX_WORKERS < 1:
     raise ValueError("TILELANG_REAL_VECTOR_COMPILE_WORKERS must be positive")
@@ -281,6 +289,9 @@ def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                 pass_configs[DISABLE_REINTERPRET_CONFIG_KEY] = (
                     mode == "planner_reinterpret_legacy"
                 )
+                pass_configs[DISABLE_GROUPED_LOCAL_LOAD_CONFIG_KEY] = (
+                    mode == "planner_grouped_load_legacy"
+                )
                 usage_level = register_usage_level(mode)
                 if usage_level is not None:
                     pass_configs[REGISTER_USAGE_CONFIG_KEY] = usage_level
@@ -436,6 +447,10 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
     reinterpret_sass_changed = 0
     reinterpret_instruction_reduced = 0
     reinterpret_register_reduced = 0
+    grouped_source_changed = 0
+    grouped_sass_changed = 0
+    grouped_instruction_reduced = 0
+    grouped_register_reduced = 0
     for workload in workload_records:
         by_key = {(case["arch"], case["mode"]): case for case in workload["cases"]}
         workload["comparisons"] = []
@@ -578,6 +593,42 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
                     planner["instruction_count"] < legacy_reinterpret["instruction_count"]
                 )
                 reinterpret_register_reduced += int(planner_regs < legacy_regs)
+        if "planner_grouped_load_legacy" in MODES:
+            workload["grouped_load_comparisons"] = []
+            for arch in ARCHES:
+                planner = by_key[(arch, "planner")]
+                legacy_grouped = by_key[(arch, "planner_grouped_load_legacy")]
+                planner_regs = max(
+                    (int(item["n_regs"]) for item in planner["resources"].values()),
+                    default=0,
+                )
+                legacy_regs = max(
+                    (int(item["n_regs"]) for item in legacy_grouped["resources"].values()),
+                    default=0,
+                )
+                comparison = {
+                    "arch": arch,
+                    "source_changed": planner["source_sha256"]
+                    != legacy_grouped["source_sha256"],
+                    "sass_changed": planner["sass_sha256"]
+                    != legacy_grouped["sass_sha256"],
+                    "planner_minus_legacy_grouped_load": {
+                        "source_bytes": planner["source_bytes"]
+                        - legacy_grouped["source_bytes"],
+                        "cubin_bytes": planner["cubin_bytes"]
+                        - legacy_grouped["cubin_bytes"],
+                        "instruction_count": planner["instruction_count"]
+                        - legacy_grouped["instruction_count"],
+                        "max_registers": planner_regs - legacy_regs,
+                    },
+                }
+                workload["grouped_load_comparisons"].append(comparison)
+                grouped_source_changed += int(comparison["source_changed"])
+                grouped_sass_changed += int(comparison["sass_changed"])
+                grouped_instruction_reduced += int(
+                    planner["instruction_count"] < legacy_grouped["instruction_count"]
+                )
+                grouped_register_reduced += int(planner_regs < legacy_regs)
     if source_changed == 0 or sass_changed == 0 or planner_packed_gain == 0:
         raise RuntimeError(
             "planner/legacy trace produced no material source, SASS, or packed-type difference"
@@ -605,6 +656,13 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
         "reinterpret_sass_changed": reinterpret_sass_changed,
         "reinterpret_instruction_reduced": reinterpret_instruction_reduced,
         "reinterpret_register_reduced": reinterpret_register_reduced,
+        "grouped_load_comparisons": len(ARCHES) * len(workload_records)
+        if "planner_grouped_load_legacy" in MODES
+        else 0,
+        "grouped_load_source_changed": grouped_source_changed,
+        "grouped_load_sass_changed": grouped_sass_changed,
+        "grouped_load_instruction_reduced": grouped_instruction_reduced,
+        "grouped_load_register_reduced": grouped_register_reduced,
     }
 
 
@@ -736,6 +794,36 @@ def write_report(payload: dict[str, Any]) -> None:
                     f"{legacy_reinterpret['instruction_count']}→"
                     f"{planner['instruction_count']} | "
                     f"{register_count(legacy_reinterpret)}→{register_count(planner)} |"
+                )
+        lines.append("")
+    if "planner_grouped_load_legacy" in payload["modes"]:
+        lines.extend(
+            [
+                "## Grouped local-load compaction",
+                "",
+                "| Workload | Arch | packed types legacy→compact | instructions legacy→compact | registers legacy→compact |",
+                "|---|---:|---:|---:|---:|",
+            ]
+        )
+        for workload in payload["workloads"]:
+            by_key = {(case["arch"], case["mode"]): case for case in workload["cases"]}
+            for arch in payload["architectures"]:
+                planner = by_key[(arch, "planner")]
+                legacy_grouped = by_key[(arch, "planner_grouped_load_legacy")]
+
+                def register_count(case: dict[str, Any]) -> str:
+                    values = sorted(
+                        {int(item["n_regs"]) for item in case["resources"].values()}
+                    )
+                    return "/".join(map(str, values)) if values else "n/a"
+
+                lines.append(
+                    f"| `{workload['name']}` | `{arch}` | "
+                    f"{legacy_grouped['packed_type_occurrences']}→"
+                    f"{planner['packed_type_occurrences']} | "
+                    f"{legacy_grouped['instruction_count']}→"
+                    f"{planner['instruction_count']} | "
+                    f"{register_count(legacy_grouped)}→{register_count(planner)} |"
                 )
         lines.append("")
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
