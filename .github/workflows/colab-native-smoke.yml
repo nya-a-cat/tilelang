@@ -1281,8 +1281,9 @@ jobs:
         shell: bash
         env:
           TILELANG_SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
-          TILELANG_REAL_VECTOR_ARCHES: sm_75,sm_80,sm_90a,sm_100a,sm_120a
-          TILELANG_REAL_VECTOR_MODES: planner,legacy,planner_inplace
+          TILELANG_REAL_VECTOR_ARCHES: sm_90a,sm_100a,sm_120a
+          TILELANG_REAL_VECTOR_WORKLOADS: dequant_gemm_w4a8_4096
+          TILELANG_REAL_VECTOR_MODES: planner,legacy,planner_ru0,planner_ru1,planner_ru2,planner_ru3,planner_ru4,planner_ru5,planner_ru6,planner_ru7,planner_ru8,planner_ru9,planner_ru10
           TILELANG_REAL_VECTOR_COMPILE_WORKERS: "4"
           TILELANG_REAL_VECTOR_RESULT: native-overlay-evidence/real-vectorization-workloads.json
           TILELANG_REAL_VECTOR_REPORT: native-overlay-evidence/real-vectorization-workloads.md

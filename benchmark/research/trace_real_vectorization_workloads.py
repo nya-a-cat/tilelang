@@ -38,6 +38,7 @@ from tilelang.cuda.backend import tilelang_callback_cuda_compile
 REPOSITORY = "nya-a-cat/tilelang"
 CONFIG_KEY = "tl.vectorize_local_parallel"
 INPLACE_CONFIG_KEY = "tl.storage_rewrite_detect_inplace"
+REGISTER_USAGE_CONFIG_KEY = "tl.ptxas_register_usage_level"
 MODES = tuple(
     mode.strip()
     for mode in os.environ.get(
@@ -46,7 +47,13 @@ MODES = tuple(
     ).split(",")
     if mode.strip()
 )
-VALID_MODES = {"planner", "legacy", "planner_inplace"}
+WORKLOAD_NAMES = tuple(
+    name.strip()
+    for name in os.environ.get("TILELANG_REAL_VECTOR_WORKLOADS", "").split(",")
+    if name.strip()
+)
+BASE_MODES = {"planner", "legacy", "planner_inplace"}
+REGISTER_USAGE_MODE_RE = re.compile(r"planner_ru(?P<level>\d+)$")
 DEFAULT_ARCHES = "sm_75,sm_80,sm_90a,sm_100a,sm_120a"
 RESULT_PATH = Path(
     os.environ.get(
@@ -89,14 +96,29 @@ PACKED_TYPE_RE = re.compile(
 
 if not ARCHES or len(set(ARCHES)) != len(ARCHES):
     raise ValueError("TILELANG_REAL_VECTOR_ARCHES must contain distinct architectures")
+if len(set(WORKLOAD_NAMES)) != len(WORKLOAD_NAMES):
+    raise ValueError("TILELANG_REAL_VECTOR_WORKLOADS must contain distinct workload names")
+invalid_modes = [
+    mode
+    for mode in MODES
+    if mode not in BASE_MODES and REGISTER_USAGE_MODE_RE.fullmatch(mode) is None
+]
+invalid_register_levels = [
+    mode
+    for mode in MODES
+    if (match := REGISTER_USAGE_MODE_RE.fullmatch(mode)) is not None
+    and not 0 <= int(match.group("level")) <= 10
+]
 if (
     not MODES
     or len(set(MODES)) != len(MODES)
-    or not set(MODES) <= VALID_MODES
     or not {"planner", "legacy"} <= set(MODES)
+    or invalid_modes
+    or invalid_register_levels
 ):
     raise ValueError(
-        "TILELANG_REAL_VECTOR_MODES must contain planner and legacy, with optional planner_inplace"
+        "TILELANG_REAL_VECTOR_MODES must contain planner and legacy; optional modes are "
+        "planner_inplace and planner_ru0 through planner_ru10"
     )
 if MAX_WORKERS < 1:
     raise ValueError("TILELANG_REAL_VECTOR_COMPILE_WORKERS must be positive")
@@ -226,6 +248,11 @@ def packed_types(source: str) -> dict[str, int]:
     return dict(sorted(Counter(PACKED_TYPE_RE.findall(source)).items()))
 
 
+def register_usage_level(mode: str) -> int | None:
+    match = REGISTER_USAGE_MODE_RE.fullmatch(mode)
+    return int(match.group("level")) if match is not None else None
+
+
 def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     workload_records: list[dict[str, Any]] = []
     compile_inputs: list[dict[str, Any]] = []
@@ -250,6 +277,9 @@ def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                 pass_configs = dict(workload["pass_configs"])
                 pass_configs[CONFIG_KEY] = mode != "legacy"
                 pass_configs[INPLACE_CONFIG_KEY] = mode == "planner_inplace"
+                usage_level = register_usage_level(mode)
+                if usage_level is not None:
+                    pass_configs[REGISTER_USAGE_CONFIG_KEY] = usage_level
                 started = time.perf_counter()
                 with tvm.transform.PassContext(opt_level=3, config=pass_configs), target:
                     artifact = tl.lower(
@@ -394,6 +424,10 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
     inplace_sass_changed = 0
     inplace_instruction_reduced = 0
     inplace_register_reduced = 0
+    usage_modes = [mode for mode in MODES if register_usage_level(mode) is not None]
+    usage_register_reduced = 0
+    usage_spill_free = 0
+    usage_instruction_reduced = 0
     for workload in workload_records:
         by_key = {(case["arch"], case["mode"]): case for case in workload["cases"]}
         workload["comparisons"] = []
@@ -459,6 +493,44 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
                     inplace["instruction_count"] < planner["instruction_count"]
                 )
                 inplace_register_reduced += int(inplace_regs < planner_regs)
+        if usage_modes:
+            workload["register_usage_comparisons"] = []
+            for arch in ARCHES:
+                planner = by_key[(arch, "planner")]
+                planner_resources = list(planner["resources"].values())
+                planner_regs = max(
+                    (int(item["n_regs"]) for item in planner_resources),
+                    default=0,
+                )
+                for mode in usage_modes:
+                    candidate = by_key[(arch, mode)]
+                    resources = list(candidate["resources"].values())
+                    candidate_regs = max(
+                        (int(item["n_regs"]) for item in resources),
+                        default=0,
+                    )
+                    spill_stores = sum(int(item["spill_store_bytes"]) for item in resources)
+                    spill_loads = sum(int(item["spill_load_bytes"]) for item in resources)
+                    comparison = {
+                        "arch": arch,
+                        "mode": mode,
+                        "register_usage_level": register_usage_level(mode),
+                        "source_changed": candidate["source_sha256"] != planner["source_sha256"],
+                        "candidate_minus_planner": {
+                            "cubin_bytes": candidate["cubin_bytes"] - planner["cubin_bytes"],
+                            "instruction_count": candidate["instruction_count"]
+                            - planner["instruction_count"],
+                            "max_registers": candidate_regs - planner_regs,
+                            "spill_store_bytes": spill_stores,
+                            "spill_load_bytes": spill_loads,
+                        },
+                    }
+                    workload["register_usage_comparisons"].append(comparison)
+                    usage_register_reduced += int(candidate_regs < planner_regs)
+                    usage_spill_free += int(spill_stores == 0 and spill_loads == 0)
+                    usage_instruction_reduced += int(
+                        candidate["instruction_count"] < planner["instruction_count"]
+                    )
     if source_changed == 0 or sass_changed == 0 or planner_packed_gain == 0:
         raise RuntimeError(
             "planner/legacy trace produced no material source, SASS, or packed-type difference"
@@ -475,6 +547,10 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
         "inplace_sass_changed": inplace_sass_changed,
         "inplace_instruction_reduced": inplace_instruction_reduced,
         "inplace_register_reduced": inplace_register_reduced,
+        "register_usage_comparisons": len(ARCHES) * len(workload_records) * len(usage_modes),
+        "register_usage_register_reduced": usage_register_reduced,
+        "register_usage_spill_free": usage_spill_free,
+        "register_usage_instruction_reduced": usage_instruction_reduced,
     }
 
 
@@ -545,6 +621,39 @@ def write_report(payload: dict[str, Any]) -> None:
                     f"{planner['sass_sha256'] != inplace['sass_sha256']} |"
                 )
         lines.append("")
+    usage_modes = [mode for mode in payload["modes"] if register_usage_level(mode) is not None]
+    if usage_modes:
+        lines.extend(
+            [
+                "## PTXAS register-usage scan",
+                "",
+                "| Workload | Arch | level | instructions planner→candidate | registers planner→candidate | spill stores/loads (bytes) |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for workload in payload["workloads"]:
+            by_key = {(case["arch"], case["mode"]): case for case in workload["cases"]}
+            for arch in payload["architectures"]:
+                planner = by_key[(arch, "planner")]
+                planner_regs = max(
+                    (int(item["n_regs"]) for item in planner["resources"].values()),
+                    default=0,
+                )
+                for mode in usage_modes:
+                    candidate = by_key[(arch, mode)]
+                    resources = list(candidate["resources"].values())
+                    candidate_regs = max(
+                        (int(item["n_regs"]) for item in resources),
+                        default=0,
+                    )
+                    spill_stores = sum(int(item["spill_store_bytes"]) for item in resources)
+                    spill_loads = sum(int(item["spill_load_bytes"]) for item in resources)
+                    lines.append(
+                        f"| `{workload['name']}` | `{arch}` | {register_usage_level(mode)} | "
+                        f"{planner['instruction_count']}→{candidate['instruction_count']} | "
+                        f"{planner_regs}→{candidate_regs} | {spill_stores}/{spill_loads} |"
+                    )
+        lines.append("")
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
     REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
 
@@ -562,6 +671,12 @@ def main() -> int:
     repo_root = Path.cwd().resolve()
     RAW_DIR.mkdir(parents=True, exist_ok=False)
     workloads = build_workloads(repo_root)
+    if WORKLOAD_NAMES:
+        by_name = {workload["name"]: workload for workload in workloads}
+        missing = [name for name in WORKLOAD_NAMES if name not in by_name]
+        if missing:
+            raise ValueError(f"unknown TILELANG_REAL_VECTOR_WORKLOADS: {', '.join(missing)}")
+        workloads = [by_name[name] for name in WORKLOAD_NAMES]
     workload_records, compile_inputs = lower_sources(workloads)
     compile_all(compile_inputs)
     aggregate = enrich_comparisons(workload_records)
@@ -572,6 +687,7 @@ def main() -> int:
         "python": platform.python_version(),
         "architectures": list(ARCHES),
         "modes": list(MODES),
+        "selected_workloads": [workload["name"] for workload in workloads],
         "config_key": CONFIG_KEY,
         "device_compile": True,
         "gpu_execution": False,
