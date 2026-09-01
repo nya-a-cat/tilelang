@@ -1282,7 +1282,7 @@ jobs:
         env:
           TILELANG_SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
           TILELANG_REAL_VECTOR_ARCHES: sm_75,sm_80,sm_90a,sm_100a,sm_120a
-          TILELANG_REAL_VECTOR_MODES: planner,legacy,planner_reinterpret_legacy
+          TILELANG_REAL_VECTOR_MODES: planner,legacy,planner_reinterpret_legacy,planner_int4x2_unpack_legacy
           TILELANG_REAL_VECTOR_COMPILE_WORKERS: "4"
           TILELANG_REAL_VECTOR_RESULT: native-overlay-evidence/real-vectorization-workloads.json
           TILELANG_REAL_VECTOR_REPORT: native-overlay-evidence/real-vectorization-workloads.md

@@ -149,6 +149,15 @@ class PassConfigKey(str, Enum):
     structural legality checks pass. Forced modes support JIT-time backend A/B
     measurements from one TileLang build. Default: "auto"."""
 
+    TL_DISABLE_INT4X2_UNPACK_PEEPHOLE = "tl.disable_int4x2_unpack_peephole"
+    """Disable CUDA's canonical signed-int4x2 unpack peephole.
+
+    On SM100+, the default codegen recognizes the vectorized two-lane form
+    produced by ``(uint8 >> [0, 4]) & 0xf`` followed by signed nibble extension
+    and emits one packed-byte helper. Set this to True for same-build
+    machine-code A/B. Default: False.
+    """
+
     TL_DISABLE_TMA_LOWER = "tl.disable_tma_lower"
     """Deprecated flag — prevents plain T.copy() from auto-lowering to TMA store.
 

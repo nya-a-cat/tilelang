@@ -49,6 +49,11 @@ static constexpr const char *kEnableLowerLDGSTGPredicated =
 // backend A/B measurements; "auto" applies the target profitability policy.
 static constexpr const char *kCudaAllReduceStrategy =
     "tl.cuda_allreduce_strategy";
+// Disable the SM100+ CUDA codegen peephole that recognizes the canonical
+// signed int4x2 unpack expression and emits one packed-byte helper call.
+// Intended for same-build machine-code A/B validation.
+static constexpr const char *kDisableInt4x2UnpackPeephole =
+    "tl.disable_int4x2_unpack_peephole";
 
 // fast math related op
 // __exp(x) - fast exponential

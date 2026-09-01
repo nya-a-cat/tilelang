@@ -483,6 +483,19 @@ TL_DEVICE uint8_t tl_pack_uint4x2(unsigned int low, unsigned int high) {
   return static_cast<uint8_t>((low & 0xF) | ((high & 0xF) << 4));
 }
 
+// Expand one packed signed-int4 byte into two signed int8 lanes.  XOR maps
+// each unsigned nibble into a biased byte; __vsub4 removes that bias in two
+// independent byte lanes, preserving two's-complement wraparound without a
+// cross-byte borrow.
+TL_DEVICE char2 tl_unpack_int4x2(unsigned char packed) {
+  unsigned int expanded = ((static_cast<unsigned int>(packed) |
+                            (static_cast<unsigned int>(packed) << 4)) &
+                           0x0F0Fu) ^
+                          0x0808u;
+  unsigned int signed_bytes = __vsub4(expanded, 0x0808u);
+  return *reinterpret_cast<char2 *>(&signed_bytes);
+}
+
 TL_DEVICE int tl_int4_packed_load(const signed char *packed, int idx) {
   unsigned char byte = static_cast<unsigned char>(packed[idx >> 1]);
   unsigned int shift = (idx & 1) * 4;

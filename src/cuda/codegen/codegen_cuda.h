@@ -59,6 +59,7 @@ public:
   void VisitExpr_(const MinNode *op, std::ostream &os) final;
   void VisitExpr_(const MaxNode *op, std::ostream &os) final;
   void VisitStmt_(const EvaluateNode *op) final;
+  void VisitStmt_(const BindNode *op) final;
   void VisitStmt_(const AllocBufferNode *op) final;
   void VisitStmt_(const AttrStmtNode *op) final;
   void VisitExpr_(const BufferLoadNode *op, std::ostream &os) final;
@@ -99,6 +100,11 @@ private:
   // __syncthreads(), which would put a call-site declaration out of scope
   // for later rng_rand / rng_rand_float uses.
   std::unordered_map<const CallNode *, std::string> rng_state_name_map_;
+
+  // Flat Bind statements produced by HoistBroadcastValues remain visible to
+  // following statements.  Preserve their TIR values so late CUDA peepholes
+  // can recover constants without relying on generated variable names.
+  std::unordered_map<const VarNode *, PrimExpr> bound_values_;
 
   // whether enable fp16
   bool enable_fp16_{false};

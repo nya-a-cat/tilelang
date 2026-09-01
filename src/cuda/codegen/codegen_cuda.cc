@@ -7,6 +7,7 @@
 #include "support/check.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/cast.h>
+#include <tvm/ir/transform.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/s_tir/stmt.h>
 #include <tvm/tirx/index_map.h>
@@ -50,6 +51,114 @@ bool IsProvablyDivisible(const PrimExpr &expr, int64_t divisor) {
   arith::Analyzer analyzer;
   arith::ModularSet modular_set = analyzer.modular_set(expr);
   return modular_set->coeff % divisor == 0 && modular_set->base % divisor == 0;
+}
+
+PrimExpr ResolveBoundValue(
+    PrimExpr expr,
+    const std::unordered_map<const VarNode *, PrimExpr> &bound_values) {
+  std::unordered_set<const VarNode *> visited;
+  while (const auto *var = expr.as<VarNode>()) {
+    if (!visited.insert(var).second) {
+      break;
+    }
+    auto it = bound_values.find(var);
+    if (it == bound_values.end()) {
+      break;
+    }
+    expr = it->second;
+  }
+  return expr;
+}
+
+bool IsBroadcastInteger(
+    const PrimExpr &expr, int64_t value, int lanes,
+    const std::unordered_map<const VarNode *, PrimExpr> &bound_values) {
+  const auto *broadcast = expr.as<BroadcastNode>();
+  return broadcast != nullptr && broadcast->dtype.lanes() == lanes &&
+         is_const_int(ResolveBoundValue(broadcast->value, bound_values), value);
+}
+
+bool IsInt4x2LaneShift(const PrimExpr &expr) {
+  const auto *ramp = expr.as<RampNode>();
+  return ramp != nullptr && ramp->dtype.is_uint() && ramp->dtype.bits() == 8 &&
+         ramp->dtype.lanes() == 2 && is_const_int(ramp->base, 0) &&
+         is_const_int(ramp->stride, 4);
+}
+
+std::optional<PrimExpr> MatchSignedInt4x2Unpack(
+    PrimExpr lhs, PrimExpr rhs,
+    const std::unordered_map<const VarNode *, PrimExpr> &bound_values) {
+  const DataType i8x2 = DataType::Int(8, 2);
+  const DataType u8x2 = DataType::UInt(8, 2);
+  if (lhs.dtype() != i8x2 || rhs.dtype() != i8x2 ||
+      !IsBroadcastInteger(rhs, 4, 2, bound_values)) {
+    return std::nullopt;
+  }
+
+  const auto *reinterpret_call = lhs.as<CallNode>();
+  if (reinterpret_call == nullptr ||
+      !reinterpret_call->op.same_as(builtin::reinterpret()) ||
+      reinterpret_call->args.size() != 1 ||
+      reinterpret_call->args[0].dtype() != u8x2) {
+    return std::nullopt;
+  }
+  const auto *shift_left = reinterpret_call->args[0].as<CallNode>();
+  if (shift_left == nullptr || !shift_left->op.same_as(builtin::shift_left()) ||
+      shift_left->args.size() != 2 ||
+      !IsBroadcastInteger(shift_left->args[1], 4, 2, bound_values)) {
+    return std::nullopt;
+  }
+  const auto *mask = shift_left->args[0].as<CallNode>();
+  if (mask == nullptr || !mask->op.same_as(builtin::bitwise_and()) ||
+      mask->args.size() != 2 ||
+      !IsBroadcastInteger(mask->args[1], 15, 2, bound_values)) {
+    return std::nullopt;
+  }
+  const auto *shift_right = mask->args[0].as<CallNode>();
+  if (shift_right == nullptr ||
+      !shift_right->op.same_as(builtin::shift_right()) ||
+      shift_right->args.size() != 2 ||
+      !IsInt4x2LaneShift(shift_right->args[1])) {
+    return std::nullopt;
+  }
+
+  PrimExpr packed_vector = shift_right->args[0];
+  if (const auto *broadcast = packed_vector.as<BroadcastNode>()) {
+    if (broadcast->dtype == u8x2 &&
+        broadcast->value.dtype() == DataType::UInt(8)) {
+      return broadcast->value;
+    }
+    return std::nullopt;
+  }
+  const auto *load = packed_vector.as<BufferLoadNode>();
+  if (load == nullptr || load->dtype != u8x2 ||
+      load->buffer->dtype != DataType::UInt(8) || load->indices.size() != 1) {
+    return std::nullopt;
+  }
+  PrimExpr vector_index = load->indices[0];
+  if (vector_index.dtype().lanes() != 2) {
+    return std::nullopt;
+  }
+  PrimExpr first_index = Shuffle::ExtractElement(vector_index, 0);
+  PrimExpr second_index = Shuffle::ExtractElement(vector_index, 1);
+  arith::Analyzer analyzer;
+  if (!analyzer.CanProveEqual(first_index, second_index)) {
+    return std::nullopt;
+  }
+  return BufferLoad(load->buffer, {analyzer.Simplify(first_index)},
+                    load->predicate, load->span);
+}
+
+bool Int4x2UnpackPeepholeEnabled() {
+  Target target = Target::Current(/*allow_not_defined=*/true);
+  if (!target.defined() || !tl::TargetHasSMVersionGE(target, 100)) {
+    return false;
+  }
+  auto pass_ctx = tvm::transform::PassContext::Current();
+  return !pass_ctx
+              ->GetConfig<Bool>(tl::kDisableInt4x2UnpackPeephole, Bool(false))
+              .value()
+              ->value;
 }
 
 std::optional<DataType> GetAccessPtrElementType(const PrimExpr &expr) {
@@ -1136,6 +1245,15 @@ void CodeGenTileLangCUDA::PrintVecConstructor(DataType t,
 void CodeGenTileLangCUDA::PrintVecBinaryOp(const std::string &op, DataType t,
                                            PrimExpr lhs, PrimExpr rhs,
                                            std::ostream &os) { // NOLINT(*)
+  if (op.find(">>") != std::string::npos && t == DataType::Int(8, 2) &&
+      Int4x2UnpackPeepholeEnabled()) {
+    if (std::optional<PrimExpr> packed =
+            MatchSignedInt4x2Unpack(lhs, rhs, bound_values_)) {
+      os << "tl_unpack_int4x2(" << PrintExpr(packed.value()) << ")";
+      return;
+    }
+  }
+
   // Fast-path for packed x2 arithmetic (float32x2, bfloat16x2, float16x2).
   //
   // For float32x2: PTX `.f32x2` instructions are available on SM100+.
@@ -5243,6 +5361,11 @@ void CodeGenTileLangCUDA::VisitStmt_(const EvaluateNode *op) {
   }
 }
 
+void CodeGenTileLangCUDA::VisitStmt_(const BindNode *op) {
+  bound_values_[op->var.get()] = op->value;
+  CodeGenC::VisitStmt_(op);
+}
+
 void CodeGenTileLangCUDA::VisitExpr_(const RampNode *op, std::ostream &os) {
   int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
   // TODO(chaofan): Comment the ramp lanes limit for now since we have
@@ -6277,6 +6400,7 @@ void CodeGenTileLangCUDA::AddFunction(const GlobalVar &gvar,
   CodeGenC::DeclareFunction(gvar, f);
   // clear previous generated state.
   this->InitFuncState(f);
+  bound_values_.clear();
   // reserve keywords
   ReserveKeywordsAsUnique_();
 
