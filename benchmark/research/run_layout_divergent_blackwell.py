@@ -171,9 +171,12 @@ def install_exact_runtime(initial_torch: dict[str, object]) -> dict[str, object]
     if installed_torch["version"] != initial_torch["version"]:
         raise RuntimeError(f"TileLang install changed PyTorch: before={initial_torch}, after={installed_torch}")
 
+    overlay_env = dict(os.environ)
+    overlay_env["PYTHON"] = sys.executable
     overlay_apply = run(
         ["bash", str(WORK_ROOT / "apply_colab_python_overlay.sh"), str(WORK_ROOT / "tilelang-python-overlay.tar.gz")],
         timeout=120,
+        env=overlay_env,
     )
     identity_code = (
         "import json,pathlib,tilelang; "
