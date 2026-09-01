@@ -1,8 +1,9 @@
 """Install an exact native overlay and run the regularized-policy A/B on Colab T4.
 
 The Colab CLI transmits this controller as one cell. Upload the four files in
-``SCRIPT_SHA256`` to ``WORK_DIR`` before execution. Every executable or Python
-input downloaded or uploaded for the run is hash checked before use.
+``SCRIPT_SHA256`` either to ``WORK_DIR`` or to ``SCRIPT_UPLOAD_DIR`` before
+execution. Every executable or Python input downloaded or uploaded for the run
+is hash checked before use.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ SCRIPT_SHA256 = {
 }
 POLICIES = ("register-count", "io-aware-regularized")
 WORK_DIR = Path("/tmp/tilelang-layout-regularized")
+SCRIPT_UPLOAD_DIR = Path(os.environ.get("TILELANG_SCRIPT_UPLOAD_DIR", "/tmp"))
 OUTPUT_DIR = Path("/tmp/tilelang-layout-regularized-evidence")
 BENCHMARK_RESULT = WORK_DIR / "benchmark-result.json"
 RESULT_PATH = OUTPUT_DIR / "layout-regularized-t4.json"
@@ -134,17 +136,29 @@ def geometric_mean(values: list[float]) -> float:
 
 
 def verify_uploaded_scripts() -> dict[str, dict[str, Any]]:
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
     verified: dict[str, dict[str, Any]] = {}
     for name, expected_sha256 in SCRIPT_SHA256.items():
-        path = WORK_DIR / name
-        if not path.is_file():
-            raise RuntimeError(f"missing uploaded benchmark input: {path}")
-        actual_sha256 = sha256_file(path)
+        destination = WORK_DIR / name
+        source = next(
+            (path for path in (destination, SCRIPT_UPLOAD_DIR / name) if path.is_file()),
+            None,
+        )
+        if source is None:
+            raise RuntimeError(f"missing uploaded benchmark input: checked {destination} and {SCRIPT_UPLOAD_DIR / name}")
+        actual_sha256 = sha256_file(source)
         if actual_sha256 != expected_sha256:
             raise RuntimeError(f"uploaded script hash mismatch for {name}: expected {expected_sha256}, got {actual_sha256}")
+        if source != destination:
+            shutil.copyfile(source, destination)
+        staged_sha256 = sha256_file(destination)
+        if staged_sha256 != expected_sha256:
+            raise RuntimeError(f"staged script hash mismatch for {name}: expected {expected_sha256}, got {staged_sha256}")
         verified[name] = {
-            "sha256": actual_sha256,
-            "bytes": path.stat().st_size,
+            "source": str(source),
+            "path": str(destination),
+            "sha256": staged_sha256,
+            "bytes": destination.stat().st_size,
         }
     return verified
 
