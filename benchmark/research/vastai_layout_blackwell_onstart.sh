@@ -3,8 +3,8 @@ set -euo pipefail
 
 EVIDENCE_ROOT=/workspace/evidence
 RUNNER_PATH=/workspace/run_layout_divergent_blackwell.py
-RUNNER_SOURCE_SHA=1869b29976f0a3d3561dfa2807307e3b5ba59211
-RUNNER_SHA256=125e95735eb105b8a695de7b192c342e4c84db4f2c82d61e0d5fbc28f9684055
+RUNNER_SOURCE_SHA=db283cc125326c3414f3b2b845e5e7d350e062ac
+RUNNER_SHA256=7919485eb6397841e9869b943f192d475b6be46d614601d051242146411e9ac0
 RUNNER_URL="https://raw.githubusercontent.com/nya-a-cat/tilelang/${RUNNER_SOURCE_SHA}/benchmark/research/run_layout_divergent_blackwell.py"
 CONTAINER_IMAGE="vastai/pytorch@sha256:6ee5f68a3c11bd89e9364771bf6b929d5f266c4382fb3628d751b5e89241d462"
 STARTED_UNIX="$(date +%s)"
@@ -46,6 +46,22 @@ temporary = root / "vast-lifecycle.json.tmp"
 temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 temporary.replace(root / "vast-lifecycle.json")
 (root / "VAST_RUN_DONE").write_text(payload["status"] + "\n", encoding="utf-8")
+PY
+  /venv/main/bin/python - <<'PY' || true
+import hashlib
+from pathlib import Path
+
+root = Path("/workspace/evidence")
+excluded = {"FINAL_SHA256SUMS", "vast-onstart.log"}
+entries = []
+for path in sorted(root.iterdir(), key=lambda item: item.name):
+    if not path.is_file() or path.name in excluded or path.name.endswith(".tmp"):
+        continue
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    entries.append(f"{digest}  {path.name}")
+temporary = root / "FINAL_SHA256SUMS.tmp"
+temporary.write_text("\n".join(entries) + "\n", encoding="utf-8")
+temporary.replace(root / "FINAL_SHA256SUMS")
 PY
   echo "TILELANG_VAST_RUN_DONE status=${status} exit_code=${exit_code}"
   sync || true

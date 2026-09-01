@@ -21,8 +21,8 @@ $ExpectedComputeCapability = 1200
 $DiskGb = 20
 $Image = "vastai/pytorch@sha256:6ee5f68a3c11bd89e9364771bf6b929d5f266c4382fb3628d751b5e89241d462"
 $ImageDigest = "sha256:6ee5f68a3c11bd89e9364771bf6b929d5f266c4382fb3628d751b5e89241d462"
-$RunnerSourceSha = "1869b29976f0a3d3561dfa2807307e3b5ba59211"
-$RunnerSha256 = "125e95735eb105b8a695de7b192c342e4c84db4f2c82d61e0d5fbc28f9684055"
+$RunnerSourceSha = "db283cc125326c3414f3b2b845e5e7d350e062ac"
+$RunnerSha256 = "7919485eb6397841e9869b943f192d475b6be46d614601d051242146411e9ac0"
 $RunnerUrl = "https://raw.githubusercontent.com/nya-a-cat/tilelang/$RunnerSourceSha/benchmark/research/run_layout_divergent_blackwell.py"
 $ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepositoryRoot = Split-Path -Parent (Split-Path -Parent $ScriptDirectory)
@@ -187,7 +187,10 @@ function Copy-RemoteEvidence {
 
 function Test-RemoteManifest {
     param([Parameter(Mandatory = $true)][string]$Directory)
-    $manifestPath = Join-Path $Directory "SHA256SUMS"
+    $manifestPath = Join-Path $Directory "FINAL_SHA256SUMS"
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        $manifestPath = Join-Path $Directory "SHA256SUMS"
+    }
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
         throw "Remote evidence is missing SHA256SUMS"
     }
@@ -312,7 +315,11 @@ try {
     $InstanceId = [long]$newContract
     $InstanceCreatedAt = $CreateAttemptAt
     Write-Host "Created Vast instance $InstanceId"
-    Invoke-VastJson -VastArguments @("attach", "ssh", [string]$InstanceId, $SshPublicKey, "--raw") | Out-Null
+    $attachResponse = Invoke-VastText -VastArguments @("attach", "ssh", [string]$InstanceId, $SshPublicKey, "--raw")
+    $attachConfirmed = $attachResponse -match "'success': True" -or $attachResponse -match '"success"\s*:\s*true'
+    if (-not $attachConfirmed) {
+        throw "Vast did not confirm SSH key attachment"
+    }
     Write-Host "Attached the pinned experiment SSH public key"
 
     $deadline = $InstanceCreatedAt.AddMinutes($MaximumRuntimeMinutes)
