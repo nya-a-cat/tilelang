@@ -29,7 +29,10 @@ import tilelang.language as T
 from tilelang.contrib.kernel_resource_info import to_dict as resource_usage_to_dict
 
 
-POLICIES = ("register-count", "io-aware")
+POLICIES = tuple(policy.strip() for policy in os.environ.get("TILELANG_LAYOUT_AB_POLICIES", "register-count,io-aware").split(","))
+if len(POLICIES) != 2 or any(not policy for policy in POLICIES):
+    raise ValueError("TILELANG_LAYOUT_AB_POLICIES must contain exactly two comma-separated policies")
+BASELINE_POLICY, CANDIDATE_POLICY = POLICIES
 CYCLES = int(os.environ.get("TILELANG_LAYOUT_AB_CYCLES", "30"))
 MIN_BATCH_MS = float(os.environ.get("TILELANG_LAYOUT_AB_MIN_BATCH_MS", "50"))
 MAX_BATCH_ITERS = int(os.environ.get("TILELANG_LAYOUT_AB_MAX_BATCH_ITERS", "65536"))
@@ -63,6 +66,7 @@ class CompiledVariant:
     source_sha256: str
     generated_source: str
     resource_usage: dict[str, Any]
+    layout_selection: dict[str, Any] | None
 
 
 def sha256_text(value: str) -> str:
@@ -367,6 +371,7 @@ def compile_variant(case: BenchmarkCase, policy: str) -> CompiledVariant:
         source_sha256=sha256_text(source),
         generated_source=source,
         resource_usage=resource_usage_to_dict(kernel.resource_usage),
+        layout_selection=getattr(kernel, "layout_selection", None),
     )
 
 
@@ -415,19 +420,21 @@ def paired_benchmark(calls: dict[str, Any]) -> dict[str, Any]:
                 "cycle": cycle,
                 "order": order,
                 "p50_us": cycle_p50,
-                "io_aware_speedup_over_register_count": cycle_p50["register-count"] / cycle_p50["io-aware"],
+                "candidate_speedup_over_baseline": cycle_p50[BASELINE_POLICY] / cycle_p50[CANDIDATE_POLICY],
             }
         )
     summaries = {policy: summary(samples[policy]) for policy in POLICIES}
-    paired_speedups = [record["io_aware_speedup_over_register_count"] for record in cycle_records]
+    paired_speedups = [record["candidate_speedup_over_baseline"] for record in cycle_records]
     return {
+        "baseline_policy": BASELINE_POLICY,
+        "candidate_policy": CANDIDATE_POLICY,
         "iterations_per_sample": iterations,
         "cycles": CYCLES,
         "samples_us": samples,
         "cycle_records": cycle_records,
         "summary": summaries,
         "paired_speedup_summary": ratio_summary(paired_speedups),
-        "io_aware_speedup_over_register_count": statistics.median(paired_speedups),
+        "candidate_speedup_over_baseline": statistics.median(paired_speedups),
     }
 
 
@@ -451,6 +458,7 @@ def benchmark_case(case: BenchmarkCase) -> dict[str, Any]:
                 "generated_source_sha256": variant.source_sha256,
                 "generated_source": variant.generated_source,
                 "resource_usage": variant.resource_usage,
+                "layout_selection": variant.layout_selection,
                 "cuda_graph_captured": variant.graph_call is not None,
                 "cuda_graph_capture_error": variant.graph_capture_error,
             }
@@ -481,7 +489,7 @@ def main() -> None:
         "started_unix": started,
         "policies": list(POLICIES),
         "evidence_boundary": (
-            "One free Colab T4 compares unchanged PrimFuncs under two existing "
+            "One free Colab T4 compares unchanged PrimFuncs under two selected "
             "TileLang backend layout policies. It screens runtime, correctness, "
             "generated code, and compiler resources. Cross-architecture selection "
             "and the global 1.50x goal remain outside this evidence."
@@ -512,9 +520,11 @@ def main() -> None:
         payload["aggregate"] = {
             "complete_cases": len(complete),
             "total_cases": len(cases),
-            "eager_io_aware_speedup_geomean": geometric_mean([case["eager"]["io_aware_speedup_over_register_count"] for case in complete]),
-            "cuda_graph_io_aware_speedup_geomean": geometric_mean(
-                [case["cuda_graph"]["io_aware_speedup_over_register_count"] for case in complete if "cuda_graph" in case]
+            "baseline_policy": BASELINE_POLICY,
+            "candidate_policy": CANDIDATE_POLICY,
+            "eager_candidate_speedup_geomean": geometric_mean([case["eager"]["candidate_speedup_over_baseline"] for case in complete]),
+            "cuda_graph_candidate_speedup_geomean": geometric_mean(
+                [case["cuda_graph"]["candidate_speedup_over_baseline"] for case in complete if "cuda_graph" in case]
             ),
         }
         payload["status"] = "complete" if len(complete) == len(cases) else "partial"
