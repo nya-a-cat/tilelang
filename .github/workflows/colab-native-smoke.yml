@@ -1038,6 +1038,27 @@ jobs:
               > SHA256SUMS
           )
 
+      - name: Trace layout cost features without a GPU
+        id: layout-cost-trace
+        shell: bash
+        env:
+          TILELANG_SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          TILELANG_LAYOUT_TRACE_ARCHES: sm_75,sm_80,sm_90a,sm_100a,sm_120a
+          TILELANG_LAYOUT_TRACE_RESULT: native-overlay-evidence/layout-cost-trace.json
+          TILELANG_LAYOUT_TRACE_LOG: native-overlay-evidence/layout-cost-trace.log
+        run: |
+          set -euo pipefail
+          native-overlay-selftest/bin/python \
+            benchmark/research/trace_layout_cost_features.py
+          (
+            cd native-overlay-evidence
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | LC_ALL=C sort -z \
+              | xargs -0 -r sha256sum \
+              > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
       - name: Save direct native compiler cache
         if: always() && steps.manylinux-native-cache.outputs.cache-hit != 'true' && steps.native-build.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1046,7 +1067,7 @@ jobs:
           key: colab-native-direct-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-${{ steps.source.outputs.native_fingerprint }}
 
       - name: Upload native compile evidence
-        if: steps.overlay-selftest.outcome == 'success'
+        if: always() && steps.overlay-selftest.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: tilelang-native-overlay-${{ steps.source.outputs.commit }}-on-${{ steps.refs.outputs.base_sha }}
