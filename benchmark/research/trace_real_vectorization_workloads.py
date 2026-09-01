@@ -341,6 +341,12 @@ def compile_case(item: dict[str, Any], nvdisasm: str) -> dict[str, Any]:
 def compile_all(compile_inputs: list[dict[str, Any]]) -> None:
     nvdisasm = shutil.which("nvdisasm")
     if nvdisasm is None:
+        cuda_home = os.environ.get("CUDA_HOME")
+        if cuda_home:
+            candidate = Path(cuda_home) / "bin/nvdisasm"
+            if candidate.is_file():
+                nvdisasm = str(candidate)
+    if nvdisasm is None:
         raise RuntimeError("nvdisasm is required for the real-workload trace")
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_item = {
