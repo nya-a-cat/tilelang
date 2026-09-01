@@ -27,13 +27,16 @@ jobs:
     timeout-minutes: 30
     env:
       CUDA_VERSION: "13.0"
+      PYTHON_VERSION: "3.13"
+      MANYLINUX_PYTHON_TAG: cp313-cp313
+      TVM_SDK_CAPTURE_PYTHON_TAG: cp310
       MANYLINUX_IMAGE_DIGEST: 012f4a50472412f18bb2b450c1cce7158434cfae4ae878591c2748a13a30c2be
       CMAKE_WHEEL_VERSION: "4.4.2"
       CMAKE_WHEEL_SHA256: 27b024e903ef985b37183d754a5c61230b56b41fe0971cd44b71b80c787ec594
       CMAKE_WHEEL_URL: https://files.pythonhosted.org/packages/5d/b7/b8d0b15f57b37ac5b9e374169471f045da3a715b7f0f3af681011415d972/cmake-4.4.2-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
-      TORCH_CPU_WHEEL_NAME: torch-2.11.0+cpu-cp310-cp310-manylinux_2_28_x86_64.whl
-      TORCH_CPU_WHEEL_SHA256: f378df648bf7fb94bbc820dfec37d3d346bd1703c692a2215edebf6edcef8b75
-      TORCH_CPU_WHEEL_URL: https://download-r2.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp310-cp310-manylinux_2_28_x86_64.whl
+      TORCH_CPU_WHEEL_NAME: torch-2.11.0+cpu-cp313-cp313-manylinux_2_28_x86_64.whl
+      TORCH_CPU_WHEEL_SHA256: 45025d7752dbc6b4c784c03afaee9c5f19730ce084b2e43fc9a2fe1677d9ff86
+      TORCH_CPU_WHEEL_URL: https://download-r2.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp313-cp313-manylinux_2_28_x86_64.whl
     steps:
       - name: Start pinned manylinux image pull
         shell: bash
@@ -54,6 +57,12 @@ jobs:
           fetch-depth: 1
           submodules: false
           persist-credentials: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          check-latest: false
 
       - name: Restore pinned CPU PyTorch wheel
         id: torch-cpu-wheel-cache
@@ -303,6 +312,7 @@ jobs:
           set -euo pipefail
           commit="$(git rev-parse HEAD)"
           native_fingerprint="$({
+            echo "python_abi=${MANYLINUX_PYTHON_TAG}"
             git ls-tree -r HEAD -- \
               CMakeLists.txt \
               cmake \
@@ -346,7 +356,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/prebuilt-tvm
-          key: colab-wheel-tvm-sdk-v1-${{ runner.os }}-${{ runner.arch }}-cp310-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-${{ steps.source.outputs.tvm_sdk_fingerprint }}
+          key: colab-wheel-tvm-sdk-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.TVM_SDK_CAPTURE_PYTHON_TAG }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-${{ steps.source.outputs.tvm_sdk_fingerprint }}
 
       - name: Restore exact CMake distribution
         id: native-cmake-cache
@@ -539,6 +549,7 @@ jobs:
             --workdir /project \
             --env CMAKE_BUILD_PARALLEL_LEVEL \
             --env CMAKE_GENERATOR=Ninja \
+            --env MANYLINUX_PYTHON_TAG \
             --env CUDAToolkit_ROOT=/project/.cache/ci-toolchain/cuda-13.0 \
             --env CUDA_HOME=/project/.cache/ci-toolchain/cuda-13.0 \
             --env CCACHE_DIR=/project/.cache/ccache \
@@ -557,7 +568,9 @@ jobs:
           set -euo pipefail
           export PATH="/project/.cache/native-cmake/root/cmake/data/bin:/project/.cache/ci-toolchain/bin:/project/.cache/ci-toolchain/cuda-13.0/bin:${PATH}"
           export LD_LIBRARY_PATH="/project/.cache/ci-toolchain/cuda-13.0/lib64:/project/.cache/ci-toolchain/cuda-13.0/lib64/stubs:/project/.cache/prebuilt-tvm:${LD_LIBRARY_PATH:-}"
-          python_bin="/opt/python/cp310-cp310/bin/python"
+          python_bin="/opt/python/${MANYLINUX_PYTHON_TAG}/bin/python"
+          python_version="$("${python_bin}" --version 2>&1)"
+          [[ "${python_version}" == Python\ 3.13.* ]]
           ccache --zero-stats
           cmake -S . -B build/native-smoke -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -572,6 +585,7 @@ jobs:
             --target tilelang cuda_stub cudart_stub nvrtc_stub \
             --parallel "${CMAKE_BUILD_PARALLEL_LEVEL}"
           {
+            "${python_bin}" --version
             cmake --version | head -n 1
             gcc --version | head -n 1
             nvcc --version
@@ -590,6 +604,8 @@ jobs:
             echo "commit=${{ steps.source.outputs.commit }}"
             echo "mode=verified_native_hot_patch"
             echo "runner=ubuntu-22.04"
+            echo "python=${PYTHON_VERSION}"
+            echo "python_abi=${MANYLINUX_PYTHON_TAG}"
             echo "cuda=13.0.88"
             echo "manylinux_image=quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
             echo "tvm_sdk_fingerprint=${{ steps.source.outputs.tvm_sdk_fingerprint }}"
@@ -948,6 +964,8 @@ jobs:
             --arg cmake_version "${CMAKE_WHEEL_VERSION}" \
             --arg cmake_wheel_sha256 "${CMAKE_WHEEL_SHA256}" \
             --arg cuda_version "13.0.88" \
+            --arg python_version "${PYTHON_VERSION}" \
+            --arg python_abi "${MANYLINUX_PYTHON_TAG}" \
             --arg tvm_sdk_fingerprint "${TVM_SDK_FINGERPRINT}" \
             --arg native_fingerprint "${NATIVE_FINGERPRINT}" \
             --argjson base_native_file_count "${base_native_file_count}" \
@@ -983,6 +1001,8 @@ jobs:
                 cmake_version: $cmake_version,
                 cmake_wheel_sha256: $cmake_wheel_sha256,
                 cuda_version: $cuda_version,
+                python_version: $python_version,
+                python_abi: $python_abi,
                 tvm_sdk_fingerprint: $tvm_sdk_fingerprint,
                 native_fingerprint: $native_fingerprint
               },
@@ -1078,7 +1098,7 @@ jobs:
           BASE_WHEEL_NAME: ${{ steps.refs.outputs.base_wheel_name }}
         run: |
           set -euo pipefail
-          python3 -m venv native-overlay-selftest
+          python -m venv native-overlay-selftest
           native-overlay-selftest/bin/python -m pip \
             --disable-pip-version-check \
             install \
@@ -1092,6 +1112,8 @@ jobs:
           import platform
           import torch
 
+          if platform.python_version_tuple()[:2] != ("3", "13"):
+              raise SystemExit(f"Expected Python 3.13, got {platform.python_version()}")
           if torch.__version__ != "2.11.0+cpu" or torch.cuda.is_available():
               raise SystemExit(f"Expected CPU-only torch 2.11.0, got {torch.__version__}, CUDA={torch.cuda.is_available()}")
           print(f"python={platform.python_version()}")
