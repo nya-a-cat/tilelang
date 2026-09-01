@@ -1095,6 +1095,7 @@ jobs:
         shell: bash
         env:
           SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          NATIVE_BASE_SHA: ${{ steps.refs.outputs.base_sha }}
           BASE_WHEEL_NAME: ${{ steps.refs.outputs.base_wheel_name }}
         run: |
           set -euo pipefail
@@ -1108,6 +1109,13 @@ jobs:
             install \
             "base-wheel/${BASE_WHEEL_NAME}"
           native-overlay-selftest/bin/python -m pip check
+          TILELANG_SOURCE_SHA="${NATIVE_BASE_SHA}" \
+          TILELANG_PARALLEL_VECTOR_TRACE_MODES=default \
+          TILELANG_PARALLEL_VECTOR_EXPECT_DEFAULT=legacy \
+          TILELANG_PARALLEL_VECTOR_TRACE_ARCHES=sm_75,sm_80,sm_90a,sm_100a,sm_120a \
+          TILELANG_PARALLEL_VECTOR_TRACE_RESULT=native-overlay-evidence/parallel-vectorization-base-trace.json \
+            native-overlay-selftest/bin/python \
+              benchmark/research/trace_parallel_vectorization.py
           native-overlay-selftest/bin/python - <<'PY' | tee native-overlay-evidence/trace-python-runtime.txt
           import platform
           import torch
@@ -1196,6 +1204,29 @@ jobs:
           set -euo pipefail
           native-overlay-selftest/bin/python \
             benchmark/research/trace_allreduce_strategies.py
+          (
+            cd native-overlay-evidence
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | LC_ALL=C sort -z \
+              | xargs -0 -r sha256sum \
+              > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Trace local T.Parallel vectorization without a GPU
+        id: parallel-vectorization-trace
+        shell: bash
+        env:
+          TILELANG_SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          TILELANG_PARALLEL_VECTOR_TRACE_ARCHES: sm_75,sm_80,sm_90a,sm_100a,sm_120a
+          TILELANG_PARALLEL_VECTOR_TRACE_MODES: default,planner,legacy
+          TILELANG_PARALLEL_VECTOR_EXPECT_DEFAULT: planner
+          TILELANG_PARALLEL_VECTOR_BASE_TRACE: native-overlay-evidence/parallel-vectorization-base-trace.json
+          TILELANG_PARALLEL_VECTOR_TRACE_RESULT: native-overlay-evidence/parallel-vectorization-trace.json
+        run: |
+          set -euo pipefail
+          native-overlay-selftest/bin/python \
+            benchmark/research/trace_parallel_vectorization.py
           (
             cd native-overlay-evidence
             find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \

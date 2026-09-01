@@ -204,6 +204,12 @@ class PassConfigKey(str, Enum):
     the final vectorization factor. Useful for debugging vectorization issues.
     Default: False"""
 
+    TL_VECTORIZE_LOCAL_PARALLEL = "tl.vectorize_local_parallel"
+    """Run the access-aware vectorization planner for ``T.Parallel`` loops
+    containing only local/fragment buffers. The planner may still select width
+    1 for scalar or hazardous accesses. Set to False to restore the legacy gate
+    for same-build differential testing. Default: True."""
+
     TL_DISABLE_WGMMA = "tl.disable_wgmma"
     """Disable usage of Hopper WGMMA. Default: False"""
 

@@ -40,6 +40,14 @@ namespace tl {
 using namespace tirx;
 using namespace ffi;
 
+// Run the access-aware vectorization planner for register-only T.Parallel
+// loops. False restores the legacy gate for same-build differential testing.
+// Keep this option local to the lowering translation unit: changing the policy
+// should not invalidate every backend source that includes op/builtin.h.
+static constexpr const char *kVectorizeLocalParallel =
+    "tl.vectorize_local_parallel";
+TVM_REGISTER_PASS_CONFIG_OPTION(kVectorizeLocalParallel, Bool);
+
 static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout,
                                    Map<Var, Var> &var_remap) {
   const auto *ptr_type =
@@ -1388,14 +1396,16 @@ private:
       }
     });
 
-    // Decide whether to vectorize: only if there are non-local buffers or
-    // vectorizable casts. Reducer combine stores (multiplicity markers were
-    // already lowered by PartitionLoop) need no special exclusion: the
-    // vectorizer's planner keeps stores whose indices do not advance with
-    // the vectorized loop var scalar, which is exactly the reduction-axis
-    // hazard; output-axis contiguous combine stores vectorize like any
-    // other read-modify-write.
-    bool should_vectorize = has_non_local || has_cast_operations;
+    auto pass_ctx = tvm::transform::PassContext::Current();
+    bool vectorize_local_parallel =
+        pass_ctx->GetConfig<Bool>(kVectorizeLocalParallel, Bool(true)).value();
+
+    // Always consult the access-aware planner by default. It selects width 1
+    // for scalar or hazardous access patterns, while register-only elementwise
+    // loops can use packed operations such as fp32x2. False preserves the
+    // historical gate for JIT-time A/B from the same native build.
+    bool should_vectorize =
+        vectorize_local_parallel || has_non_local || has_cast_operations;
     // Lower the parallel loop using the common function
     Stmt lowered = LowerParallelLoop(
         for_node, loop_layout, CurrentThreadIndex(), analyzer_, layout_map_,
@@ -1405,9 +1415,8 @@ private:
     // lowering does not require converting eligible global->shared copies to
     // `tir.ptx_cp_async`.
     if (TargetCudaHasAsyncCopy(target_)) {
-      tvm::transform::PassContext ctx = tvm::transform::PassContext::Current();
       bool auto_async_copy_enabled =
-          ctx->GetConfig<Bool>(kEnableAsyncCopy, Bool(true)).value();
+          pass_ctx->GetConfig<Bool>(kEnableAsyncCopy, Bool(true)).value();
       bool should_inject_async_copy =
           parallel_prefer_async ||
           (auto_async_copy_enabled && parallel_async_without_async_commit_wait);
