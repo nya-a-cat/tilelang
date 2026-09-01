@@ -167,6 +167,13 @@ bool TargetCudaPrefersHierarchicalAllReduce(Target target) {
   return false;
 }
 
+bool CudaWarpAggregateReduxEnabled() {
+  auto pass_ctx = tvm::transform::PassContext::Current();
+  return !pass_ctx->GetConfig<Bool>(kDisableWarpAggregateRedux, Bool(false))
+              .value()
+              ->value;
+}
+
 bool TargetSupportVectorize256(Target target) {
   if (!TargetIsCuda(target))
     return false;

@@ -106,6 +106,9 @@ struct Reduce : backend::ReduceLowerer<Reduce> {
     ss << ", " << batch << ", " << workspace_stride;
     if (hierarchical) {
       ss << ", true";
+      if (!CudaWarpAggregateReduxEnabled()) {
+        ss << ", false";
+      }
     }
     ss << ">::run_batch";
     return ss.str();
@@ -127,6 +130,9 @@ struct Reduce : backend::ReduceLowerer<Reduce> {
     }
     if (hierarchical) {
       ss << ", 1, 0, true";
+      if (!CudaWarpAggregateReduxEnabled()) {
+        ss << ", false";
+      }
     }
     ss << ">::run";
     return ss.str();

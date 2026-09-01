@@ -54,6 +54,10 @@ static constexpr const char *kCudaAllReduceStrategy =
 // Intended for same-build machine-code A/B validation.
 static constexpr const char *kDisableInt4x2UnpackPeephole =
     "tl.disable_int4x2_unpack_peephole";
+// Disable hardware warp reduction for the second level of hierarchical
+// AllReduce. Intended for same-build CUBIN/runtime A/B validation.
+static constexpr const char *kDisableWarpAggregateRedux =
+    "tl.disable_warp_aggregate_redux";
 
 // fast math related op
 // __exp(x) - fast exponential

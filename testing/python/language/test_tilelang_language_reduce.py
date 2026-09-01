@@ -741,11 +741,20 @@ def test_finalize_reducer_target_profitability_and_jit_overrides():
     sm80_auto = lower("sm_80")
     sm75_forced_hierarchical = lower("sm_75", "hierarchical")
     sm80_forced_butterfly = lower("sm_80", "butterfly")
+    sm80_redux_rollback = _lower_cuda_artifact_without_device_compile(
+        kernel,
+        "sm_80",
+        {
+            **baseline_plan,
+            tl.PassConfigKey.TL_DISABLE_WARP_AGGREGATE_REDUX: True,
+        },
+    ).kernel_source
 
     assert ", 4, 256>::run_batch" in sm75_auto
     assert ", 4, 8, true>::run_batch" in sm80_auto
     assert ", 4, 8, true>::run_batch" in sm75_forced_hierarchical
     assert ", 4, 256>::run_batch" in sm80_forced_butterfly
+    assert ", 4, 8, true, false>::run_batch" in sm80_redux_rollback
 
 
 @tilelang.testing.requires_cuda_compute_version_ge(8, 0)
@@ -1138,6 +1147,19 @@ def test_hierarchical_allreduce_target_profitability_and_jit_overrides():
     assert _dynamic_shared_bytes(sm75_forced_hierarchical) == 4 * 4
     assert ", true>::run" not in sm80_forced_butterfly.kernel_source
     assert _dynamic_shared_bytes(sm80_forced_butterfly) == 128 * 4
+
+
+def test_hierarchical_allreduce_warp_aggregate_redux_rollback():
+    kernel = _make_allreduce_width_kernel(T.reduce_max, 1, 128, 128)
+    default_source = _lower_cuda_source_without_device_compile(kernel, "sm_100a")
+    rollback_source = _lower_cuda_source_without_device_compile(
+        kernel,
+        "sm_100a",
+        {tl.PassConfigKey.TL_DISABLE_WARP_AGGREGATE_REDUX: True},
+    )
+
+    assert ", 1, 0, true>::run" in default_source
+    assert ", 1, 0, true, false>::run" in rollback_source
 
 
 def test_hierarchical_allreduce_rejects_unknown_jit_strategy():

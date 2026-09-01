@@ -38,6 +38,11 @@ bool TargetSupportsNamedBarrier(Target target);
  * A/B measurements without rebuilding TileLang.
  */
 bool TargetCudaPrefersHierarchicalAllReduce(Target target);
+/*! \brief Whether hierarchical AllReduce may use hardware warp redux for its
+ * second-level aggregate reduction. The pass config
+ * `tl.disable_warp_aggregate_redux` provides a same-build rollback path.
+ */
+bool CudaWarpAggregateReduxEnabled();
 bool TargetSupportVectorize256(Target target);
 bool TargetHasSMVersionGE(Target target, int version);
 

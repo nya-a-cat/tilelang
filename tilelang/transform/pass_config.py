@@ -158,6 +158,15 @@ class PassConfigKey(str, Enum):
     machine-code A/B. Default: False.
     """
 
+    TL_DISABLE_WARP_AGGREGATE_REDUX = "tl.disable_warp_aggregate_redux"
+    """Disable hardware warp redux in hierarchical CUDA AllReduce.
+
+    The default path uses one hardware warp reduction for the second-level
+    aggregate when the operator and target ISA preserve the reducer semantics.
+    Set this to True for same-build machine-code and runtime A/B. Default:
+    False.
+    """
+
     TL_DISABLE_TMA_LOWER = "tl.disable_tma_lower"
     """Deprecated flag — prevents plain T.copy() from auto-lowering to TMA store.
 

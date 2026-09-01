@@ -241,9 +241,13 @@ template <int all_threads> struct NamedBarrier {
 //                     least two physical warps. The path has one barrier
 //                     after publishing the aggregates; callers must order any
 //                     preceding reuse of the workspace.
+//   warp_aggregate_redux - use a hardware warp reduction for the compact
+//                     second level when the reduction is idempotent and the
+//                     target ISA implements its exact scalar semantics.
 template <class Reducer, int threads, int scale, int thread_offset = 0,
           class Barrier = SyncThreadsBarrier, int batch_size = 1,
-          int workspace_stride = 0, bool hierarchical = false>
+          int workspace_stride = 0, bool hierarchical = false,
+          bool warp_aggregate_redux = true>
 struct AllReduce {
   static_assert(threads > 0, "tl::AllReduce threads must be positive");
   static_assert(scale > 0, "tl::AllReduce scale must be positive");
@@ -294,6 +298,29 @@ private:
                          batch_size, workspace_stride, false>;
 
   template <typename T> static TL_DEVICE T reduce_warp_aggregates(T x) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) &&                       \
+    (defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM100_F))
+    constexpr bool kReduxF32Type = std::is_same_v<T, float> ||
+                                   std::is_same_v<T, half_t> ||
+                                   std::is_same_v<T, bfloat16_t>;
+    constexpr bool kReduxF32Op =
+        std::is_same_v<Reducer, MaxOp> || std::is_same_v<Reducer, MinOp>;
+    if constexpr (warp_aggregate_redux && kReduxF32Type && kReduxF32Op) {
+      // Every lane loads one of the kWarps aggregate values. Duplicating each
+      // value across 32 / kWarps lanes is semantics-preserving for min/max,
+      // and lets every lane participate in one full-mask hardware reduction.
+      return warp_reduce(x, Reducer());
+    }
+#endif
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    constexpr bool kReduxIntType = std::is_integral_v<T> && sizeof(T) <= 4;
+    constexpr bool kReduxIntOp =
+        std::is_same_v<Reducer, MaxOp> || std::is_same_v<Reducer, MinOp> ||
+        std::is_same_v<Reducer, BitAndOp> || std::is_same_v<Reducer, BitOrOp>;
+    if constexpr (warp_aggregate_redux && kReduxIntType && kReduxIntOp) {
+      return warp_reduce(x, Reducer());
+    }
+#endif
     constexpr int kWarps = threads / 32;
 #pragma unroll
     for (int offset = kWarps / 2; offset > 0; offset >>= 1) {

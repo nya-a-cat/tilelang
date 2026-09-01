@@ -1276,6 +1276,31 @@ jobs:
             sha256sum --check SHA256SUMS
           )
 
+      - name: Compile warp-aggregate redux matrix without a GPU
+        id: warp-aggregate-redux
+        shell: bash
+        env:
+          TILELANG_SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          TILELANG_WARP_AGGREGATE_REDUX_ARCHES: sm_75,sm_80,sm_90a,sm_100a,sm_120a
+          TILELANG_WARP_AGGREGATE_REDUX_WORKERS: "4"
+          TILELANG_WARP_AGGREGATE_REDUX_RESULT: native-overlay-evidence/warp-aggregate-redux.json
+          TILELANG_WARP_AGGREGATE_REDUX_REPORT: native-overlay-evidence/warp-aggregate-redux.md
+          TILELANG_WARP_AGGREGATE_REDUX_RAW_DIR: native-overlay-evidence/warp-aggregate-redux-raw
+          TILELANG_WARP_AGGREGATE_REDUX_RAW_ARCHIVE: native-overlay-evidence/warp-aggregate-redux-raw.zip
+        run: |
+          set -euo pipefail
+          native-overlay-selftest/bin/python \
+            benchmark/research/trace_warp_aggregate_redux.py
+          rm -rf -- native-overlay-evidence/warp-aggregate-redux-raw
+          (
+            cd native-overlay-evidence
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | LC_ALL=C sort -z \
+              | xargs -0 -r sha256sum \
+              > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
       - name: Compile frozen real vectorization workloads without a GPU
         id: real-vectorization-workloads
         shell: bash
