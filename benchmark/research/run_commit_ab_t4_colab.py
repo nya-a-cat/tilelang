@@ -353,8 +353,9 @@ def prepare_environments(records: list[dict[str, Any]]) -> dict[str, Any]:
             )
         )
 
-    run_checked([sys.executable, "-m", "venv", "--system-site-packages", str(BASELINE_ENV)], records)
-    run_checked([sys.executable, "-m", "venv", "--system-site-packages", str(CANDIDATE_ENV)], records)
+    venv_flags = ["-m", "venv", "--system-site-packages", "--without-pip"]
+    run_checked([sys.executable, *venv_flags, str(BASELINE_ENV)], records)
+    run_checked([sys.executable, *venv_flags, str(CANDIDATE_ENV)], records)
     baseline_python = BASELINE_ENV / "bin" / "python"
     candidate_python = CANDIDATE_ENV / "bin" / "python"
     dependencies = [
@@ -363,6 +364,10 @@ def prepare_environments(records: list[dict[str, Any]]) -> dict[str, Any]:
         "z3-solver==4.15.4.0",
     ]
     for python in (baseline_python, candidate_python):
+        run_checked(
+            [str(python), "-c", "import pip; print(pip.__version__, pip.__file__)"],
+            records,
+        )
         run_checked(
             [
                 str(python),
