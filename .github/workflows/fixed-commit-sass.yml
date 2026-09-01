@@ -1,6 +1,12 @@
 name: Fixed-commit SASS diagnostic
 
 on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Full 40-character fork commit containing the diagnostic
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       source_ref:

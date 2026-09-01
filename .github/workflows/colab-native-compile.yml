@@ -21,6 +21,14 @@ on:
         description: Full 40-character commit SHA or named ref to compile
         required: true
         type: string
+      mode:
+        description: Select the cached native compile or fixed-commit SASS diagnostic
+        required: false
+        default: native-compile
+        type: choice
+        options:
+          - native-compile
+          - fixed-commit-sass
 
 permissions:
   contents: read
@@ -31,7 +39,9 @@ concurrency:
 
 jobs:
   native-compile-smoke:
-    if: github.repository == 'nya-a-cat/tilelang'
+    if: >-
+      github.repository == 'nya-a-cat/tilelang' &&
+      (github.event_name != 'workflow_dispatch' || inputs.mode == 'native-compile')
     name: Ubuntu 22.04 CUDA native compile only
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -275,3 +285,14 @@ jobs:
           path: native-smoke-evidence/*
           if-no-files-found: error
           retention-days: 7
+
+  fixed-commit-sass:
+    if: >-
+      github.repository == 'nya-a-cat/tilelang' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'fixed-commit-sass'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/fixed-commit-sass.yml
+    with:
+      source_ref: ${{ inputs.source_ref }}
