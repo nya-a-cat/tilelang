@@ -35,9 +35,9 @@ static constexpr const char *kLexicalAllocScope = "lexical_alloc_scope";
 
 // Marks a collective statement whose implementation begins with a shared-memory
 // barrier over `value` participating threads.  The marker is analysis-only: the
-// backend implementation still emits the actual barrier.  ThreadSync may consume
-// it as an existing synchronization boundary only after proving that the
-// participant count covers the physical CTA.
+// backend implementation still emits the actual barrier.  ThreadSync may
+// consume it as an existing synchronization boundary only after proving that
+// the participant count covers the physical CTA.
 static constexpr const char *kCollectiveLeadingBarrier =
     "tl.collective_leading_barrier";
 
