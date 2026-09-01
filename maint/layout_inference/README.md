@@ -2,9 +2,9 @@
 
 Constructed IR cases with reviewed expected layouts, for validating the
 free-mode layout search — in particular the selection policy behind
-`tl.layout_cost_model` ("register-count" = the default ordering,
-"io-aware" = the opt-in global-memory model in
-`src/transform/layout_inference/layout_cost_model.cc`).
+`tl.layout_cost_model` ("register-count" = the compact-layout ordering,
+"io-aware" = the pure global-memory model, and "io-aware-regularized" = the
+CUDA target default in `src/transform/layout_inference/layout_cost_model.cc`).
 
 Why this exists:
 

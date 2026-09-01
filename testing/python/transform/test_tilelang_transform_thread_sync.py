@@ -1369,5 +1369,109 @@ def test_sync_grid_acts_as_shared_barrier():
     assert 'T.tvm_storage_sync("shared")' not in s, f"sync_grid already covers the barrier:\n{s}"
 
 
+def _collective_workspace_call(workspace, access_mask=3):
+    """Build the opaque workspace access used by lowered AllReduce calls."""
+    return T.call_extern(
+        "handle",
+        "fake_allreduce",
+        T.tvm_access_ptr(
+            T.type_annotation("float32"),
+            workspace.data,
+            0,
+            128,
+            access_mask,
+        ),
+    )
+
+
+def test_full_cta_collective_leading_barrier_satisfies_shared_dyn_sync():
+    """A full-CTA collective's real leading barrier orders workspace reuse.
+
+    Lowered AllReduce is opaque to ThreadSync.  The analysis-only marker tells
+    it that the second call reaches a real block barrier before touching the
+    reused dynamic-shared workspace, so adding another storage sync would be
+    redundant.
+    """
+
+    @T.prim_func(private=True)
+    def func():
+        workspace = T.alloc_buffer((128,), "float32", scope="shared.dyn")
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 128)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tz = T.launch_thread("threadIdx.z", 1)
+        with T.attr(T.int32(0), "tl.collective_leading_barrier", T.int32(128)):
+            T.evaluate(_collective_workspace_call(workspace))
+        with T.attr(T.int32(0), "tl.collective_leading_barrier", T.int32(128)):
+            T.evaluate(_collective_workspace_call(workspace))
+
+    mod = tvm.IRModule({"main": func})
+    mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
+    s = str(mod.script())
+    assert 'T.tvm_storage_sync("shared.dyn")' not in s, f"Unexpected redundant sync:\n{s}"
+
+
+def test_partial_cta_collective_marker_does_not_satisfy_block_sync():
+    """A named barrier over only part of the CTA cannot order all threads."""
+
+    @T.prim_func(private=True)
+    def func():
+        workspace = T.alloc_buffer((128,), "float32", scope="shared.dyn")
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 128)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tz = T.launch_thread("threadIdx.z", 1)
+        with T.attr(T.int32(0), "tl.collective_leading_barrier", T.int32(64)):
+            T.evaluate(_collective_workspace_call(workspace))
+        with T.attr(T.int32(0), "tl.collective_leading_barrier", T.int32(64)):
+            T.evaluate(_collective_workspace_call(workspace))
+
+    mod = tvm.IRModule({"main": func})
+    mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
+    s = str(mod.script())
+    assert 'T.tvm_storage_sync("shared.dyn")' in s, f"Partial-CTA marker hid a required sync:\n{s}"
+
+
+def test_divergent_collective_marker_does_not_satisfy_block_sync():
+    """Even a full-count marker is unusable under thread-divergent control."""
+
+    @T.prim_func(private=True, check_well_formed=False)
+    def func():
+        workspace = T.alloc_buffer((128,), "float32", scope="shared.dyn")
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 128)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tz = T.launch_thread("threadIdx.z", 1)
+        with T.attr(T.int32(0), "tl.collective_leading_barrier", T.int32(128)):
+            T.evaluate(_collective_workspace_call(workspace))
+        if tx < 64:
+            with T.attr(T.int32(0), "tl.collective_leading_barrier", T.int32(128)):
+                T.evaluate(_collective_workspace_call(workspace))
+
+    mod = tvm.IRModule({"main": func})
+    mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
+    s = str(mod.script())
+    assert 'T.tvm_storage_sync("shared.dyn")' in s, f"Divergent marker hid a required sync:\n{s}"
+
+
+def test_unmarked_opaque_collectives_keep_conservative_sync():
+    """Unannotated opaque read/write calls retain the existing behavior."""
+
+    @T.prim_func(private=True)
+    def func():
+        workspace = T.alloc_buffer((128,), "float32", scope="shared.dyn")
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 128)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tz = T.launch_thread("threadIdx.z", 1)
+        T.evaluate(_collective_workspace_call(workspace))
+        T.evaluate(_collective_workspace_call(workspace))
+
+    mod = tvm.IRModule({"main": func})
+    mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
+    s = str(mod.script())
+    assert 'T.tvm_storage_sync("shared.dyn")' in s, f"Unmarked calls lost their required sync:\n{s}"
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

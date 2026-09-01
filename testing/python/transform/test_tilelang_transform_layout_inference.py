@@ -110,7 +110,7 @@ def test_loop_tail_split(block_M, block_N, block_K, threads, vec_load_b, dtype):
         # tvm.ir.assert_structural_equal(mod, ref_mod)
 
 
-def test_register_count_is_default_layout_cost_model():
+def test_regularized_io_aware_is_default_cuda_layout_cost_model():
     @T.prim_func
     def main(
         S: T.Tensor((2,), T.float32),
@@ -133,11 +133,88 @@ def test_register_count_is_default_layout_cost_model():
             return tl.transform.LayoutInference()(mod)
 
     default = infer()
+    target_default = infer({"tl.layout_cost_model": "target-default"})
     register_count = infer({"tl.layout_cost_model": "register-count"})
     io_aware = infer({"tl.layout_cost_model": "io-aware"})
+    io_aware_regularized = infer({"tl.layout_cost_model": "io-aware-regularized"})
+    traced_register_count = infer({"tl.layout_cost_model": "register-count", "tl.enable_layout_cost_trace": True})
+    traced_io_aware = infer({"tl.layout_cost_model": "io-aware", "tl.enable_layout_cost_trace": True})
+    traced_io_aware_regularized = infer(
+        {
+            "tl.layout_cost_model": "io-aware-regularized",
+            "tl.enable_layout_cost_trace": True,
+        }
+    )
 
-    tvm.ir.assert_structural_equal(default, register_count)
-    assert not tvm.ir.structural_equal(default, io_aware)
+    tvm.ir.assert_structural_equal(default, target_default)
+    tvm.ir.assert_structural_equal(default, io_aware_regularized)
+    assert not tvm.ir.structural_equal(default, register_count)
+    tvm.ir.assert_structural_equal(io_aware_regularized, io_aware)
+    tvm.ir.assert_structural_equal(register_count, traced_register_count)
+    tvm.ir.assert_structural_equal(io_aware, traced_io_aware)
+    tvm.ir.assert_structural_equal(io_aware_regularized, traced_io_aware_regularized)
+
+
+def test_target_default_keeps_register_count_on_cpu():
+    @T.prim_func
+    def main(
+        S: T.Tensor((4,), T.float32),
+        Out: T.Tensor((4, 4096), T.float32),
+    ):
+        with T.Kernel(1, threads=256):
+            scalar = T.alloc_fragment((4,), T.float32)
+            T.copy(S, scalar)
+            for i, j in T.Parallel(4, 4096):
+                Out[i, j] = scalar[i] * 2.0
+
+    target = tvm.target.Target("c")
+
+    def infer(policy):
+        with target, tvm.transform.PassContext(config={"tl.layout_cost_model": policy}):
+            mod = tvm.IRModule({"main": main})
+            mod = tvm.tirx.transform.BindTarget(target)(mod)
+            mod = tl.transform.MaterializeKernelLaunch(lower_thread_binding=False)(mod)
+            return tl.transform.LayoutInference()(mod)
+
+    target_default = infer("target-default")
+    register_count = infer("register-count")
+    tvm.ir.assert_structural_equal(target_default, register_count)
+
+
+@pytest.mark.parametrize(
+    "rows, cols, threads, expected_policy",
+    [
+        (4, 1024, 128, "register-count"),
+        (4, 4096, 256, "io-aware"),
+    ],
+)
+def test_io_aware_regularized_broadcast_boundaries(rows, cols, threads, expected_policy):
+    @T.prim_func
+    def main(
+        S: T.Tensor((rows,), T.float32),
+        Out: T.Tensor((rows, cols), T.float32),
+    ):
+        with T.Kernel(1, threads=threads):
+            scalar = T.alloc_fragment((rows,), T.float32)
+            T.copy(S, scalar)
+            for i, j in T.Parallel(rows, cols):
+                Out[i, j] = scalar[i] * 2.0
+
+    target = auto_target
+
+    def infer(policy):
+        with target, tvm.transform.PassContext(config={"tl.layout_cost_model": policy}):
+            mod = tvm.IRModule({"main": main})
+            mod = tvm.tirx.transform.BindTarget(target)(mod)
+            mod = tl.transform.MaterializeKernelLaunch()(mod)
+            return tl.transform.LayoutInference()(mod)
+
+    register_count = infer("register-count")
+    io_aware = infer("io-aware")
+    regularized = infer("io-aware-regularized")
+    assert not tvm.ir.structural_equal(register_count, io_aware)
+    expected = register_count if expected_policy == "register-count" else io_aware
+    tvm.ir.assert_structural_equal(regularized, expected)
 
 
 def test_static_ragged_copy_minimizes_full_thread_padding():

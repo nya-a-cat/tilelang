@@ -17,10 +17,23 @@ using namespace tirx;
 namespace rocm {
 
 struct Reduce : backend::ReduceLowerer<Reduce> {
+  static int WarpSize(Target target) { return TargetRocmGetWarpSize(target); }
+
   static bool SupportsFp16Bf16NanReduce(Target) { return false; }
 
   static int GetPreferredVectorizedSize(const ReduceOpNode &, Target) {
     return 1;
+  }
+
+  static bool SupportsBatchPackedAllReduce(Target) { return false; }
+
+  static int GetAllReduceWorkspaceStride(int, int, PrimExpr, PrimExpr,
+                                         int fallback_stride, Target) {
+    return fallback_stride;
+  }
+
+  static bool AllReduceHasLeadingBarrier(int, int, PrimExpr, PrimExpr, Target) {
+    return true;
   }
 
   static std::string MakeBatchAllReduce(std::string reducer,

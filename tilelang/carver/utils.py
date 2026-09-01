@@ -44,10 +44,10 @@ def get_roller_hints_from_func(
         try:
             tensorized_func, tags = get_tensorized_func_and_tags(func, arch.target, allow_gemv=allow_gemv)
         except Exception as e_msg:
-            logger.debug("Get tensorized func and tags failed: ", e_msg)
+            logger.debug("Get tensorized func and tags failed: %s", e_msg)
             tags = None
         if tags and tensorized_func:
-            policy = TensorCorePolicy(func=tensorized_func, arch=arch, tags=tags)
+            policy = TensorCorePolicy.from_prim_func(func=tensorized_func, arch=arch, tags=tags)
             roller_hints = policy.emit_config(topk)
         else:
             roller_hints = None
@@ -57,7 +57,7 @@ def get_roller_hints_from_func(
         try:
             tensorized_func, tags = get_tensorized_func_and_tags(func, arch.target, allow_gemv=allow_gemv)
         except Exception as e_msg:
-            logger.debug("Get tensorized func and tags failed: ", e_msg)
+            logger.debug("Get tensorized func and tags failed: %s", e_msg)
             tags = None
         if tags and tensorized_func:
             policy = TensorCorePolicy.from_prim_func(func=tensorized_func, arch=arch, tags=tags)
@@ -75,7 +75,7 @@ def get_roller_hints_from_output_nodes(
         policy = TensorCorePolicy.from_output_nodes(output_nodes, arch=arch, tags=None)
         lints = policy.emit_config(topk)
     except Exception as e_msg:
-        logger.debug(f"Generate hints from output nodes failed: {e_msg}", "fallback to default policy")
+        logger.debug("Generate hints from output nodes failed: %s; falling back to default policy", e_msg)
 
     if len(lints) == 0:
         policy = DefaultPolicy.from_output_nodes(output_nodes, arch=arch, tags=None)

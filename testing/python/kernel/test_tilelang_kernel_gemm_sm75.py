@@ -33,6 +33,11 @@ def _assert_mma_sync_shape(source, a_type, c_type, m, n, k):
     assert "mma_sync_sm70" not in source
 
 
+def _assert_ldmatrix_shape(source, a_num, b_num):
+    assert f"tl::ptx_ldmatrix_x{a_num}(" in source
+    assert f"tl::ptx_ldmatrix_x{b_num}(" in source
+
+
 def _pack_int4(tensor: torch.Tensor) -> torch.Tensor:
     tensor_i16 = tensor.to(torch.int16)
     packed = (tensor_i16[..., ::2] & 0x0F) | ((tensor_i16[..., 1::2] & 0x0F) << 4)
@@ -49,6 +54,7 @@ def test_sm75_f16_gemm_uses_m16n8k8_and_matches_torch():
         out_idx=[2],
     )
     _assert_mma_sync_shape(kernel.get_kernel_source(), "kFloat16", "kFloat32", 16, 8, 8)
+    _assert_ldmatrix_shape(kernel.get_kernel_source(), 2, 1)
 
     a = torch.randn((M, K), device="cuda", dtype=torch.float16)
     b = torch.randn((N, K), device="cuda", dtype=torch.float16)
@@ -68,6 +74,7 @@ def test_sm75_f16_gemm_f16_accum_uses_m16n8k8_and_matches_torch():
         out_idx=[2],
     )
     _assert_mma_sync_shape(kernel.get_kernel_source(), "kFloat16", "kFloat16", 16, 8, 8)
+    _assert_ldmatrix_shape(kernel.get_kernel_source(), 2, 1)
 
     a = torch.randn((M, K), device="cuda", dtype=torch.float16) * 0.1
     b = torch.randn((N, K), device="cuda", dtype=torch.float16) * 0.1
@@ -87,6 +94,7 @@ def test_sm75_uint8_gemm_uses_m8n8k16_and_matches_torch():
         out_idx=[2],
     )
     _assert_mma_sync_shape(kernel.get_kernel_source(), "kUInt8", "kInt32", 8, 8, 16)
+    _assert_ldmatrix_shape(kernel.get_kernel_source(), 1, 1)
 
     a = torch.randint(0, 256, (M, K), device="cuda", dtype=torch.uint8)
     b = torch.randint(0, 256, (N, K), device="cuda", dtype=torch.uint8)
@@ -106,6 +114,7 @@ def test_sm75_int8_gemm_uses_m8n8k16_and_matches_torch():
         out_idx=[2],
     )
     _assert_mma_sync_shape(kernel.get_kernel_source(), "kInt8", "kInt32", 8, 8, 16)
+    _assert_ldmatrix_shape(kernel.get_kernel_source(), 1, 1)
 
     a = torch.randint(-8, 8, (M, K), device="cuda", dtype=torch.int8)
     b = torch.randint(-8, 8, (N, K), device="cuda", dtype=torch.int8)
@@ -125,6 +134,7 @@ def test_sm75_int4_gemm_uses_m8n8k32_and_matches_torch():
         out_idx=[2],
     )
     _assert_mma_sync_shape(kernel.get_kernel_source(), "kInt4", "kInt32", 8, 8, 32)
+    _assert_ldmatrix_shape(kernel.get_kernel_source(), 1, 1)
 
     a = torch.randint(-8, 8, (M, K), device="cuda", dtype=torch.int8)
     b = torch.randint(-8, 8, (N, K), device="cuda", dtype=torch.int8)

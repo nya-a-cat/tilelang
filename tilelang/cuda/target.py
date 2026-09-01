@@ -156,6 +156,10 @@ def target_has_bulk_copy(target: Target) -> bool:
     return _target_ffi_api().TargetHasBulkCopy(target)
 
 
+def target_has_reg_reconfiguration(target: Target) -> bool:
+    return _target_ffi_api().TargetHasRegReconfiguration(target)
+
+
 register_target_detector("cuda", _detect_cuda_target, override=True)
 register_target_normalizer("cuda", normalize_cuda_target, override=True)
 register_target_normalizer("cutedsl", _normalize_cutedsl_target_for_resolve, override=True)

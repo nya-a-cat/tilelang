@@ -12,6 +12,7 @@
 #include <tvm/tirx/transform.h>
 
 #include "cuda/op/builtin.h"
+#include "cuda/target_utils.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
 #include <functional>
@@ -374,6 +375,13 @@ using namespace tirx::transform;
 tvm::transform::Pass AnnotateWarpGroupRegAlloc() {
   auto pass_func = [](PrimFunc f, const IRModule &m,
                       const PassContext &ctx) -> PrimFunc {
+    auto target = f->GetAttr<Target>(tvm::attr::kTarget);
+    if (target.defined() && !TargetHasRegReconfiguration(target.value())) {
+      // Warp specialization and TMA are legal on portable SM90+ targets, but
+      // setmaxnreg redistribution is not. CUDA codegen treats the unconsumed
+      // role annotations as non-semantic hints.
+      return f;
+    }
     return SetMaxNRegInjector::Inject(std::move(f));
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.AnnotateWarpGroupRegAlloc", {});

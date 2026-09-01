@@ -491,7 +491,7 @@ def test_reduce(op, dtype, M, N, src_scope, dst_scope, threads, batch):
 
     if batch > 1:
         src = jit_kernel.get_kernel_source()
-        m = re.search(r",\s*(\d+)\s*,\s*\d+\s*>::run_batch\(", src)
+        m = re.search(r",\s*(\d+)\s*,\s*\d+(?:\s*,\s*true)?\s*>::run_batch\(", src)
         assert m is not None, f"Expected run_batch in generated source.\n{src}"
 
     seed = _case_seed("reduce", op, dtype, M, N, src_scope, dst_scope, threads, batch)
@@ -706,18 +706,24 @@ def test_finalize_reducer_codegen(op, dtype, block_M, block_N, batch):
     and run_batch is legitimately absent.
     """
 
-    src = tl.compile(
-        _make_finalize_reducer_kernel(block_M, block_N, dtype, op, batch),
-        out_idx=-1,
-        pass_configs={**_COMPILE_FLAGS, "tl.reducer_force_baseline": True},
-    ).get_kernel_source()
+    target = {"kind": "cuda", "arch": "sm_80"}
+    pass_config = {**_COMPILE_FLAGS, "tl.reducer_force_baseline": True}
+    with tvm.transform.PassContext(config=pass_config), tvm.target.Target(target):
+        artifact = tilelang.lower(
+            _make_finalize_reducer_kernel(block_M, block_N, dtype, op, batch),
+            target=target,
+            enable_device_compile=False,
+        )
+    src = artifact.kernel_source
+    assert src is not None
 
     if batch == 1:
         assert "run_batch" not in src, f"batch=1 must not emit run_batch.\n{src}"
     else:
-        m = re.search(r",\s*(\d+)\s*,\s*\d+\s*>::run_batch\(", src)
+        m = re.search(r",\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*true)?\s*>::run_batch\(", src)
         assert m is not None, f"Expected run_batch in generated source.\n{src}"
         assert int(m.group(1)) == batch, f"Expected batch={batch}, got {m.group(1)}.\n{src}"
+        assert int(m.group(2)) == 8, f"Expected compact warp stride=8, got {m.group(2)}.\n{src}"
 
 
 @tilelang.testing.requires_cuda_compute_version_ge(8, 0)
@@ -1055,6 +1061,105 @@ def _make_allreduce_dim0_scale_kernel(reduce_fn, logical_width, scale):
     return kernel
 
 
+def _lower_cuda_artifact_without_device_compile(prim_func, arch="sm_80"):
+    target = {"kind": "cuda", "arch": arch}
+    with tvm.transform.PassContext(), tvm.target.Target(target):
+        return tilelang.lower(prim_func, target=target, enable_device_compile=False)
+
+
+def _lower_cuda_source_without_device_compile(prim_func, arch="sm_80"):
+    artifact = _lower_cuda_artifact_without_device_compile(prim_func, arch)
+    assert artifact.kernel_source is not None
+    return artifact.kernel_source
+
+
+def _dynamic_shared_bytes(artifact):
+    values = [int(func.attrs.get("dyn_shared_memory_buf", 0)) for func in artifact.device_mod.functions.values()]
+    assert len(values) == 1
+    return values[0]
+
+
+def test_hierarchical_allreduce_codegen_selection_boundaries():
+    full_cta = _lower_cuda_source_without_device_compile(_make_allreduce_width_kernel(T.reduce_sum, 1, 128, 128))
+    two_warps = _lower_cuda_source_without_device_compile(_make_allreduce_width_kernel(T.reduce_sum, 1, 64, 64))
+    strided_artifact = _lower_cuda_artifact_without_device_compile(_make_allreduce_dim0_scale_kernel(T.reduce_sum, 64, 2))
+    strided = strided_artifact.kernel_source
+    assert strided is not None
+    assert ", true>::run" in full_cta, full_cta
+    assert "__syncthreads()" not in full_cta, full_cta
+    assert ", true>::run" in two_warps, two_warps
+    assert ", true>::run" not in strided, strided
+    assert _dynamic_shared_bytes(strided_artifact) == 128 * 4
+
+
+def test_hierarchical_allreduce_compacts_dynamic_shared_workspace():
+    four_warps = _lower_cuda_artifact_without_device_compile(_make_allreduce_width_kernel(T.reduce_sum, 1, 128, 128))
+    two_warps = _lower_cuda_artifact_without_device_compile(_make_allreduce_width_kernel(T.reduce_sum, 1, 64, 64))
+    full_cta = _lower_cuda_artifact_without_device_compile(_make_allreduce_width_kernel(T.reduce_sum, 1, 1024, 1024))
+
+    assert _dynamic_shared_bytes(four_warps) == 4 * 4
+    assert _dynamic_shared_bytes(two_warps) == 2 * 4
+    assert _dynamic_shared_bytes(full_cta) == 32 * 4
+
+
+def test_hierarchical_allreduce_batch_codegen():
+    rows, width, threads, batch = 4, 1024, 128, 4
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((rows, width), T.float32),
+        B: T.Tensor((rows,), T.float32),
+    ):
+        with T.Kernel(1, threads=threads):
+            src = T.alloc_fragment((rows, width), T.float32)
+            dst = T.alloc_fragment((rows,), T.float32)
+            T.copy(A, src)
+            T.reduce_sum(src, dst, dim=1, batch=batch)
+            T.copy(dst, B)
+
+    artifact = _lower_cuda_artifact_without_device_compile(kernel)
+    source = artifact.kernel_source
+    assert source is not None
+    assert "run_batch" in source, source
+    assert ", 4, 4, true>::run_batch" in source, source
+    assert _dynamic_shared_bytes(artifact) == 4 * batch * 4
+
+    blackwell_artifact = _lower_cuda_artifact_without_device_compile(kernel, "sm_100a")
+    blackwell_source = blackwell_artifact.kernel_source
+    assert blackwell_source is not None
+    assert "tl::SumOp_f32x2" in blackwell_source, blackwell_source
+    assert ", 2, 4, true>::run_batch" in blackwell_source, blackwell_source
+    assert _dynamic_shared_bytes(blackwell_artifact) == 4 * batch * 4
+
+
+def test_consecutive_hierarchical_batch_chunks_sync_workspace_reuse():
+    rows, width, threads, batch = 8, 1024, 128, 4
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((rows, width), T.float32),
+        B: T.Tensor((rows,), T.float32),
+    ):
+        with T.Kernel(1, threads=threads):
+            src = T.alloc_fragment((rows, width), T.float32)
+            dst = T.alloc_fragment((rows,), T.float32)
+            T.copy(A, src)
+            T.reduce_sum(src, dst, dim=1, batch=batch)
+            T.copy(dst, B)
+
+    artifact = _lower_cuda_artifact_without_device_compile(kernel)
+    source = artifact.kernel_source
+    assert source is not None
+    assert source.count("tl::AllReduce") == rows // batch, source
+    assert source.count(", 4, 4, true>::run_batch") == rows // batch, source
+    assert source.count("__syncthreads();") == 1, source
+    first_call = source.index("tl::AllReduce")
+    second_call = source.index("tl::AllReduce", first_call + 1)
+    sync = source.index("__syncthreads();")
+    assert first_call < sync < second_call, source
+    assert _dynamic_shared_bytes(artifact) == 4 * batch * 4
+
+
 @tilelang.testing.requires_cuda
 @pytest.mark.parametrize("reduce_fn", [T.reduce_sum, T.reduce_max], ids=["sum", "max"])
 @pytest.mark.parametrize("width", [48, 96])
@@ -1195,6 +1300,45 @@ def test_reduce_packed_max_nan_batch_runtime():
         B = _compile(_make_nan_reduce_kernel(T.reduce_max, M, N, tl_dtype, threads=256, nan_propagate=True))(A)
         assert not math.isnan(B[0].float().item()), f"{tl_dtype}: non-NaN rows should not produce NaN"
         assert math.isnan(B[2].float().item()), f"{tl_dtype}: NaN row must produce NaN"
+
+
+@pytest.mark.parametrize("threads", [64, 128])
+def test_consecutive_full_cta_reductions_sync_workspace_codegen(threads):
+    """Workspace reuse is ordered by the selected AllReduce contract.
+
+    This is a source-only regression test: device compilation and execution
+    are deliberately disabled so the backend contract is covered on CPU-only
+    CI as well. The one-barrier hierarchical path relies on ThreadSync to
+    order a second collective's reuse of the compact workspace.
+    """
+
+    width = threads * 8
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((2, width), T.float32),
+        B: T.Tensor((2,), T.float32),
+    ):
+        with T.Kernel(1, threads=threads):
+            first_values = T.alloc_fragment((width,), T.float32)
+            second_values = T.alloc_fragment((width,), T.float32)
+            first_sum = T.alloc_fragment((1,), T.float32)
+            second_sum = T.alloc_fragment((1,), T.float32)
+            T.copy(A[0, :], first_values)
+            T.copy(A[1, :], second_values)
+            T.reduce_sum(first_values, first_sum, dim=0)
+            T.reduce_sum(second_values, second_sum, dim=0)
+            if T.get_thread_binding() == 0:
+                B[0] = first_sum[0]
+                B[1] = second_sum[0]
+
+    source = _lower_cuda_source_without_device_compile(kernel)
+    assert source.count("tl::AllReduce") == 2, source
+    assert source.count(", true>::run") == 2, source
+    assert "tl.collective_leading_barrier" not in source, source
+    first_call = source.index("tl::AllReduce")
+    second_call = source.index("tl::AllReduce", first_call + 1)
+    assert source[first_call:second_call].count("__syncthreads()") == 1, source
 
 
 if __name__ == "__main__":

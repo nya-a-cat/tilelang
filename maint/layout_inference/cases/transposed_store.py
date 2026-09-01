@@ -2,7 +2,7 @@
 
 The copy ``A -> frag`` wants the fragment coalesced along j (A's last
 axis); the loop stores ``B[j, i]``, which is coalesced along i instead.
-No layout satisfies both, so this is where the two selection policies
+No layout satisfies both, so this is where the two endpoint policies
 can legitimately disagree: register count cannot see the difference
 (every non-replicated candidate holds the same slot count), while the
 io-aware model weighs the actual transaction counts of both statements.

@@ -32,6 +32,14 @@ def is_volta_arch(arch: TileDevice) -> bool:
     conditions = [True]
     conditions.append(is_cuda_arch(arch))
     conditions.append(arch.sm_version >= 70)
+    conditions.append(arch.sm_version < 75)
+    return all(conditions)
+
+
+def is_turing_arch(arch: TileDevice) -> bool:
+    conditions = [True]
+    conditions.append(is_cuda_arch(arch))
+    conditions.append(arch.sm_version >= 75)
     conditions.append(arch.sm_version < 80)
     return all(conditions)
 
@@ -55,6 +63,23 @@ def is_hopper_arch(arch: TileDevice) -> bool:
     conditions.append(is_cuda_arch(arch))
     conditions.append(arch.sm_version == 90)
     return all(conditions)
+
+
+def is_blackwell_arch(arch: TileDevice) -> bool:
+    conditions = [True]
+    conditions.append(is_cuda_arch(arch))
+    conditions.append(arch.sm_version >= 100)
+    conditions.append(arch.sm_version < 130)
+    return all(conditions)
+
+
+def sm_supports_async_copy(sm_version: int) -> bool:
+    """Whether an SM version supports global-to-shared ``cp.async``."""
+    return sm_version >= 80
+
+
+def has_async_copy(arch: TileDevice) -> bool:
+    return is_cuda_arch(arch) and sm_supports_async_copy(arch.sm_version)
 
 
 def has_mma_support(arch: TileDevice) -> bool:
@@ -88,10 +113,16 @@ volta_tensorcore_supported = [
     ("float16", "float32"),
     ("float16", "float16"),
 ]
+turing_tensorcore_supported = volta_tensorcore_supported + [
+    ("int8", "int32"),
+    ("int4", "int32"),
+    ("int1", "int32"),
+]
 ampere_tensorcore_supported = [
     ("bfloat16", "float32"),
     ("float16", "float32"),
     ("float16", "float16"),
+    ("custom[tfloat32]", "float32"),
     ("int8", "int32"),
     ("int4", "int32"),
     ("int2", "int32"),
@@ -101,25 +132,37 @@ ada_tensorcore_supported = [
     ("bfloat16", "float32"),
     ("float16", "float32"),
     ("float16", "float16"),
+    ("custom[tfloat32]", "float32"),
     ("int8", "int32"),
     ("float8_e5m2", "float32"),
     ("float8_e4m3", "float32"),
 ]
 hopper_tensorcore_supported = ada_tensorcore_supported
+blackwell_tensorcore_supported = hopper_tensorcore_supported
 
 
 # TODO(lei): we should consider the dtype of the input a and b
 # instead of assuming both a and b share the same dtype.
 # As the tensorcore may supports float8_e4m3 * float8_e5m2
 def is_tensorcore_supported_precision(in_dtype: str, accum_dtype: str, arch: TileDevice) -> bool:
+    # TVM's canonical spelling is ``custom[tfloat32]``.  Accept the concise
+    # aliases as well because public TileLang APIs commonly call the type TF32.
+    in_dtype = str(in_dtype)
+    accum_dtype = str(accum_dtype)
+    if in_dtype in {"tf32", "tfloat32"}:
+        in_dtype = "custom[tfloat32]"
     if is_volta_arch(arch):
         return (in_dtype, accum_dtype) in volta_tensorcore_supported
+    elif is_turing_arch(arch):
+        return (in_dtype, accum_dtype) in turing_tensorcore_supported
     elif is_ampere_arch(arch):
         return (in_dtype, accum_dtype) in ampere_tensorcore_supported
     elif is_ada_arch(arch):
         return (in_dtype, accum_dtype) in ada_tensorcore_supported
     elif is_hopper_arch(arch):
         return (in_dtype, accum_dtype) in hopper_tensorcore_supported
+    elif is_blackwell_arch(arch):
+        return (in_dtype, accum_dtype) in blackwell_tensorcore_supported
     else:
         raise ValueError(f"Unsupported architecture: {arch}")
 
@@ -142,7 +185,8 @@ class CUDA(TileDevice):
 
             target = determine_target(target, return_object=True)
         self.target = target
-        self.sm_version = check_sm_version(self.target.attrs["arch"])
+        target_arch = str(self.target.attrs["arch"])
+        self.sm_version = check_sm_version(target_arch)
         device = tvm.runtime.cuda(0)
         if not device.exist:
             raise RuntimeError("Cannot find cuda device 0.")
@@ -153,7 +197,10 @@ class CUDA(TileDevice):
         self.smem_cap = cuda_driver.get_shared_memory_per_block()
         self.compute_max_core = device.multi_processor_count
         self.warp_size = device.warp_size
-        self.compute_capability = device.compute_version.replace(".", "")
+        # Scheduling features must follow the compilation target.  Preserve the
+        # device-style numeric spelling used by existing Analyzer consumers,
+        # while keeping the exact lettered target on ``self.target``.
+        self.compute_capability = str(self.sm_version)
         self.reg_cap: int = 65536
         self.max_smem_usage: int = 2 * self.smem_cap
         self.sm_partition: int = 4
@@ -183,10 +230,14 @@ class CUDA(TileDevice):
 __all__ = [
     "is_cuda_arch",
     "is_volta_arch",
+    "is_turing_arch",
     "is_ampere_arch",
     "is_ada_arch",
     "is_hopper_arch",
+    "is_blackwell_arch",
     "is_tensorcore_supported_precision",
+    "sm_supports_async_copy",
+    "has_async_copy",
     "has_mma_support",
     "CUDA",
 ]

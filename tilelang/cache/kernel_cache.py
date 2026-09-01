@@ -29,8 +29,9 @@ from tilelang.jit import JITKernel
 from tilelang.jit.adapter.base import CachedTextSource
 from tilelang.jit.diagnostics import jit_phase
 from tilelang.transform.pass_config import normalize_pass_configs
-from tilelang.contrib.hip_resource_info import dump_to_file, load_from_file
+from tilelang.contrib.kernel_resource_info import dump_to_file, load_from_file
 from tilelang import __version__
+from tilelang._build_identity import get_python_overlay_stamp
 
 
 class KernelCache:
@@ -140,6 +141,9 @@ class KernelCache:
     @staticmethod
     def _get_base_key() -> dict:
         base = {"version": __version__}
+        overlay_stamp = get_python_overlay_stamp()
+        if overlay_stamp:
+            base["python_overlay"] = overlay_stamp
         if env.should_use_kernel_cache_lib_stamp():
             lib_stamp = KernelCache._get_tilelang_lib_stamp()
             if lib_stamp:
@@ -328,7 +332,8 @@ class KernelCache:
             Set to "1", "true", "yes", or "on" to enable verbose compilation by default.
         TILELANG_LAYOUT_COST_MODEL : str
             Default value for the `tl.layout_cost_model` pass config when it is
-            not set explicitly in `pass_configs`. Unset keeps the built-in default.
+            not set explicitly in `pass_configs`. Unset keeps the built-in
+            target-aware default.
         """
 
         # Resolve env-var-derived pass-config defaults up front so they are
@@ -599,7 +604,7 @@ class KernelCache:
                 self.logger.debug(f"Saving kernel parameters to disk: {params_path}")
             KernelCache._safe_write_file(params_path, "wb", lambda file: cloudpickle.dump(kernel.params, file))
 
-            # Persist HIP kernel-resource-usage remarks
+            # Persist compiler resource usage captured during device compilation.
             usage = getattr(kernel, "_resource_usage", None) or {}
             if usage:
                 dump_to_file(usage, os.path.join(staging_path, self.resource_usage_path))
@@ -719,8 +724,8 @@ class KernelCache:
             shutil.rmtree(cache_path, ignore_errors=True)
             return None
         if kernel is not None:
-            # Restore parsed kernel-resource-usage if a previous compile
-            # persisted it; absent file is fine (older caches, non-HIP).
+            # Restore parsed compiler resource usage if a previous compile
+            # persisted it; absent file is fine for older cache entries.
             ru_path = os.path.join(cache_path, self.resource_usage_path)
             if os.path.exists(ru_path):
                 try:

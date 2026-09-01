@@ -6,6 +6,8 @@
 
 #include "layout_cost_model.h"
 
+#include "backend/common/target_utils.h"
+
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/op.h>
@@ -140,6 +142,15 @@ struct StatementTraffic {
   int64_t Time() const { return std::max(bw, issue); }
 };
 
+struct StatementCharge {
+  int64_t mem{0};
+  int64_t bw{0};
+  int64_t issue{0};
+  int64_t measured{0};
+  int64_t worst_case{0};
+  int64_t unavailable{0};
+};
+
 void LogProbe(int member_idx, const char *what, const StatementProbe &probe) {
   const char *state = probe.accesses.empty()
                           ? "no-global-access"
@@ -192,6 +203,29 @@ bool TryMultiplyPositive(int64_t lhs, int64_t rhs, int64_t *product) {
   }
   *product = lhs * rhs;
   return true;
+}
+
+// A 256 KiB byte-equivalent regularization price per fragment slot, calibrated
+// on the existing 18-case T4/consumer-Blackwell layout-divergence set. The
+// target-aware default applies it on CUDA; explicit register-count remains the
+// compatibility escape hatch, and non-CUDA targets retain register-count until
+// separately calibrated.
+constexpr int64_t kRegularizedRegisterSlotPriceBytes = int64_t{1} << 18;
+
+/*! \brief Saturating non-negative `memory + price * registers` scalarization.
+ *
+ * Layout costs are estimates, so overflowing into a cheap negative score is
+ * worse than conservatively keeping the attempt at the end of the ordering. */
+int64_t RegisterRegularizedRank(int64_t memory, int64_t registers,
+                                int64_t register_price) {
+  const int64_t maximum = std::numeric_limits<int64_t>::max();
+  if (memory < 0 || registers < 0 || register_price < 0) {
+    return maximum;
+  }
+  if (register_price != 0 && registers > (maximum - memory) / register_price) {
+    return maximum;
+  }
+  return memory + registers * register_price;
 }
 
 /*! \brief Zero out vars outside the probe's own coordinate set: block
@@ -983,8 +1017,10 @@ public:
     DLOG(INFO) << "[LayoutCost] register-count score begin: members="
                << FormatVector(members);
     AttemptCost cost;
-    cost.mem = CountSpilledBytes(members, infer_list, tmp_layout_map);
+    cost.spill = CountSpilledBytes(members, infer_list, tmp_layout_map);
+    cost.mem = cost.spill;
     cost.regs = CountRegisterSlots(tmp_layout_map);
+    cost.rank = cost.mem;
     DLOG(INFO) << "[LayoutCost] register-count score end: mem(spill)="
                << cost.mem << " regs=" << cost.regs;
     return cost;
@@ -999,18 +1035,22 @@ public:
  *  opacity). Registers remain the lexicographic tiebreak. */
 class IOAwareCostModel final : public LayoutCostModel {
 public:
-  explicit IOAwareCostModel(Target target) : target_(std::move(target)) {}
+  IOAwareCostModel(Target target, std::string name,
+                   int64_t register_slot_price_bytes)
+      : target_(std::move(target)), name_(std::move(name)),
+        register_slot_price_bytes_(register_slot_price_bytes) {}
 
   AttemptCost Score(const std::vector<int> &members,
                     const std::vector<TileOperator> &infer_list,
                     const LayoutMap &tmp_layout_map) const final {
-    DLOG(INFO) << "[LayoutCost] io-aware score begin: members="
-               << FormatVector(members)
+    DLOG(INFO) << "[LayoutCost] " << name_
+               << " score begin: members=" << FormatVector(members)
                << " layout_entries=" << tmp_layout_map.size();
     AttemptCost cost;
     // Spill traffic enters the same byte-denominated channel as the global
     // estimates below, competing rather than vetoing.
-    cost.mem = CountSpilledBytes(members, infer_list, tmp_layout_map);
+    cost.spill = CountSpilledBytes(members, infer_list, tmp_layout_map);
+    cost.mem = cost.spill;
     cost.regs = CountRegisterSlots(tmp_layout_map);
 
     for (int idx : members) {
@@ -1055,8 +1095,8 @@ public:
         }
         DLOG(INFO) << "[LayoutCost] member " << idx << " copy fragment layout: "
                    << frag_layout.value()->DebugOutput();
-        int64_t statement_mem =
-            CachedStatementMem(idx, frag_layout.value(), [&]() {
+        StatementCharge statement =
+            CachedStatementCost(idx, frag_layout.value(), [&]() {
               std::optional<StatementProbe> probe;
               try {
                 probe = BuildCopyProbe(copy_op, frag_layout.value(),
@@ -1069,9 +1109,9 @@ public:
               }
               return ChargeStatement(probe, idx, "copy");
             });
-        cost.mem += statement_mem;
+        AccumulateCharge(&cost, statement);
         DLOG(INFO) << "[LayoutCost] member " << idx
-                   << " copy contribution=" << statement_mem
+                   << " copy contribution=" << statement.mem
                    << " running_mem=" << cost.mem;
       } else if (const auto *loop = infer_list[idx].as<ParallelOpNode>()) {
         ParallelOp loop_op = GetRef<ParallelOp>(loop);
@@ -1095,13 +1135,13 @@ public:
           }
           return ChargeStatement(probe, idx, "parallel-loop");
         };
-        int64_t statement_mem =
+        StatementCharge statement =
             loop_layout.defined()
-                ? CachedStatementMem(idx, loop_layout, compute)
+                ? CachedStatementCost(idx, loop_layout, compute)
                 : compute();
-        cost.mem += statement_mem;
+        AccumulateCharge(&cost, statement);
         DLOG(INFO) << "[LayoutCost] member " << idx
-                   << " parallel-loop contribution=" << statement_mem
+                   << " parallel-loop contribution=" << statement.mem
                    << " running_mem=" << cost.mem;
       } else {
         DLOG(INFO) << "[LayoutCost] member " << idx
@@ -1109,28 +1149,46 @@ public:
                    << " is outside the IO-aware statement model";
       }
     }
-    DLOG(INFO) << "[LayoutCost] io-aware score end: mem=" << cost.mem
-               << " regs=" << cost.regs;
+    cost.register_price = register_slot_price_bytes_;
+    cost.rank = RegisterRegularizedRank(cost.mem, cost.regs,
+                                        register_slot_price_bytes_);
+    DLOG(INFO) << "[LayoutCost] " << name_ << " score end: rank=" << cost.rank
+               << " mem=" << cost.mem << " regs=" << cost.regs
+               << " register_price=" << cost.register_price;
     return cost;
   }
 
-  const char *Name() const final { return "io-aware"; }
+  const char *Name() const final { return name_.c_str(); }
 
 private:
+  static void AccumulateCharge(AttemptCost *cost,
+                               const StatementCharge &statement) {
+    cost->mem += statement.mem;
+    cost->global_mem += statement.mem;
+    cost->global_bw += statement.bw;
+    cost->global_issue += statement.issue;
+    cost->measured_statements += statement.measured;
+    cost->worst_case_statements += statement.worst_case;
+    cost->unavailable_statements += statement.unavailable;
+  }
+
   /*! \brief Final charge of one prepared statement, honoring the probe's
    *  three-state protocol (zero / worst-case / measured). */
-  static int64_t ChargeStatement(const std::optional<StatementProbe> &probe,
-                                 int member_idx, const char *what) {
+  static StatementCharge
+  ChargeStatement(const std::optional<StatementProbe> &probe, int member_idx,
+                  const char *what) {
     if (!probe.has_value()) {
       DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
                  << " probe unavailable; contribution=0";
-      return 0; // nothing sensible to charge
+      StatementCharge charge;
+      charge.unavailable = 1;
+      return charge; // nothing sensible to charge
     }
     LogProbe(member_idx, what, *probe);
     if (probe->accesses.empty()) {
       DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
                  << " has no direct global traffic; contribution=0";
-      return 0;
+      return StatementCharge{};
     }
     std::optional<StatementTraffic> traffic;
     if (probe->measurable) {
@@ -1141,13 +1199,22 @@ private:
                  << " measured: bw=" << traffic->bw
                  << " issue=" << traffic->issue
                  << " contribution=max(bw,issue)=" << traffic->Time();
-      return traffic->Time();
+      StatementCharge charge;
+      charge.mem = traffic->Time();
+      charge.bw = traffic->bw;
+      charge.issue = traffic->issue;
+      charge.measured = 1;
+      return charge;
     }
     int64_t worst_case = WorstCaseBytes(*probe);
     DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
                << " outside the measurable model; worst-case contribution="
                << worst_case;
-    return worst_case;
+    StatementCharge charge;
+    charge.mem = worst_case;
+    charge.bw = worst_case;
+    charge.worst_case = 1;
+    return charge;
   }
 
   /*! \brief Memoize a statement's charge by (op index, layout): the charge
@@ -1156,27 +1223,30 @@ private:
    *  those attempts then score the statement for free. Structural layout
    *  equality; entries per index stay tiny (one per distinct layout). */
   template <typename F>
-  int64_t CachedStatementMem(int idx, const Fragment &layout,
-                             F &&compute) const {
+  StatementCharge CachedStatementCost(int idx, const Fragment &layout,
+                                      F &&compute) const {
     auto &entries = stmt_cache_[idx];
-    for (const auto &[cached_layout, mem] : entries) {
+    for (const auto &[cached_layout, cost] : entries) {
       if (cached_layout->IsEqual(layout.get())) {
         DLOG(INFO) << "[LayoutCost] member " << idx
-                   << " statement cache hit: contribution=" << mem;
-        return mem;
+                   << " statement cache hit: contribution=" << cost.mem;
+        return cost;
       }
     }
     DLOG(INFO) << "[LayoutCost] member " << idx
                << " statement cache miss: cached_layouts=" << entries.size();
-    int64_t mem = compute();
-    entries.emplace_back(layout, mem);
+    StatementCharge cost = compute();
+    entries.emplace_back(layout, cost);
     DLOG(INFO) << "[LayoutCost] member " << idx
-               << " statement cache store: contribution=" << mem;
-    return mem;
+               << " statement cache store: contribution=" << cost.mem;
+    return cost;
   }
 
   Target target_;
-  mutable std::unordered_map<int, std::vector<std::pair<Fragment, int64_t>>>
+  std::string name_;
+  int64_t register_slot_price_bytes_{0};
+  mutable std::unordered_map<int,
+                             std::vector<std::pair<Fragment, StatementCharge>>>
       stmt_cache_;
 };
 
@@ -1184,15 +1254,28 @@ private:
 
 std::unique_ptr<LayoutCostModel>
 LayoutCostModel::Create(const std::string &name, Target target) {
+  if (name == "target-default") {
+    if (TargetIsCuda(target)) {
+      return std::make_unique<IOAwareCostModel>(
+          std::move(target), "io-aware-regularized",
+          kRegularizedRegisterSlotPriceBytes);
+    }
+    return std::make_unique<RegisterCountCostModel>();
+  }
   if (name == "io-aware") {
-    return std::make_unique<IOAwareCostModel>(std::move(target));
+    return std::make_unique<IOAwareCostModel>(std::move(target), name, 0);
+  }
+  if (name == "io-aware-regularized") {
+    return std::make_unique<IOAwareCostModel>(
+        std::move(target), name, kRegularizedRegisterSlotPriceBytes);
   }
   if (name == "register-count") {
     return std::make_unique<RegisterCountCostModel>();
   }
   LOG(FATAL) << "Unknown layout cost model \"" << name
              << "\" for pass config `tl.layout_cost_model`; valid values "
-                "are \"register-count\" (default) and \"io-aware\".";
+                "are \"target-default\" (default), \"register-count\", "
+                "\"io-aware\", and \"io-aware-regularized\".";
   return nullptr; // unreachable
 }
 

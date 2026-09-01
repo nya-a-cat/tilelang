@@ -19,7 +19,8 @@ from tilelang.contrib.nvcc import (
 )
 from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
 from tilelang.env import TILELANG_TEMPLATE_PATH
-from tilelang.contrib.hip_resource_info import filter_and_record
+from tilelang.contrib.cuda_resource_info import filter_and_record as filter_and_record_cuda
+from tilelang.contrib.hip_resource_info import filter_and_record as filter_and_record_hip
 
 from .utils import is_cpu_target, is_cuda_target, is_hip_target
 
@@ -112,8 +113,7 @@ class LibraryGenerator:
                 command += ["--use_fast_math"]
             if ptxas_usage_level is not None:
                 command += [f"--ptxas-options=--register-usage-level={int(ptxas_usage_level)}"]
-            if self.verbose:
-                command += ["--ptxas-options=--verbose"]
+            command += ["--resource-usage"]
             command += [
                 "-I" + CUTLASS_INCLUDE_DIR,
             ]
@@ -180,7 +180,7 @@ class LibraryGenerator:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
-        if is_hip_target(target):
+        if is_cuda_target(target) or is_hip_target(target):
             run_kwargs.setdefault("stdout", subprocess.PIPE)
             run_kwargs.setdefault("stderr", subprocess.STDOUT)
 
@@ -195,8 +195,12 @@ class LibraryGenerator:
             captured = ret.stdout.decode("utf-8", errors="replace") if ret.stdout else ""
             raise RuntimeError(f"Compilation Failed! {command}\n{captured}\n{self.lib_code}")
 
-        if is_hip_target(target) and ret.stdout is not None:
-            captured = filter_and_record(ret.stdout.decode("utf-8", errors="replace"))
+        if is_cuda_target(target) and ret.stdout is not None:
+            captured = filter_and_record_cuda(ret.stdout.decode("utf-8", errors="replace"))
+            if verbose and captured.strip():
+                print(captured)
+        elif is_hip_target(target) and ret.stdout is not None:
+            captured = filter_and_record_hip(ret.stdout.decode("utf-8", errors="replace"))
             if verbose and captured.strip():
                 print(captured)
 

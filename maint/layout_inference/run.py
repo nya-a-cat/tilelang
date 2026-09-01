@@ -2,10 +2,11 @@
 """Layout-inference verification driver.
 
 Each module under ``cases/`` constructs PrimFuncs whose free-mode layout
-search has a known-good answer.  This driver runs LayoutInference under
-both selection policies (``tl.layout_cost_model`` = "register-count" or
-"io-aware"), snapshots the inferred layouts, and compares them against
-the reviewed golden files under ``expected/``.
+search has a known-good answer.  This driver runs LayoutInference under the
+two endpoint policies (``tl.layout_cost_model`` = "register-count" or
+"io-aware"), snapshots the inferred layouts, and compares them against the
+reviewed golden files under ``expected/``. The regularized CUDA default is
+validated separately against these endpoints.
 
 Usage:
     python run.py                 # verify every case against goldens

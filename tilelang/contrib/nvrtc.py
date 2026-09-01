@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import re
 import cuda.bindings.nvrtc as nvrtc
 from typing import Literal
 from tvm.target import Target
@@ -11,10 +13,43 @@ def get_nvrtc_version() -> tuple[int, int]:
     return (major, minor)
 
 
+def get_nvrtc_arch_option(
+    target_format: Literal["ptx", "cubin"],
+    arch: int | str | None = None,
+) -> str:
+    """Return NVRTC's exact architecture option without inventing feature suffixes.
+
+    CUDA feature-specific targets such as ``100f`` and ``100a`` are distinct
+    compilation contracts.  Keep that suffix when the caller or current TVM
+    target supplied one; a bare integer remains a base architecture.
+    """
+    if target_format not in ["cubin", "ptx"]:
+        raise ValueError("target_format must be cubin or ptx")
+
+    if arch is None:
+        target = Target.current(allow_none=True)
+        if target is not None and "arch" in target.attrs:
+            arch = str(target.attrs["arch"])
+        else:
+            major, minor = parse_compute_version(get_target_compute_version(target))
+            arch = major * 10 + minor
+
+    arch_token = str(arch)
+    for prefix in ("sm_", "compute_"):
+        if arch_token.startswith(prefix):
+            arch_token = arch_token.removeprefix(prefix)
+            break
+    if re.fullmatch(r"[0-9]{2,3}[af]?", arch_token) is None:
+        raise ValueError("NVRTC arch must be an exact CUDA architecture token such as 80, 'sm_100', 'sm_100f', or 'sm_100a'.")
+
+    prefix = "compute" if target_format == "ptx" else "sm"
+    return f"--gpu-architecture={prefix}_{arch_token}"
+
+
 def compile_cuda(
     code: str,
     target_format: Literal["ptx", "cubin"] = "ptx",
-    arch: int | None = None,
+    arch: int | str | None = None,
     options: str | list[str] | None = None,
     verbose: bool = False,
 ) -> bytearray:
@@ -28,8 +63,9 @@ def compile_cuda(
     target_format : Literal["ptx", "cubin"]
         The target format of nvrtc compiler.
 
-    arch : Optional[int]
-        The cuda architecture code.
+    arch : Optional[Union[int, str]]
+        The exact CUDA architecture code. Feature suffixes are preserved, for
+        example ``"100f"`` or ``"sm_100a"``.
 
     options : Optional[Union[str, List[str]]]
         The additional options.
@@ -42,24 +78,13 @@ def compile_cuda(
     result_bytes : bytearray
         The bytearray of the cubin or ptx code.
     """
-    if arch is None:
-        # If None, then it will use `tvm.target.Target.current().arch`.
-        # Target arch could be a str like "80", "90", "90a", etc.
-        major, minor = parse_compute_version(get_target_compute_version(Target.current(allow_none=True)))
-        arch = major * 10 + minor
-    prefix = "compute" if target_format == "ptx" else "sm"
-    suffix = "a" if arch >= 90 else ""
-    arch_option = f"--gpu-architecture={prefix}_{arch}{suffix}"
+    arch_option = get_nvrtc_arch_option(target_format, arch)
 
     file_name = "tvm_kernels"
-    if target_format not in ["cubin", "ptx"]:
-        raise ValueError("target_format must be cubin or ptx")
-
     final_options = ["-default-device"]
     if get_nvrtc_version() >= (12, 8):
         final_options += ["-pch"]
-    if arch is not None:
-        final_options += [arch_option]
+    final_options += [arch_option]
 
     if options:
         if isinstance(options, str):

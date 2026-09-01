@@ -20,6 +20,7 @@ from tvm.base import py_str
 from tvm.contrib import utils
 from tilelang import logger
 from .cc import get_cplus_compiler
+from .cuda_resource_info import filter_and_record
 
 
 def get_nvcc_subprocess_env() -> dict[str, str] | None:
@@ -199,12 +200,15 @@ def compile_cuda(code, target_format="ptx", arch=None, options=None, path_target
             msg += f"Output:\n{captured}\n"
         raise RuntimeError(msg) from exc
 
+    output_text = filter_and_record(py_str(out))
+
     if verbose:
         logger.info("NVCC compilation command: %s", " ".join(cmd))
-        logger.info("PTXAS verbose output:\n%s", py_str(out))
+        if output_text.strip():
+            logger.info("NVCC diagnostic output:\n%s", output_text)
 
     if proc.returncode != 0:
-        msg = f"{code}\nCompilation error:\n{py_str(out)}\nCommand: {' '.join(cmd)}\n"
+        msg = f"{code}\nCompilation error:\n{output_text}\nCommand: {' '.join(cmd)}\n"
         if os.name == "nt":
             from tilelang.contrib.msvc import get_msvc_environment_error
 
@@ -573,20 +577,17 @@ def have_tensorcore(compute_version=None, target=None):
         isn't specified.
     """
     if compute_version is None:
-        if tvm.cuda(0).exist:
-            compute_version = tvm.cuda(0).compute_version
-        else:
-            if target is None or "arch" not in target.attrs:
-                warnings.warn(
-                    "Tensorcore will be disabled due to no CUDA architecture specified. "
-                    "Specify it with a target config such as {'kind': 'cuda', 'arch': 'sm_90'}.",
-                    stacklevel=2,
-                )
-                return False
-            compute_version = target.attrs["arch"]
-            # Compute version will be in the form "sm_{major}{minor}"
-            major, minor = compute_version.split("_")[1]
-            compute_version = major + "." + minor
+        try:
+            # Keep all target spellings (including sm_100a/sm_103a/sm_120a)
+            # on the single parser used by the rest of the CUDA backend.
+            compute_version = get_target_compute_version(target)
+        except ValueError:
+            warnings.warn(
+                "Tensorcore will be disabled due to no CUDA architecture specified. "
+                "Specify it with a target config such as {'kind': 'cuda', 'arch': 'sm_90'}.",
+                stacklevel=2,
+            )
+            return False
     major, _ = parse_compute_version(compute_version)
     return major >= 7
 

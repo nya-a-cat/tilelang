@@ -33,6 +33,14 @@ static constexpr const char *kLocalVarInit = "tl.local_var_init";
 static constexpr const char *kNonRestrictParams = "tl.non_restrict_params";
 static constexpr const char *kLexicalAllocScope = "lexical_alloc_scope";
 
+// Marks a collective statement whose implementation begins with a shared-memory
+// barrier over `value` participating threads.  The marker is analysis-only: the
+// backend implementation still emits the actual barrier.  ThreadSync may
+// consume it as an existing synchronization boundary only after proving that
+// the participant count covers the physical CTA.
+static constexpr const char *kCollectiveLeadingBarrier =
+    "tl.collective_leading_barrier";
+
 } // namespace attr
 
 inline ffi::Optional<PrimExpr> GetAnnotatedMbarPhaseExpr(
@@ -81,11 +89,15 @@ static constexpr const char *kReducerForceBaseline =
 static constexpr const char *kEnableReducerPlanVerbose =
     "tl.enable_reducer_plan_verbose";
 // The cost model that ranks free-mode layout attempts, by name:
-// "register-count" (default) uses total fragment register slots;
+// "target-default" uses regularized IO-aware scoring on CUDA and preserves
+// register-count on other targets; "register-count" uses total fragment slots;
 // "io-aware" scores estimated global-memory access cost — vector width /
 // coalescing of every fragment<->global copy, weighted by bytes moved —
-// with register count as the tiebreak.
+// with register count as the tiebreak; "io-aware-regularized" adds a
+// byte-equivalent register-slot price to that traffic score.
 static constexpr const char *kLayoutCostModel = "tl.layout_cost_model";
+static constexpr const char *kEnableLayoutCostTrace =
+    "tl.enable_layout_cost_trace";
 static constexpr const char *kEnableVectorizePlannerVerbose =
     "tl.enable_vectorize_planner_verbose";
 static constexpr const char *kDisableLoopUnswitching =

@@ -2635,7 +2635,7 @@ Stmt Im2Col::Lower(const Im2ColOpNode &op, const LowerArgs &lower_args,
   const Buffer &src = op.src_;
   const Buffer &dst = op.dst_;
 
-  ICHECK(TargetIsHopper(lower_args.target));
+  ICHECK(TargetHasBulkCopy(lower_args.target));
   ICHECK(IsGlobalBuffer(src) && IsSharedBuffer(dst));
   ICHECK(src->shape.size() == 4);
   ICHECK(src->dtype == dst->dtype);
@@ -2810,7 +2810,7 @@ bool RegisterCudaIm2Col() {
   RegisterIm2ColImpl(Im2ColImpl{
       "cuda.Im2Col",
       [](Target target) {
-        return MatchCudaCopyTarget(target) && TargetIsHopper(target);
+        return MatchCudaCopyTarget(target) && TargetHasBulkCopy(target);
       },
       100,
       cuda::Im2Col::Lower,

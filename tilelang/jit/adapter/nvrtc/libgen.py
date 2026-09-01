@@ -28,6 +28,7 @@ from tilelang.jit.adapter.libgen import LibraryGenerator
 from tilelang.jit.adapter.utils import is_cuda_target
 from tilelang.jit.adapter.nvrtc import is_nvrtc_available, NVRTC_UNAVAILABLE_MESSAGE
 from tilelang.jit.adapter.nvrtc.include_paths import discover_cuda_include_paths
+from tilelang.contrib.nvcc import get_target_arch_and_code
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +213,14 @@ class NVRTCLibraryGenerator(LibraryGenerator):
             if self.compile_flags:
                 options += [item for flag in self.compile_flags for item in flag.split() if item not in options]
 
-            cubin_bytes = compile_cuda(self.lib_code, target_format="cubin", options=options, verbose=verbose)
+            target_arch, _ = get_target_arch_and_code(target)
+            cubin_bytes = compile_cuda(
+                self.lib_code,
+                target_format="cubin",
+                arch=target_arch,
+                options=options,
+                verbose=verbose,
+            )
             with open(libpath, "wb") as f:
                 f.write(cubin_bytes)
 

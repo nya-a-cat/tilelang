@@ -14,7 +14,9 @@ from tilelang.autotuner.param import (
     KERNEL_LIB_PATH,
     KERNEL_PY_PATH,
     PARAMS_PATH,
+    RESOURCE_USAGE_PATH,
 )
+from tilelang.contrib.kernel_resource_info import KernelResourceUsage, load_from_file
 from tilelang.env import env
 
 
@@ -87,6 +89,17 @@ def test_autotune_save_rewrites_incomplete_cache_dir(cache_dirs, tmp_path):
     ):
         assert (path / filename).exists()
     assert not (path / "stale.txt").exists()
+
+
+def test_autotune_save_persists_optional_compiler_resource_usage(cache_dirs, tmp_path):
+    result = _make_result(tmp_path)
+    result.kernel._resource_usage = {"kernel": KernelResourceUsage(n_regs=64, shared_bytes=8192, barrier_count=2, arch="sm_90a")}
+    path = cache_dirs / "test-namespace" / "autotuner" / "autotune-resource-entry"
+
+    result.save_to_disk(path)
+    restored = load_from_file(str(path / RESOURCE_USAGE_PATH))
+
+    assert restored == result.kernel._resource_usage
 
 
 def test_autotune_save_logs_write_oserror_instead_of_treating_it_as_race(cache_dirs, tmp_path, monkeypatch):

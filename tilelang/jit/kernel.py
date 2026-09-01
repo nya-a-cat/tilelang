@@ -20,7 +20,10 @@ from tilelang.jit.adapter import (
 )
 from tilelang.profiler import Profiler, TensorSupplyType
 from tilelang.contrib import nvcc as tl_nvcc
-from tilelang.contrib.hip_resource_info import pop_recorded, reset_recorder
+from tilelang.contrib.cuda_resource_info import pop_recorded as pop_cuda_resource_usage
+from tilelang.contrib.cuda_resource_info import reset_recorder as reset_cuda_resource_usage
+from tilelang.contrib.hip_resource_info import pop_recorded as pop_hip_resource_usage
+from tilelang.contrib.hip_resource_info import reset_recorder as reset_hip_resource_usage
 from tilelang.jit.abi import prepare_tvm_ffi_callee_allocated_outputs
 from tilelang.jit.diagnostics import jit_phase
 from tilelang.transform import PassConfigKey
@@ -239,9 +242,12 @@ class JITKernel(Generic[_P, _T]):
                     compile_flags_cfg + compile_flags if compile_flags_cfg is not None else compile_flags
                 )
 
+            capture_cuda_resource_usage = is_cuda_target(target)
             capture_hip_resource_usage = is_hip_target(target)
-            if capture_hip_resource_usage:
-                reset_recorder()
+            if capture_cuda_resource_usage:
+                reset_cuda_resource_usage()
+            elif capture_hip_resource_usage:
+                reset_hip_resource_usage()
 
             compile_metadata = {
                 "kernel": func_name,
@@ -258,8 +264,10 @@ class JITKernel(Generic[_P, _T]):
                 compile_metadata,
             )
 
-            if capture_hip_resource_usage:
-                self._resource_usage = pop_recorded()
+            if capture_cuda_resource_usage:
+                self._resource_usage = pop_cuda_resource_usage()
+            elif capture_hip_resource_usage:
+                self._resource_usage = pop_hip_resource_usage()
 
             return adapter
 
@@ -705,7 +713,7 @@ class JITKernel(Generic[_P, _T]):
 
     @property
     def resource_usage(self) -> dict[str, Any]:
-        """HIP only now"""
+        """Per-entry compiler resource usage when supported by the target."""
         return getattr(self, "_resource_usage", {}) or {}
 
     def _primary_resource_usage(self):
@@ -733,6 +741,41 @@ class JITKernel(Generic[_P, _T]):
     def n_max_threads(self) -> int | None:
         info = self._primary_resource_usage()
         return info.n_max_threads if info is not None else None
+
+    @property
+    def shared_bytes(self) -> int | None:
+        info = self._primary_resource_usage()
+        return info.shared_bytes if info is not None else None
+
+    @property
+    def stack_frame_bytes(self) -> int | None:
+        info = self._primary_resource_usage()
+        return info.stack_frame_bytes if info is not None else None
+
+    @property
+    def spill_store_bytes(self) -> int | None:
+        info = self._primary_resource_usage()
+        return info.spill_store_bytes if info is not None else None
+
+    @property
+    def spill_load_bytes(self) -> int | None:
+        info = self._primary_resource_usage()
+        return info.spill_load_bytes if info is not None else None
+
+    @property
+    def constant_bytes(self) -> int | None:
+        info = self._primary_resource_usage()
+        return info.constant_bytes if info is not None else None
+
+    @property
+    def local_bytes(self) -> int | None:
+        info = self._primary_resource_usage()
+        return info.local_bytes if info is not None else None
+
+    @property
+    def barrier_count(self) -> int | None:
+        info = self._primary_resource_usage()
+        return info.barrier_count if info is not None else None
 
     def export_library(self, kernel_file: str) -> None:
         """

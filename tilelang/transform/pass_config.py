@@ -114,12 +114,22 @@ class PassConfigKey(str, Enum):
 
     TL_LAYOUT_COST_MODEL = "tl.layout_cost_model"
     """The cost model that ranks free-mode layout attempts, by name:
+    "target-default" uses the single-lowering io-aware-regularized model on
+    CUDA and preserves register-count on other targets;
+    "io-aware-regularized" adds a byte-equivalent fragment-register price to
+    the IO score so small or register-heavy kernels retain compact layouts;
     "io-aware" scores estimated global-memory access cost (vector width /
     warp coalescing of every fragment<->global copy, weighted by bytes
     moved) with register count as the tiebreak; "register-count" is the
     total-register-slots-only ordering. When unset, the
     ``TILELANG_LAYOUT_COST_MODEL`` environment variable supplies the
-    default. Default: 'register-count'"""
+    default. Built-in default: 'target-default'."""
+
+    TL_ENABLE_LAYOUT_COST_TRACE = "tl.enable_layout_cost_trace"
+    """Emit machine-readable INFO records for free-mode layout attempts and
+    the final selection. The trace decomposes the existing score into spill,
+    global-memory, bandwidth, issue-depth, and register-proxy fields without
+    changing candidate ordering. Default: False"""
 
     TL_REDUCER_FORCE_BASELINE = "tl.reducer_force_baseline"
     """Force the canonical FullParticipant baseline for every reducer epoch,

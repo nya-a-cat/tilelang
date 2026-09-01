@@ -34,6 +34,13 @@ using namespace ffi;
 
 namespace {
 
+// A short fixed mainloop is cheap to unroll and may benefit from eliminating
+// loop-control instructions.  Guard only the larger fixed-trip pipelines where
+// duplicating TMA/barrier/MMA bodies creates meaningful instruction-cache
+// pressure.  The threshold also keeps the policy conservative for small-K and
+// short-sequence kernels.
+constexpr int64_t kMinRolledPipelineTripCount = 8;
+
 bool IsValidCPAsyncTransferBytes(int64_t bytes) {
   return bytes == 4 || bytes == 8 || bytes == 16;
 }
@@ -754,6 +761,12 @@ std::string CodeGenTileLangCUDA::Finish() {
 }
 
 void CodeGenTileLangCUDA::VisitStmt_(const tirx::ForNode *op) {
+  const auto *extent_imm = op->extent.as<IntImmNode>();
+  bool should_roll_pipeline =
+      extent_imm != nullptr &&
+      extent_imm->value >= kMinRolledPipelineTripCount &&
+      (op->annotations.Get("tl_pipelined_num_stages") ||
+       op->annotations.Get("tl_no_implicit_unroll"));
   if (op->kind == tirx::ForKind::kUnrolled) {
     PrintIndent();
     if (unroll_factor.count(op->loop_var.get())) {
@@ -762,6 +775,14 @@ void CodeGenTileLangCUDA::VisitStmt_(const tirx::ForNode *op) {
     } else {
       stream << "#pragma unroll\n";
     }
+  } else if (should_roll_pipeline) {
+    // Keep a sufficiently long software-pipeline mainloop rolled unless the
+    // schedule asked for explicit unrolling.  NVCC otherwise fully unrolls
+    // common constant K-loop trip counts, duplicating async-copy/barrier/MMA
+    // sequences and inflating instruction-cache pressure.  Short fixed loops
+    // and inner loops marked kUnrolled retain their normal unroll behavior.
+    PrintIndent();
+    stream << "#pragma unroll 1\n";
   }
   std::string extent =
       PrintExpr(arith::Analyzer().Simplify(op->extent + op->min));
