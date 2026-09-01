@@ -1,6 +1,6 @@
 """Install an exact native overlay and run the regularized-policy A/B on Colab T4.
 
-The Colab CLI transmits this controller as one cell. Upload the three files in
+The Colab CLI transmits this controller as one cell. Upload the four files in
 ``SCRIPT_SHA256`` to ``WORK_DIR`` before execution. Every executable or Python
 input downloaded or uploaded for the run is hash checked before use.
 """
@@ -42,6 +42,7 @@ OVERLAY_ASSETS = {
 }
 SCRIPT_SHA256 = {
     "benchmark_layout_cost_models_t4.py": "5da1e8fb602f84e3d7bb17ad7c357412935eca379e2e21b261e70e07207d1a5f",
+    "benchmark_layout_normalization_policies_t4.py": "a424500185fbc76a32901527ee917e9116b743a5ec820c32cfb8d67a8117009a",
     "scan_layout_policy_divergence.py": "dd002155fa32d023d810965f816fde49232127c38975db4762db48ca7e4d3da6",
     "benchmark_layout_divergent_cases_t4.py": "c279f1496a48d1b595ffef8c9bef7531cad1f9e58f8cb0d8329bb1ed923c36f9",
 }
