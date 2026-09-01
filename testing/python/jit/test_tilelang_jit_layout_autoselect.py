@@ -105,7 +105,8 @@ def test_identical_generated_source_keeps_stable_register_policy(t4_profile):
 def test_missing_device_profile_and_cross_compile_fall_back_to_register(monkeypatch, t4_profile):
     register = _Kernel(_source(128, "register"), _Usage(n_regs=24))
     io_aware = _Kernel(_source(128, "io"), _Usage(n_regs=20))
-    monkeypatch.setattr("tilelang.jit.layout_autoselect.get_current_cuda_device_profile", lambda: None)
+    layout_module = importlib.import_module("tilelang.jit.layout_autoselect")
+    monkeypatch.setattr(layout_module, "get_current_cuda_device_profile", lambda: None)
 
     selected_without_device = select_compiled_layout(register, io_aware)
     assert selected_without_device is register
