@@ -6,8 +6,6 @@ layout policies for explicit CUDA architecture targets.  This script performs
 no device compilation or execution.
 """
 
-from __future__ import annotations
-
 import argparse
 from dataclasses import dataclass
 import hashlib
