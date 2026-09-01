@@ -38,6 +38,8 @@ jobs:
       CANDIDATE_RELEASE_TAG: colab-fast-4df968c3a85e723dc1870c62a0745284660bffd3
       CANDIDATE_WHEEL_NAME: tilelang-0.1.13+cu130.git4df968c3-cp39-abi3-linux_x86_64.whl
       CANDIDATE_WHEEL_SHA256: f3ddcaa79cb10a5b61f4c8ed2eb6941fb30a3f53ddb45aeff2008b6824835f82
+      NVDISASM_DEB_URL: https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-nvdisasm-13-0_13.0.85-1_amd64.deb
+      NVDISASM_DEB_SHA256: a0edae45d1debe83291254405afa1ee95a1f653e1fc59ea2cc6ffff6f49eefb5
 
     steps:
       - name: Checkout exact diagnostic source
@@ -92,6 +94,44 @@ jobs:
           python-version: "3.13"
           update-environment: true
 
+      - name: Restore exact nvdisasm package
+        id: nvdisasm-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/cuda-binary-utils
+          key: cuda-binary-utils-${{ runner.os }}-${{ runner.arch }}-nvdisasm-13.0.85-${{ env.NVDISASM_DEB_SHA256 }}
+
+      - name: Prepare verified nvdisasm
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_root="${GITHUB_WORKSPACE}/.cache/cuda-binary-utils"
+          package="${cache_root}/cuda-nvdisasm-13-0_13.0.85-1_amd64.deb"
+          extract_root="${cache_root}/extract"
+          mkdir -p "${cache_root}"
+          if [[ ! -f "${package}" ]] || ! echo "${NVDISASM_DEB_SHA256}  ${package}" | sha256sum --check --status; then
+            rm -f -- "${package}" "${package}.part"
+            curl --fail --location --retry 5 --output "${package}.part" "${NVDISASM_DEB_URL}"
+            echo "${NVDISASM_DEB_SHA256}  ${package}.part" | sha256sum --check --strict
+            mv -- "${package}.part" "${package}"
+          fi
+          echo "${NVDISASM_DEB_SHA256}  ${package}" | sha256sum --check --strict
+          rm -rf -- "${extract_root}"
+          mkdir -p "${extract_root}"
+          dpkg-deb --extract "${package}" "${extract_root}"
+          nvdisasm="$(find "${extract_root}" -type f -path '*/bin/nvdisasm' -print -quit)"
+          test -n "${nvdisasm}"
+          test -x "${nvdisasm}"
+          "${nvdisasm}" --version
+          echo "NVDISASM=${nvdisasm}" >> "${GITHUB_ENV}"
+
+      - name: Save verified nvdisasm package
+        if: steps.nvdisasm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/cuda-binary-utils
+          key: cuda-binary-utils-${{ runner.os }}-${{ runner.arch }}-nvdisasm-13.0.85-${{ env.NVDISASM_DEB_SHA256 }}
+
       - name: Download and verify frozen inputs
         shell: bash
         env:
@@ -120,7 +160,7 @@ jobs:
             --baseline-wheel "inputs/${BASELINE_WHEEL_NAME}" \
             --candidate-wheel "inputs/${CANDIDATE_WHEEL_NAME}" \
             --nvcc "${CUDA_HOME}/bin/nvcc" \
-            --nvdisasm "${CUDA_HOME}/bin/nvdisasm" \
+            --nvdisasm "${NVDISASM}" \
             --cuda-home "${CUDA_HOME}" \
             --work-dir "work/static-sass" \
             --output-dir evidence
