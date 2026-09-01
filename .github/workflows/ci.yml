@@ -61,6 +61,11 @@ jobs:
         run: |
           "${{ steps.setup-pylowest.outputs.python-path }}" -m compileall -q -f tilelang
 
+      - name: Validate frozen backend benchmark manifest
+        run: |
+          "${{ steps.setup-pylowest.outputs.python-path }}" \
+            benchmark/research/backend_benchmark_manifest.py validate
+
       - name: Restore fork pre-commit environments
         id: restore-fork-precommit
         if: github.event_name == 'workflow_dispatch' && github.repository_owner != 'tile-ai'

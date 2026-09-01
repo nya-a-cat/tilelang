@@ -1,0 +1,500 @@
+{
+  "schema": "tilelang-backend-benchmark-manifest-v1",
+  "status": "frozen",
+  "frozen_at": "2026-09-01",
+  "repository": "nya-a-cat/tilelang",
+  "baseline": {
+    "commit": "958d6d3bd24a31874a2bb189a9791347e855eecd",
+    "comparison_contract": "The baseline and candidate receive byte-identical TileLang programs, explicit schedules, inputs, output allocation, toolchain versions, and tuning budgets. Only the checked-out TileLang compiler and runtime commit changes."
+  },
+  "tiers": [
+    {
+      "id": "presubmit_static",
+      "paid": false,
+      "purpose": "Manifest validation, Python syntax, native unit tests, and compile-only lowering for portable targets."
+    },
+    {
+      "id": "free_t4_screen",
+      "paid": false,
+      "purpose": "Early correctness and runtime rejection on a free Colab T4. Results are advisory because SM75 is outside the required main-score architectures."
+    },
+    {
+      "id": "main_operator",
+      "paid": true,
+      "purpose": "Frozen operator and layout matrix on every supported required architecture."
+    },
+    {
+      "id": "main_subgraph",
+      "paid": true,
+      "purpose": "Frozen multi-operator and fusion patterns on every supported required architecture."
+    },
+    {
+      "id": "main_model",
+      "paid": true,
+      "purpose": "Pinned end-to-end model inference and training-step workloads."
+    },
+    {
+      "id": "main_external_suite",
+      "paid": true,
+      "purpose": "Pinned independent benchmark suites and real-world workload collections."
+    }
+  ],
+  "portable_compile_targets": [
+    "sm_80",
+    "sm_90",
+    "sm_100",
+    "sm_120",
+    "gfx942"
+  ],
+  "hardware": [
+    {
+      "id": "t4_sm75",
+      "backend": "cuda",
+      "architecture": "sm_75",
+      "representative": "NVIDIA Tesla T4",
+      "required_for_primary_score": false,
+      "role": "free_screen"
+    },
+    {
+      "id": "a100_sm80",
+      "backend": "cuda",
+      "architecture": "sm_80",
+      "representative": "NVIDIA A100 80GB",
+      "required_for_primary_score": true,
+      "role": "main"
+    },
+    {
+      "id": "h100_sm90a",
+      "backend": "cuda",
+      "architecture": "sm_90a",
+      "representative": "NVIDIA H100 80GB",
+      "required_for_primary_score": true,
+      "role": "main"
+    },
+    {
+      "id": "b200_sm100a",
+      "backend": "cuda",
+      "architecture": "sm_100a",
+      "representative": "NVIDIA B200",
+      "required_for_primary_score": true,
+      "role": "main"
+    },
+    {
+      "id": "rtx5090_sm120",
+      "backend": "cuda",
+      "architecture": "sm_120",
+      "representative": "NVIDIA GeForce RTX 5090",
+      "required_for_primary_score": true,
+      "role": "main"
+    },
+    {
+      "id": "mi300x_gfx942",
+      "backend": "rocm",
+      "architecture": "gfx942",
+      "representative": "AMD Instinct MI300X 192GB",
+      "required_for_primary_score": true,
+      "role": "main"
+    },
+    {
+      "id": "l40s_sm89",
+      "backend": "cuda",
+      "architecture": "sm_89",
+      "representative": "NVIDIA L40S",
+      "required_for_primary_score": false,
+      "role": "expansion"
+    },
+    {
+      "id": "b300_sm103a",
+      "backend": "cuda",
+      "architecture": "sm_103a",
+      "representative": "NVIDIA B300",
+      "required_for_primary_score": false,
+      "role": "expansion"
+    }
+  ],
+  "protocol": {
+    "environment_isolation": {
+      "separate_worktrees": true,
+      "separate_python_environments": true,
+      "separate_tilelang_cache_dirs": true,
+      "record_driver_compiler_torch_device_clocks": true
+    },
+    "correctness": {
+      "reference_required": true,
+      "fixed_random_seeds": [0, 1, 17, 200],
+      "boundary_and_extreme_inputs_required": true,
+      "compute_sanitizer_memcheck_and_racecheck_before_timing": true,
+      "tolerances_are_case_specific": true,
+      "unsupported_or_failed_cases_count_as_failures": true
+    },
+    "timing": {
+      "paired_order_even": ["baseline", "candidate", "candidate", "baseline"],
+      "paired_order_odd": ["candidate", "baseline", "baseline", "candidate"],
+      "paired_cycles_min": 30,
+      "warmup_seconds_min_per_variant_mode": 1.0,
+      "sample_seconds_min_per_variant_mode": 3.0,
+      "statistics": ["p50", "p90", "p99"],
+      "launch_modes": ["eager", "cuda_graph"],
+      "cache_modes": ["hot_l2", "cold_l2"],
+      "primary_latency": "paired CUDA-event p50; CUDA Graph is a separately reported primary slice",
+      "nsight_compute_wall_time_is_explanatory_only": true
+    },
+    "tuning": {
+      "round_1": "fixed identical schedule",
+      "round_2": "independent autotuning with identical candidate and wall-clock budgets",
+      "record_compile_jit_and_tuning_wall_time": true,
+      "cache_hit_and_cold_compile_reported_separately": true
+    },
+    "aggregation": {
+      "speedup_definition": "baseline_p50_ms / candidate_p50_ms",
+      "order": [
+        "geomean repetitions into case",
+        "geomean shapes and dtypes into workload family",
+        "geomean families into layer",
+        "geomean layers into architecture",
+        "geomean required architectures into overall score"
+      ],
+      "equal_weight_within_each_level": true,
+      "primary_layers": ["operator", "subgraph", "model", "external_suite"]
+    },
+    "acceptance": {
+      "overall_hierarchical_geomean_min": 1.5,
+      "per_required_architecture_geomean_min": 1.0,
+      "per_primary_layer_geomean_min": 1.0,
+      "critical_case_speedup_min": 0.97,
+      "correctness_pass_fraction": 1.0,
+      "required_architecture_completion_fraction": 1.0
+    }
+  },
+  "sources": [
+    {
+      "id": "triton_mapl_2019",
+      "kind": "paper",
+      "url": "https://research.ibm.com/publications/triton-an-intermediate-language-and-compiler-for-tiled-neural-network-computations",
+      "benchmark_design_used": "Matrix multiplication, convolution, and shift convolution against vendor libraries."
+    },
+    {
+      "id": "ansor_osdi_2020",
+      "kind": "paper_with_talk",
+      "url": "https://www.usenix.org/conference/osdi20/presentation/zheng",
+      "benchmark_design_used": "Three levels: 80 single-operator cases, Conv-BN-ReLU and transpose-batch-matmul-softmax subgraphs, then five end-to-end networks; equal measurement-trial budgets and geometric means."
+    },
+    {
+      "id": "roller_osdi_2022",
+      "kind": "paper_with_talk",
+      "url": "https://www.usenix.org/conference/osdi22/presentation/zhu",
+      "benchmark_design_used": "119 high-frequency operator instances from real models, compilation time, multiple GPUs, and four end-to-end models."
+    },
+    {
+      "id": "welder_osdi_2023",
+      "kind": "paper_with_talk",
+      "url": "https://www.usenix.org/conference/osdi23/presentation/shi",
+      "benchmark_design_used": "Ten models spanning CNN, Transformer, CNN-Transformer, MLP, NLP, speech, 3D, restoration, and super-resolution; batch 1/64, warm-up, at least five seconds timing, geometric mean."
+    },
+    {
+      "id": "tilelang_arxiv_2504_17577_v2",
+      "kind": "paper",
+      "url": "https://arxiv.org/html/2504.17577",
+      "benchmark_design_used": "Exact decode and large GEMM shapes, five FlashAttention shapes, and twelve Mamba-2 chunk-scan/chunk-state shapes on H100, A100, and MI300X."
+    },
+    {
+      "id": "tilelang_iclr_2026",
+      "kind": "paper",
+      "url": "https://openreview.net/forum?id=Jb1WkNSfUB",
+      "benchmark_design_used": "Nine modern kernels: GEMM, WINT4AFP16 dequant GEMM, attention, MLA, block-sparse attention, Conv2D, chunk Gated DeltaNet, vertical-slash sparse attention, and attention sink on H100 and MI300X."
+    },
+    {
+      "id": "tileops_2026_09_01",
+      "kind": "official_repository",
+      "url": "https://github.com/tile-ai/TileOPs",
+      "commit": "8d990016e1095b9c771ac56d034a484afb14d845",
+      "benchmark_design_used": "Spec-driven workload manifests, reference correctness, roofline efficiency, and broad operator families including attention, GEMM, convolution, normalization, MoE, reduction, scan, Mamba, and sequence modeling."
+    },
+    {
+      "id": "tilegym_2026_09_01",
+      "kind": "official_repository",
+      "url": "https://github.com/NVIDIA/TileGym",
+      "commit": "077eee3bd6d64f039a1a631b7bd1c21a37534766",
+      "benchmark_design_used": "B200 microbenchmarks for BMM, dropout, attention, grouped and persistent GEMM, LayerNorm, MLA, RMSNorm, RoPE, Softmax, SwiGLU, plus Llama 3.1 and DeepSeek V2 integration."
+    },
+    {
+      "id": "meta_tritonbench_2026_09_01",
+      "kind": "official_repository",
+      "url": "https://github.com/meta-pytorch/tritonbench",
+      "commit": "1c3fed689fc4fcb589193514d753ebc4412eb44f",
+      "benchmark_design_used": "Real PyTorch custom operators with example inputs and multiple optimized implementation baselines, including TileLang, FlashAttention, CUTLASS, ThunderKittens, FBGEMM, and AITer."
+    },
+    {
+      "id": "kernelbench_2026_09_01",
+      "kind": "official_repository_and_paper",
+      "url": "https://github.com/ScalingIntelligence/KernelBench",
+      "commit": "423217d9fda91e0c2d67e4a43bf62f96f6d104f1",
+      "benchmark_design_used": "Verified Level 1 single kernels, Level 2 fused patterns, and Level 3 model architectures with correctness and speedup scoring."
+    },
+    {
+      "id": "sol_execbench_2026_09_01",
+      "kind": "official_repository_and_paper",
+      "url": "https://github.com/NVIDIA/SOL-ExecBench",
+      "commit": "a9fa0804c793d438e70850c33fe34426e66d53dd",
+      "benchmark_design_used": "235 real-world kernel problems from 124 language, diffusion, vision, audio, video, and hybrid models, reference correctness, reproducible timing, and B200 speed-of-light scoring."
+    }
+  ],
+  "workloads": [
+    {
+      "id": "layout_and_elementwise",
+      "layer": "operator",
+      "family": "layout_elementwise",
+      "source_ids": ["roller_osdi_2022", "tileops_2026_09_01"],
+      "implementation_status": "in_tree",
+      "driver": "benchmark/research/benchmark_layout_divergent_cases_t4.py",
+      "tiers": ["free_t4_screen", "main_operator"],
+      "hardware": ["t4_sm75", "a100_sm80", "h100_sm90a", "b200_sm100a", "rtx5090_sm120", "mi300x_gfx942", "l40s_sm89", "b300_sm103a"],
+      "dtypes": ["encoded_in_case"],
+      "modes": ["eager", "cuda_graph"],
+      "cases": [
+        {"id": "row_broadcast_f32_2x2560_t256"},
+        {"id": "row_broadcast_f32_4x1024_t128"},
+        {"id": "row_broadcast_f32_8x512_t128"},
+        {"id": "row_broadcast_f32_16x256_t128"},
+        {"id": "row_broadcast_f32_4x4096_t256"},
+        {"id": "column_broadcast_float16_64x256_t128"},
+        {"id": "column_broadcast_float32_128x128_t128"},
+        {"id": "mixed_f16_f32_64x64_t128"},
+        {"id": "mixed_f16_f32_128x128_t128"},
+        {"id": "mixed_f16_f32_64x256_t128"},
+        {"id": "mixed_f16_f32_128x256_t256"},
+        {"id": "affine_float16_32x128_t128"},
+        {"id": "affine_float16_64x128_t128"},
+        {"id": "affine_float32_32x128_t128"},
+        {"id": "affine_float32_64x256_t256"},
+        {"id": "transpose_float16_128x128_t128"},
+        {"id": "transpose_float16_128x256_t256"},
+        {"id": "transpose_float32_128x128_t128"}
+      ]
+    },
+    {
+      "id": "reduction_and_normalization",
+      "layer": "operator",
+      "family": "reduction_normalization",
+      "source_ids": ["ansor_osdi_2020", "roller_osdi_2022", "tilegym_2026_09_01", "tileops_2026_09_01"],
+      "implementation_status": "partial_in_tree",
+      "tiers": ["free_t4_screen", "main_operator"],
+      "hardware": ["t4_sm75", "a100_sm80", "h100_sm90a", "b200_sm100a", "rtx5090_sm120", "mi300x_gfx942", "l40s_sm89", "b300_sm103a"],
+      "dtypes": ["float16", "bfloat16", "float32", "int32"],
+      "modes": ["eager", "cuda_graph"],
+      "cases": [
+        {"id": "reduce_sum_b1_n128", "params": {"op": "sum", "batch": 1, "n": 128}},
+        {"id": "reduce_max_b4_n1024", "params": {"op": "max", "batch": 4, "n": 1024}},
+        {"id": "reduce_min_b8_n4096", "params": {"op": "min", "batch": 8, "n": 4096}},
+        {"id": "reduce_abs_sum_b4_n16384", "params": {"op": "abs_sum", "batch": 4, "n": 16384}},
+        {"id": "reduce_bitwise_b8_n4096", "params": {"op": "bitwise", "batch": 8, "n": 4096}},
+        {"id": "softmax_b1_h128", "params": {"batch": 1, "hidden": 128}},
+        {"id": "softmax_b32_h4096", "params": {"batch": 32, "hidden": 4096}},
+        {"id": "softmax_b1280_h16384", "params": {"batch": 1280, "hidden": 16384}},
+        {"id": "rmsnorm_b1_h128", "params": {"batch": 1, "hidden": 128}},
+        {"id": "rmsnorm_b32_h4096", "params": {"batch": 32, "hidden": 4096}},
+        {"id": "rmsnorm_b1280_h8192", "params": {"batch": 1280, "hidden": 8192}},
+        {"id": "layernorm_b1280_h4096", "params": {"batch": 1280, "hidden": 4096}}
+      ]
+    },
+    {
+      "id": "dense_gemm_tilelang_paper",
+      "layer": "operator",
+      "family": "dense_gemm",
+      "source_ids": ["triton_mapl_2019", "tilelang_arxiv_2504_17577_v2", "tilelang_iclr_2026"],
+      "implementation_status": "adapter_required",
+      "tiers": ["main_operator"],
+      "hardware": ["a100_sm80", "h100_sm90a", "b200_sm100a", "rtx5090_sm120", "mi300x_gfx942", "l40s_sm89", "b300_sm103a"],
+      "dtypes": ["float16", "bfloat16"],
+      "modes": ["eager", "cuda_graph"],
+      "cases": [
+        {"id": "gemm_v0", "params": {"m": 1, "n": 16384, "k": 16384}},
+        {"id": "gemm_v1", "params": {"m": 1, "n": 43008, "k": 14336}},
+        {"id": "gemm_v2", "params": {"m": 1, "n": 14336, "k": 14336}},
+        {"id": "gemm_v3", "params": {"m": 1, "n": 57344, "k": 14336}},
+        {"id": "gemm_v4", "params": {"m": 1, "n": 14336, "k": 57344}},
+        {"id": "gemm_v5", "params": {"m": 1, "n": 9216, "k": 9216}},
+        {"id": "gemm_v6", "params": {"m": 1, "n": 36864, "k": 9216}},
+        {"id": "gemm_v7", "params": {"m": 1, "n": 9216, "k": 36864}},
+        {"id": "gemm_m0", "params": {"m": 4096, "n": 1024, "k": 8192}},
+        {"id": "gemm_m1", "params": {"m": 4096, "n": 8192, "k": 8192}},
+        {"id": "gemm_m2", "params": {"m": 4096, "n": 28672, "k": 8192}},
+        {"id": "gemm_m3", "params": {"m": 4096, "n": 8192, "k": 28672}},
+        {"id": "gemm_m4", "params": {"m": 8192, "n": 1024, "k": 8192}},
+        {"id": "gemm_m5", "params": {"m": 8192, "n": 8192, "k": 8192}},
+        {"id": "gemm_m6", "params": {"m": 8192, "n": 28672, "k": 8192}},
+        {"id": "gemm_m7", "params": {"m": 8192, "n": 8192, "k": 28672}}
+      ]
+    },
+    {
+      "id": "low_precision_and_grouped_gemm",
+      "layer": "operator",
+      "family": "low_precision_gemm",
+      "source_ids": ["tilelang_iclr_2026", "tilegym_2026_09_01", "tileops_2026_09_01"],
+      "implementation_status": "adapter_required",
+      "tiers": ["main_operator"],
+      "hardware": ["a100_sm80", "h100_sm90a", "b200_sm100a", "rtx5090_sm120", "mi300x_gfx942", "l40s_sm89", "b300_sm103a"],
+      "dtypes": ["wint4_afp16", "fp8", "mxfp8", "nvfp4_where_supported"],
+      "modes": ["eager", "cuda_graph"],
+      "cases": [
+        {"id": "dequant_v0", "params": {"m": 1, "n": 1024, "k": 8192}},
+        {"id": "dequant_v1", "params": {"m": 1, "n": 8192, "k": 8192}},
+        {"id": "dequant_v2", "params": {"m": 1, "n": 28672, "k": 8192}},
+        {"id": "dequant_v3", "params": {"m": 1, "n": 8192, "k": 28672}},
+        {"id": "grouped_gemm_8x_decode", "params": {"groups": 8, "m_per_group": 1, "n": 7168, "k": 2048}},
+        {"id": "grouped_gemm_64x_prefill", "params": {"groups": 64, "m_per_group": 32, "n": 4096, "k": 4096}}
+      ]
+    },
+    {
+      "id": "convolution",
+      "layer": "operator",
+      "family": "convolution",
+      "source_ids": ["triton_mapl_2019", "ansor_osdi_2020", "roller_osdi_2022", "tilelang_iclr_2026"],
+      "implementation_status": "adapter_required",
+      "tiers": ["main_operator"],
+      "hardware": ["a100_sm80", "h100_sm90a", "b200_sm100a", "rtx5090_sm120", "mi300x_gfx942", "l40s_sm89", "b300_sm103a"],
+      "dtypes": ["float16", "bfloat16", "float32"],
+      "modes": ["eager", "cuda_graph"],
+      "cases": [
+        {"id": "conv0", "params": {"n": 128, "c": 2048, "h": 7, "w": 7, "f": 512, "k": 1, "stride": 1, "padding": 0}},
+        {"id": "conv1", "params": {"n": 128, "c": 512, "h": 7, "w": 7, "f": 2048, "k": 1, "stride": 1, "padding": 0}},
+        {"id": "conv2", "params": {"n": 128, "c": 512, "h": 14, "w": 14, "f": 512, "k": 3, "stride": 2, "padding": 1}},
+        {"id": "conv3", "params": {"n": 128, "c": 512, "h": 7, "w": 7, "f": 512, "k": 3, "stride": 1, "padding": 1}},
+        {"id": "conv4", "params": {"n": 128, "c": 256, "h": 14, "w": 14, "f": 256, "k": 3, "stride": 1, "padding": 1}},
+        {"id": "conv5", "params": {"n": 128, "c": 1024, "h": 14, "w": 14, "f": 256, "k": 1, "stride": 1, "padding": 0}},
+        {"id": "conv6", "params": {"n": 128, "c": 512, "h": 28, "w": 28, "f": 128, "k": 1, "stride": 1, "padding": 0}},
+        {"id": "conv7", "params": {"n": 128, "c": 64, "h": 56, "w": 56, "f": 64, "k": 1, "stride": 1, "padding": 0}}
+      ]
+    },
+    {
+      "id": "attention",
+      "layer": "operator",
+      "family": "attention",
+      "source_ids": ["tilelang_arxiv_2504_17577_v2", "tilelang_iclr_2026", "tilegym_2026_09_01", "tileops_2026_09_01"],
+      "implementation_status": "partial_in_tree",
+      "tiers": ["main_operator"],
+      "hardware": ["a100_sm80", "h100_sm90a", "b200_sm100a", "rtx5090_sm120", "mi300x_gfx942", "l40s_sm89", "b300_sm103a"],
+      "dtypes": ["float16", "bfloat16"],
+      "modes": ["eager", "cuda_graph"],
+      "cases": [
+        {"id": "fa0", "params": {"batch": 1, "heads": 32, "seq": 512, "head_dim": 128, "causal": true}},
+        {"id": "fa1", "params": {"batch": 1, "heads": 32, "seq": 512, "head_dim": 128, "causal": false}},
+        {"id": "fa2", "params": {"batch": 1, "heads": 32, "seq": 1024, "head_dim": 128, "causal": true}},
+        {"id": "fa3", "params": {"batch": 1, "heads": 32, "seq": 1024, "head_dim": 128, "causal": false}},
+        {"id": "fa4", "params": {"batch": 1, "heads": 32, "seq": 4096, "head_dim": 128, "causal": true}},
+        {"id": "gqa_decode_b1_ctx4096", "params": {"batch": 1, "q_heads": 32, "kv_heads": 8, "query": 1, "context": 4096, "head_dim": 128}},
+        {"id": "gqa_prefill_b8_s4096", "params": {"batch": 8, "q_heads": 32, "kv_heads": 8, "query": 4096, "context": 4096, "head_dim": 128}},
+        {"id": "mla_decode_ctx8192", "params": {"batch": 64, "heads": 128, "context": 8192, "head_dim": 512, "pe_dim": 64}},
+        {"id": "block_sparse_attention_90pct", "params": {"batch": 64, "heads": 64, "seq": 4096, "head_dim": 128, "sparsity": 0.9}},
+        {"id": "vertical_slash_sparse_attention", "params": {"batch": 8, "heads": 32, "seq": 8192, "head_dim": 128}},
+        {"id": "attention_sink_decode", "params": {"batch": 64, "heads": 32, "context": 8192, "head_dim": 128}}
+      ]
+    },
+    {
+      "id": "linear_attention_and_ssm",
+      "layer": "operator",
+      "family": "linear_attention_ssm",
+      "source_ids": ["tilelang_arxiv_2504_17577_v2", "tilelang_iclr_2026", "tilegym_2026_09_01", "tileops_2026_09_01"],
+      "implementation_status": "partial_in_tree",
+      "tiers": ["main_operator"],
+      "hardware": ["a100_sm80", "h100_sm90a", "b200_sm100a", "rtx5090_sm120", "mi300x_gfx942", "l40s_sm89", "b300_sm103a"],
+      "dtypes": ["float16", "bfloat16"],
+      "modes": ["eager", "cuda_graph"],
+      "cases": [
+        {"id": "mamba_chunk_scan_b1_s1024", "params": {"op": "chunk_scan", "batch": 1, "heads": 64, "seq": 1024, "head_dim": 64, "state": 128}},
+        {"id": "mamba_chunk_scan_b1_s2048", "params": {"op": "chunk_scan", "batch": 1, "heads": 64, "seq": 2048, "head_dim": 64, "state": 128}},
+        {"id": "mamba_chunk_scan_b1_s8192", "params": {"op": "chunk_scan", "batch": 1, "heads": 64, "seq": 8192, "head_dim": 64, "state": 128}},
+        {"id": "mamba_chunk_scan_b64_s1024", "params": {"op": "chunk_scan", "batch": 64, "heads": 64, "seq": 1024, "head_dim": 64, "state": 128}},
+        {"id": "mamba_chunk_scan_b64_s2048", "params": {"op": "chunk_scan", "batch": 64, "heads": 64, "seq": 2048, "head_dim": 64, "state": 128}},
+        {"id": "mamba_chunk_scan_b64_s8192", "params": {"op": "chunk_scan", "batch": 64, "heads": 64, "seq": 8192, "head_dim": 64, "state": 128}},
+        {"id": "mamba_chunk_state_b1_s1024", "params": {"op": "chunk_state", "batch": 1, "heads": 64, "seq": 1024, "head_dim": 64, "state": 128}},
+        {"id": "mamba_chunk_state_b1_s2048", "params": {"op": "chunk_state", "batch": 1, "heads": 64, "seq": 2048, "head_dim": 64, "state": 128}},
+        {"id": "mamba_chunk_state_b1_s8192", "params": {"op": "chunk_state", "batch": 1, "heads": 64, "seq": 8192, "head_dim": 64, "state": 128}},
+        {"id": "mamba_chunk_state_b64_s1024", "params": {"op": "chunk_state", "batch": 64, "heads": 64, "seq": 1024, "head_dim": 64, "state": 128}},
+        {"id": "mamba_chunk_state_b64_s2048", "params": {"op": "chunk_state", "batch": 64, "heads": 64, "seq": 2048, "head_dim": 64, "state": 128}},
+        {"id": "mamba_chunk_state_b64_s8192", "params": {"op": "chunk_state", "batch": 64, "heads": 64, "seq": 8192, "head_dim": 64, "state": 128}},
+        {"id": "chunk_gated_deltanet_b1_s8192", "params": {"batch": 1, "heads": 64, "seq": 8192, "head_dim": 64, "state": 128}}
+      ]
+    },
+    {
+      "id": "moe_and_routing",
+      "layer": "operator",
+      "family": "moe",
+      "source_ids": ["tileops_2026_09_01", "meta_tritonbench_2026_09_01", "sol_execbench_2026_09_01"],
+      "implementation_status": "adapter_required",
+      "tiers": ["main_operator"],
+      "hardware": ["a100_sm80", "h100_sm90a", "b200_sm100a", "rtx5090_sm120", "mi300x_gfx942", "l40s_sm89", "b300_sm103a"],
+      "dtypes": ["float16", "bfloat16", "fp8_where_supported", "nvfp4_where_supported"],
+      "modes": ["eager", "cuda_graph"],
+      "cases": [
+        {"id": "moe_topk_t32_e64", "params": {"tokens": 32, "experts": 64, "topk": 2}},
+        {"id": "moe_topk_t512_e64", "params": {"tokens": 512, "experts": 64, "topk": 8}},
+        {"id": "moe_topk_t4096_e256", "params": {"tokens": 4096, "experts": 256, "topk": 8}},
+        {"id": "moe_grouped_gemm_t128_e8", "params": {"tokens": 128, "experts": 8, "hidden": 4096, "intermediate": 14336}},
+        {"id": "moe_grouped_gemm_t2048_e64", "params": {"tokens": 2048, "experts": 64, "hidden": 4096, "intermediate": 14336}},
+        {"id": "moe_permute_unpermute_t4096", "params": {"tokens": 4096, "experts": 64, "topk": 8, "hidden": 4096}}
+      ]
+    },
+    {
+      "id": "paper_subgraphs",
+      "layer": "subgraph",
+      "family": "paper_fusion_patterns",
+      "source_ids": ["ansor_osdi_2020", "welder_osdi_2023"],
+      "implementation_status": "adapter_required",
+      "tiers": ["main_subgraph"],
+      "hardware": ["a100_sm80", "h100_sm90a", "b200_sm100a", "rtx5090_sm120", "mi300x_gfx942", "l40s_sm89", "b300_sm103a"],
+      "dtypes": ["float16", "bfloat16", "float32"],
+      "modes": ["eager", "cuda_graph"],
+      "cases": [
+        {"id": "conv_bn_relu_resnet_stem", "params": {"batch": 1, "channels": 64, "height": 112, "width": 112}},
+        {"id": "conv_bn_relu_resnet_body", "params": {"batch": 64, "channels": 256, "height": 56, "width": 56}},
+        {"id": "transpose_bmm_softmax_b1_s512", "params": {"batch": 1, "heads": 12, "seq": 512, "head_dim": 64}},
+        {"id": "transpose_bmm_softmax_b16_s1024", "params": {"batch": 16, "heads": 16, "seq": 1024, "head_dim": 64}},
+        {"id": "matmul_bias_gelu", "params": {"tokens": 2048, "hidden": 4096, "intermediate": 14336}},
+        {"id": "rmsnorm_qkv_rope", "params": {"tokens": 2048, "hidden": 4096, "heads": 32, "head_dim": 128}},
+        {"id": "dual_gemm_swiglu", "params": {"tokens": 256, "hidden": 4096, "intermediate": 14336}},
+        {"id": "moe_route_grouped_gemm_unroute", "params": {"tokens": 2048, "experts": 64, "topk": 8, "hidden": 4096, "intermediate": 14336}}
+      ]
+    },
+    {
+      "id": "pinned_models",
+      "layer": "model",
+      "family": "end_to_end_models",
+      "source_ids": ["ansor_osdi_2020", "welder_osdi_2023", "tilegym_2026_09_01", "sol_execbench_2026_09_01"],
+      "implementation_status": "integration_required",
+      "tiers": ["main_model"],
+      "hardware": ["a100_sm80", "h100_sm90a", "b200_sm100a", "rtx5090_sm120", "mi300x_gfx942", "l40s_sm89", "b300_sm103a"],
+      "dtypes": ["model_default_bf16_or_fp16"],
+      "modes": ["inference_eager", "inference_cuda_graph"],
+      "cases": [
+        {"id": "resnet50", "params": {"model": "microsoft/resnet-50", "revision": "34c2154c194f829b11125337b98c8f5f9965ff19", "batch": [1, 64], "image": 224}},
+        {"id": "vit_base", "params": {"model": "google/vit-base-patch16-224", "revision": "3f49326eb077187dfe1c2a2bb15fbd74e6ab91e3", "batch": [1, 64], "image": 224}},
+        {"id": "bert_large", "params": {"model": "google-bert/bert-large-uncased", "revision": "6da4b6a26a1877e173fca3225479512db81a5e5b", "batch": [1, 16], "sequence": [128, 512]}},
+        {"id": "qwen3_8b", "params": {"model": "Qwen/Qwen3-8B", "revision": "b968826d9c46dd6066d109eabc6255188de91218", "batch": [1, 8], "prefill": [128, 2048, 8192], "decode_tokens": 128}},
+        {"id": "deepseek_v2_lite", "hardware": ["a100_sm80", "h100_sm90a", "b200_sm100a", "mi300x_gfx942", "l40s_sm89", "b300_sm103a"], "params": {"model": "deepseek-ai/DeepSeek-V2-Lite", "revision": "604d5664dddd88a0433dbae533b7fe9472482de0", "batch": [1, 8], "prefill": [128, 2048, 8192], "decode_tokens": 128}},
+        {"id": "mamba2_2_7b", "params": {"model": "state-spaces/mamba2-2.7b", "revision": "99b226cc377d131cccc610ed4346db564f381f1e", "batch": [1, 8], "prefill": [128, 2048, 8192], "decode_tokens": 128}},
+        {"id": "sdxl_unet", "params": {"model": "stabilityai/stable-diffusion-xl-base-1.0", "revision": "462165984030d82259a11f4367a4eed129e94a7b", "batch": [1, 4], "resolution": [512, 1024]}}
+      ]
+    },
+    {
+      "id": "external_suites",
+      "layer": "external_suite",
+      "family": "independent_suites",
+      "source_ids": ["tileops_2026_09_01", "tilegym_2026_09_01", "meta_tritonbench_2026_09_01", "kernelbench_2026_09_01", "sol_execbench_2026_09_01"],
+      "implementation_status": "adapter_required",
+      "tiers": ["main_external_suite"],
+      "hardware": ["h100_sm90a", "b200_sm100a", "mi300x_gfx942"],
+      "dtypes": ["suite_defined"],
+      "modes": ["suite_defined"],
+      "cases": [
+        {"id": "tileops_all_manifest_workloads", "hardware": ["h100_sm90a"], "params": {"source_commit": "8d990016e1095b9c771ac56d034a484afb14d845"}},
+        {"id": "tilegym_all_stable_benchmarks", "hardware": ["b200_sm100a"], "params": {"source_commit": "077eee3bd6d64f039a1a631b7bd1c21a37534766"}},
+        {"id": "meta_tritonbench_tilelang_supported_ops", "hardware": ["h100_sm90a", "b200_sm100a", "mi300x_gfx942"], "params": {"source_commit": "1c3fed689fc4fcb589193514d753ebc4412eb44f"}},
+        {"id": "kernelbench_level1_verified", "hardware": ["h100_sm90a", "b200_sm100a"], "params": {"source_commit": "423217d9fda91e0c2d67e4a43bf62f96f6d104f1", "task_count": 79}},
+        {"id": "kernelbench_level2_verified", "hardware": ["h100_sm90a", "b200_sm100a"], "params": {"source_commit": "423217d9fda91e0c2d67e4a43bf62f96f6d104f1", "task_count": 60}},
+        {"id": "kernelbench_level3", "hardware": ["h100_sm90a", "b200_sm100a"], "params": {"source_commit": "423217d9fda91e0c2d67e4a43bf62f96f6d104f1", "task_count": 50}},
+        {"id": "sol_execbench_full", "hardware": ["b200_sm100a"], "params": {"source_commit": "a9fa0804c793d438e70850c33fe34426e66d53dd", "problem_count": 235, "official_hardware": "b200_sm100a"}}
+      ]
+    }
+  ]
+}
