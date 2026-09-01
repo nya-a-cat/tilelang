@@ -452,6 +452,7 @@ def prepare_environments(records: list[dict[str, Any]]) -> dict[str, Any]:
             "install",
             "--disable-pip-version-check",
             "--quiet",
+            "--ignore-installed",
             "--no-deps",
             str(baseline_wheel),
         ],
@@ -465,11 +466,28 @@ def prepare_environments(records: list[dict[str, Any]]) -> dict[str, Any]:
             "install",
             "--disable-pip-version-check",
             "--quiet",
+            "--ignore-installed",
             "--no-deps",
             str(candidate_base_wheel),
         ],
         records,
     )
+
+    for label, python, environment_root in (
+        ("baseline", baseline_python, BASELINE_ENV),
+        ("candidate", candidate_python, CANDIDATE_ENV),
+    ):
+        package_output = run_checked(
+            [
+                str(python),
+                "-c",
+                "from importlib import metadata; print(metadata.distribution('tilelang').locate_file('tilelang').resolve())",
+            ],
+            records,
+        )
+        package_path = Path(package_output.strip())
+        if not package_path.is_relative_to(environment_root.resolve()):
+            raise RuntimeError(f"{label} TileLang resolved outside its isolated environment: {package_path}")
 
     manifest_path = downloads_dir / "native-overlay-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
