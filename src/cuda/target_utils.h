@@ -30,6 +30,14 @@ bool TargetHasTmem(Target target);
 bool TargetHasBulkCopy(Target target);
 bool TargetHasRegReconfiguration(Target target);
 bool TargetSupportsNamedBarrier(Target target);
+/*! \brief Whether CUDA AllReduce should prefer the hierarchical algorithm.
+ *
+ * This is the target profitability decision. Collective-specific legality is
+ * checked separately by the reduction lowerer. The pass config
+ * `tl.cuda_allreduce_strategy` can force either implementation for JIT-time
+ * A/B measurements without rebuilding TileLang.
+ */
+bool TargetCudaPrefersHierarchicalAllReduce(Target target);
 bool TargetSupportVectorize256(Target target);
 bool TargetHasSMVersionGE(Target target, int version);
 

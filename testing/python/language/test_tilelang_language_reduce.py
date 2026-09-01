@@ -726,6 +726,28 @@ def test_finalize_reducer_codegen(op, dtype, block_M, block_N, batch):
         assert int(m.group(2)) == 8, f"Expected compact warp stride=8, got {m.group(2)}.\n{src}"
 
 
+def test_finalize_reducer_target_profitability_and_jit_overrides():
+    kernel = _make_finalize_reducer_kernel(128, 64, T.float32, "sum", 4)
+    baseline_plan = {**_COMPILE_FLAGS, "tl.reducer_force_baseline": True}
+
+    def lower(arch, strategy="auto"):
+        pass_configs = {
+            **baseline_plan,
+            tl.PassConfigKey.TL_CUDA_ALLREDUCE_STRATEGY: strategy,
+        }
+        return _lower_cuda_artifact_without_device_compile(kernel, arch, pass_configs).kernel_source
+
+    sm75_auto = lower("sm_75")
+    sm80_auto = lower("sm_80")
+    sm75_forced_hierarchical = lower("sm_75", "hierarchical")
+    sm80_forced_butterfly = lower("sm_80", "butterfly")
+
+    assert ", 4, 256>::run_batch" in sm75_auto
+    assert ", 4, 8, true>::run_batch" in sm80_auto
+    assert ", 4, 8, true>::run_batch" in sm75_forced_hierarchical
+    assert ", 4, 256>::run_batch" in sm80_forced_butterfly
+
+
 @tilelang.testing.requires_cuda_compute_version_ge(8, 0)
 @pytest.mark.parametrize("batch", [1, 4])
 def test_finalize_reducer_sm80_uses_named_barrier(batch):
@@ -1061,14 +1083,14 @@ def _make_allreduce_dim0_scale_kernel(reduce_fn, logical_width, scale):
     return kernel
 
 
-def _lower_cuda_artifact_without_device_compile(prim_func, arch="sm_80"):
+def _lower_cuda_artifact_without_device_compile(prim_func, arch="sm_80", pass_configs=None):
     target = {"kind": "cuda", "arch": arch}
-    with tvm.transform.PassContext(), tvm.target.Target(target):
+    with tvm.transform.PassContext(config=pass_configs or {}), tvm.target.Target(target):
         return tilelang.lower(prim_func, target=target, enable_device_compile=False)
 
 
-def _lower_cuda_source_without_device_compile(prim_func, arch="sm_80"):
-    artifact = _lower_cuda_artifact_without_device_compile(prim_func, arch)
+def _lower_cuda_source_without_device_compile(prim_func, arch="sm_80", pass_configs=None):
+    artifact = _lower_cuda_artifact_without_device_compile(prim_func, arch, pass_configs)
     assert artifact.kernel_source is not None
     return artifact.kernel_source
 
@@ -1090,6 +1112,42 @@ def test_hierarchical_allreduce_codegen_selection_boundaries():
     assert ", true>::run" in two_warps, two_warps
     assert ", true>::run" not in strided, strided
     assert _dynamic_shared_bytes(strided_artifact) == 128 * 4
+
+
+def test_hierarchical_allreduce_target_profitability_and_jit_overrides():
+    kernel = _make_allreduce_width_kernel(T.reduce_sum, 1, 128, 128)
+
+    sm75_auto = _lower_cuda_artifact_without_device_compile(kernel, "sm_75")
+    sm80_auto = _lower_cuda_artifact_without_device_compile(kernel, "sm_80")
+    sm75_forced_hierarchical = _lower_cuda_artifact_without_device_compile(
+        kernel,
+        "sm_75",
+        {tl.PassConfigKey.TL_CUDA_ALLREDUCE_STRATEGY: "hierarchical"},
+    )
+    sm80_forced_butterfly = _lower_cuda_artifact_without_device_compile(
+        kernel,
+        "sm_80",
+        {tl.PassConfigKey.TL_CUDA_ALLREDUCE_STRATEGY: "butterfly"},
+    )
+
+    assert ", true>::run" not in sm75_auto.kernel_source
+    assert _dynamic_shared_bytes(sm75_auto) == 128 * 4
+    assert ", true>::run" in sm80_auto.kernel_source
+    assert _dynamic_shared_bytes(sm80_auto) == 4 * 4
+    assert ", true>::run" in sm75_forced_hierarchical.kernel_source
+    assert _dynamic_shared_bytes(sm75_forced_hierarchical) == 4 * 4
+    assert ", true>::run" not in sm80_forced_butterfly.kernel_source
+    assert _dynamic_shared_bytes(sm80_forced_butterfly) == 128 * 4
+
+
+def test_hierarchical_allreduce_rejects_unknown_jit_strategy():
+    kernel = _make_allreduce_width_kernel(T.reduce_sum, 1, 128, 128)
+    with pytest.raises(Exception, match="tl.cuda_allreduce_strategy"):
+        _lower_cuda_artifact_without_device_compile(
+            kernel,
+            "sm_80",
+            {tl.PassConfigKey.TL_CUDA_ALLREDUCE_STRATEGY: "unknown"},
+        )
 
 
 def test_hierarchical_allreduce_compacts_dynamic_shared_workspace():

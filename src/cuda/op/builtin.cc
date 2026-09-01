@@ -22,6 +22,7 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kDisableWGMMA, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableShuffleElect, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kEnableLowerLDGSTG, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kEnableLowerLDGSTGPredicated, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kCudaAllReduceStrategy, ffi::String);
 
 DataType CuTensorMapType() { return DataType::UInt(8, 128); }
 

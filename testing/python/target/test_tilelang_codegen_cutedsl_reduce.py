@@ -89,6 +89,12 @@ def test_cutedsl_codegen_full_reduce_uses_hierarchical_path(threads):
     assert _dynamic_shared_bytes(artifact) == warps * 4
 
 
+def test_cutedsl_codegen_sm75_auto_preserves_butterfly_path():
+    artifact = _lower_cutedsl_full_reduce(arch="sm_75", threads=128)
+    assert "True).run" not in artifact.kernel_source
+    assert _dynamic_shared_bytes(artifact) == 128 * 4
+
+
 def test_cutedsl_codegen_batched_full_reduce_uses_run_batch_alias():
     artifact = _lower_cutedsl_full_reduce(batch=4)
     assert "tl.NamedBarrier(128), 4, 4, True).run_batch" in artifact.kernel_source

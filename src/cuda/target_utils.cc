@@ -6,9 +6,11 @@
 #include "cuda/target_utils.h"
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/transform.h>
 
 #include <string>
 
+#include "cuda/op/builtin.h"
 #include "dlpack/dlpack.h"
 #include "support/check.h"
 
@@ -137,6 +139,32 @@ bool TargetSupportsNamedBarrier(Target target) {
     return false;
   int arch = GetCudaArchInt(target);
   return arch >= 80;
+}
+
+bool TargetCudaPrefersHierarchicalAllReduce(Target target) {
+  ICHECK(TargetIsCuda(target));
+  auto pass_ctx = tvm::transform::PassContext::Current();
+  std::string strategy =
+      pass_ctx->GetConfig(kCudaAllReduceStrategy, ffi::Optional<ffi::String>())
+          .value_or(ffi::String("auto"));
+  if (strategy == "butterfly") {
+    return false;
+  }
+  if (strategy == "hierarchical") {
+    return true;
+  }
+  if (strategy == "auto") {
+    // Pre-SM80 targets lack TileLang's partial-CTA named-barrier policy. Keep
+    // their established butterfly lowering by default; the hierarchical path
+    // adds a dependent cross-warp shuffle chain that regresses scalar SM75
+    // reductions. SM80+ retains the compact one-barrier candidate while its
+    // per-architecture timing matrix is collected.
+    return TargetSupportsNamedBarrier(target);
+  }
+  LOG(FATAL) << "Invalid pass config `" << kCudaAllReduceStrategy << "`: \""
+             << strategy
+             << "\". Expected one of: auto, butterfly, hierarchical.";
+  return false;
 }
 
 bool TargetSupportVectorize256(Target target) {

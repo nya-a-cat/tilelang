@@ -141,6 +141,14 @@ class PassConfigKey(str, Enum):
     numerically), as a field escape hatch if a narrow plan ever miscompiles,
     and for plan-choice A/B measurement. Default: False"""
 
+    TL_CUDA_ALLREDUCE_STRATEGY = "tl.cuda_allreduce_strategy"
+    """Select the CUDA cross-warp AllReduce implementation:
+    "auto" applies TileLang's architecture-aware profitability policy;
+    "butterfly" forces the recursive shared-memory butterfly;
+    "hierarchical" forces the compact warp-aggregate path whenever its
+    structural legality checks pass. Forced modes support JIT-time backend A/B
+    measurements from one TileLang build. Default: "auto"."""
+
     TL_DISABLE_TMA_LOWER = "tl.disable_tma_lower"
     """Deprecated flag — prevents plain T.copy() from auto-lowering to TMA store.
 

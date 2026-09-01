@@ -1186,6 +1186,25 @@ jobs:
             sha256sum --check SHA256SUMS
           )
 
+      - name: Trace CUDA AllReduce strategies without a GPU
+        id: allreduce-strategy-trace
+        shell: bash
+        env:
+          TILELANG_SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          TILELANG_ALLREDUCE_TRACE_RESULT: native-overlay-evidence/allreduce-strategy-trace.json
+        run: |
+          set -euo pipefail
+          native-overlay-selftest/bin/python \
+            benchmark/research/trace_allreduce_strategies.py
+          (
+            cd native-overlay-evidence
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | LC_ALL=C sort -z \
+              | xargs -0 -r sha256sum \
+              > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
       - name: Save direct native compiler cache
         if: always() && steps.manylinux-native-cache.outputs.cache-hit != 'true' && steps.native-build.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

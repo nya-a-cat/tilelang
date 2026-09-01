@@ -19,6 +19,16 @@ namespace cuda {
 struct Reduce : backend::ReduceLowerer<Reduce> {
   static int WarpSize(Target target) { return TargetCudaGetWarpSize(target); }
 
+  static bool ShouldUseHierarchicalAllReduce(int reducing_threads, int scale,
+                                             PrimExpr thread_offset,
+                                             PrimExpr all_threads,
+                                             Target target) {
+    return TargetCudaPrefersHierarchicalAllReduce(target) &&
+           backend::reduce::CanUseHierarchicalAllReduce(
+               reducing_threads, scale, thread_offset, all_threads,
+               TargetCudaGetWarpSize(target));
+  }
+
   static bool IsFAdd2Enabled(const ReduceOpNode &op) {
     constexpr const char *kEnableFAdd2 = "enable_fadd2";
     if (auto value = op.annotations.Get(kEnableFAdd2)) {
@@ -64,9 +74,8 @@ struct Reduce : backend::ReduceLowerer<Reduce> {
                                          PrimExpr thread_offset,
                                          PrimExpr all_threads,
                                          int fallback_stride, Target target) {
-    if (backend::reduce::CanUseHierarchicalAllReduce(
-            reducing_threads, scale, thread_offset, all_threads,
-            TargetCudaGetWarpSize(target))) {
+    if (ShouldUseHierarchicalAllReduce(reducing_threads, scale, thread_offset,
+                                       all_threads, target)) {
       return reducing_threads / TargetCudaGetWarpSize(target);
     }
     return fallback_stride;
@@ -75,9 +84,8 @@ struct Reduce : backend::ReduceLowerer<Reduce> {
   static bool AllReduceHasLeadingBarrier(int reducing_threads, int scale,
                                          PrimExpr thread_offset,
                                          PrimExpr all_threads, Target target) {
-    return !backend::reduce::CanUseHierarchicalAllReduce(
-        reducing_threads, scale, thread_offset, all_threads,
-        TargetCudaGetWarpSize(target));
+    return !ShouldUseHierarchicalAllReduce(reducing_threads, scale,
+                                           thread_offset, all_threads, target);
   }
 
   static std::string MakeBatchAllReduce(std::string reducer,
@@ -85,9 +93,8 @@ struct Reduce : backend::ReduceLowerer<Reduce> {
                                         PrimExpr thread_offset,
                                         PrimExpr all_threads, int batch,
                                         int workspace_stride, Target target) {
-    bool hierarchical = backend::reduce::CanUseHierarchicalAllReduce(
-        reducing_threads, scale, thread_offset, all_threads,
-        TargetCudaGetWarpSize(target));
+    bool hierarchical = ShouldUseHierarchicalAllReduce(
+        reducing_threads, scale, thread_offset, all_threads, target);
     std::stringstream ss;
     ss << "tl::AllReduce<" << reducer << ", " << reducing_threads << ", "
        << scale << ", " << thread_offset;
@@ -108,9 +115,8 @@ struct Reduce : backend::ReduceLowerer<Reduce> {
                                          int reducing_threads, int scale,
                                          PrimExpr thread_offset,
                                          PrimExpr all_threads, Target target) {
-    bool hierarchical = backend::reduce::CanUseHierarchicalAllReduce(
-        reducing_threads, scale, thread_offset, all_threads,
-        TargetCudaGetWarpSize(target));
+    bool hierarchical = ShouldUseHierarchicalAllReduce(
+        reducing_threads, scale, thread_offset, all_threads, target);
     std::stringstream ss;
     ss << "tl::AllReduce<" << reducer << ", " << reducing_threads << ", "
        << scale << ", " << thread_offset;

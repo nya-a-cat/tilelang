@@ -44,6 +44,11 @@ static constexpr const char *kDisableShuffleElect = "tl.disable_shuffle_elect";
 static constexpr const char *kEnableLowerLDGSTG = "tl.enable_lower_ldgstg";
 static constexpr const char *kEnableLowerLDGSTGPredicated =
     "tl.enable_lower_ldgstg_predicated";
+// CUDA AllReduce implementation policy. Valid values are "auto",
+// "butterfly", and "hierarchical". The forced modes are intended for
+// backend A/B measurements; "auto" applies the target profitability policy.
+static constexpr const char *kCudaAllReduceStrategy =
+    "tl.cuda_allreduce_strategy";
 
 // fast math related op
 // __exp(x) - fast exponential
