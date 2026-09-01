@@ -24,7 +24,13 @@ from tilelang.language.eager import PrimFunc, prim_func, JITFunc
 from tvm.target import Target
 
 from tilelang.jit.kernel import JITKernel
+from tilelang.jit.layout_autoselect import (
+    AUTO_LAYOUT_POLICY,
+    LAYOUT_COST_MODEL_KEY,
+    compile_auto_layout,
+)
 from tilelang.cache import cached
+from tilelang.transform.pass_config import normalize_pass_configs
 from tilelang.utils.device import get_available_cpu_count
 from os import path, makedirs
 from logging import getLogger
@@ -158,6 +164,23 @@ def compile(
             else:
                 func_cf.extend(compile_flags)
         compile_flags = func_cf
+
+    pass_configs = normalize_pass_configs(pass_configs)
+    if pass_configs.get(LAYOUT_COST_MODEL_KEY) == AUTO_LAYOUT_POLICY:
+
+        def compile_variant(candidate_pass_configs: dict[str, Any]) -> JITKernel[_KP, _T]:
+            return cached(
+                func=func,
+                out_idx=out_idx,
+                execution_backend=execution_backend,
+                target=target,
+                target_host=target_host,
+                verbose=verbose,
+                pass_configs=candidate_pass_configs,
+                compile_flags=compile_flags,
+            )
+
+        return compile_auto_layout(compile_variant, pass_configs)
 
     return cached(
         func=func,

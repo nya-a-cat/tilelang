@@ -114,6 +114,9 @@ class PassConfigKey(str, Enum):
 
     TL_LAYOUT_COST_MODEL = "tl.layout_cost_model"
     """The cost model that ranks free-mode layout attempts, by name:
+    "auto" makes the Python JIT compile the two concrete policies and select
+    one using compiler-reported spills and an occupancy guard for the current
+    CUDA device; it adds first-compilation work and no runtime dispatch;
     "io-aware" scores estimated global-memory access cost (vector width /
     warp coalescing of every fragment<->global copy, weighted by bytes
     moved) with register count as the tiebreak; "register-count" is the

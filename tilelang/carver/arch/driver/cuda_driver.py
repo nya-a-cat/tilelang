@@ -14,8 +14,11 @@ class cudaDeviceAttrNames:
     """
 
     cudaDevAttrMaxThreadsPerBlock: int = 1
+    cudaDevAttrWarpSize: int = 10
     cudaDevAttrMaxRegistersPerBlock: int = 12
     cudaDevAttrMaxThreadsPerMultiProcessor: int = 39
+    cudaDevAttrComputeCapabilityMajor: int = 75
+    cudaDevAttrComputeCapabilityMinor: int = 76
     cudaDevAttrMaxSharedMemoryPerMultiprocessor: int = 81
     cudaDevAttrMaxRegistersPerMultiprocessor: int = 82
     cudaDevAttrMaxBlocksPerMultiprocessor: int = 106
@@ -67,7 +70,7 @@ def _load_cudart():
     return ctypes.cdll.LoadLibrary("libcudart.so")
 
 
-def get_device_attribute(attr: int, device_id: int = 0) -> int:
+def get_device_attribute(attr: int, device_id: int = 0) -> int | None:
     try:
         libcudart = _load_cudart()
 
@@ -87,6 +90,23 @@ def get_device_attribute(attr: int, device_id: int = 0) -> int:
         return value.value
     except Exception as e:
         print(f"Error getting device attribute: {e}")
+        return None
+
+
+def get_current_device() -> int | None:
+    """Return the CUDA runtime's current logical device."""
+    try:
+        libcudart = _load_cudart()
+        value = ctypes.c_int()
+        cudaGetDevice = libcudart.cudaGetDevice
+        cudaGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        cudaGetDevice.restype = ctypes.c_int
+        ret = cudaGetDevice(ctypes.byref(value))
+        if ret != 0:
+            raise RuntimeError(f"cudaGetDevice failed with error {ret}")
+        return value.value
+    except Exception as e:
+        print(f"Error getting current CUDA device: {e}")
         return None
 
 
