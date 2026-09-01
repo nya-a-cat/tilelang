@@ -38,6 +38,16 @@ MIN_BATCH_MS = float(os.environ.get("TILELANG_LAYOUT_AB_MIN_BATCH_MS", "50"))
 MAX_BATCH_ITERS = int(os.environ.get("TILELANG_LAYOUT_AB_MAX_BATCH_ITERS", "65536"))
 WARM_SECONDS = float(os.environ.get("TILELANG_LAYOUT_AB_WARM_SECONDS", "1"))
 RESULT_PATH = Path(os.environ.get("TILELANG_LAYOUT_AB_RESULT", "/content/tilelang-layout-cost-models-t4.json"))
+RESULT_SCHEMA = os.environ.get("TILELANG_LAYOUT_AB_SCHEMA", "tilelang-layout-cost-model-runtime-ab-v1")
+EVIDENCE_BOUNDARY = os.environ.get(
+    "TILELANG_LAYOUT_AB_EVIDENCE_BOUNDARY",
+    (
+        "One free Colab T4 compares unchanged PrimFuncs under two selected "
+        "TileLang backend layout policies. It screens runtime, correctness, "
+        "generated code, and compiler resources. Cross-architecture selection "
+        "and the global 1.50x goal remain outside this evidence."
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -482,18 +492,13 @@ def benchmark_case(case: BenchmarkCase) -> dict[str, Any]:
 def main() -> None:
     started = time.time()
     payload: dict[str, Any] = {
-        "schema": "tilelang-layout-cost-model-runtime-ab-v1",
+        "schema": RESULT_SCHEMA,
         "repository": "nya-a-cat/tilelang",
         "source_sha": os.environ.get("TILELANG_SOURCE_SHA"),
         "native_base_sha": os.environ.get("TILELANG_NATIVE_BASE_SHA"),
         "started_unix": started,
         "policies": list(POLICIES),
-        "evidence_boundary": (
-            "One free Colab T4 compares unchanged PrimFuncs under two selected "
-            "TileLang backend layout policies. It screens runtime, correctness, "
-            "generated code, and compiler resources. Cross-architecture selection "
-            "and the global 1.50x goal remain outside this evidence."
-        ),
+        "evidence_boundary": EVIDENCE_BOUNDARY,
         "system": {
             "platform": platform.platform(),
             "python": sys.version,
