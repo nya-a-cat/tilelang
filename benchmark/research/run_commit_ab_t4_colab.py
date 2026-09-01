@@ -948,6 +948,9 @@ def main() -> int:
             raise RuntimeError("TILELANG_RUNNER_SOURCE_SHA must be a full lowercase Git commit")
         if not HEX_64.fullmatch(controller_sha256):
             raise RuntimeError("TILELANG_CONTROLLER_SHA256 must be a lowercase SHA-256 digest")
+        actual_controller_sha256 = sha256_file(Path(__file__).resolve())
+        if actual_controller_sha256 != controller_sha256:
+            raise RuntimeError(f"controller hash mismatch: expected {controller_sha256}, got {actual_controller_sha256}")
         worker = verify_worker()
         environment = prepare_environments(records)
         baseline_python = Path(environment["baseline_python"])
