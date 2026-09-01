@@ -121,6 +121,10 @@ jobs:
           mapfile -d '' assets < <(find release-assets -type f -print0 | LC_ALL=C sort -z)
           test "${#assets[@]}" -ge 8
           printf '%s\0' "${assets[@]}" | xargs -0 sha256sum | tee release-asset-sha256.txt
+          {
+            echo '# Zero-byte files preserved in the verified Actions artifact and omitted from GitHub Release assets'
+            find release-assets -type f -empty -printf '%P\n' | LC_ALL=C sort
+          } > zero-byte-release-assets.txt
 
       - name: Upload verified assets to fork prerelease
         shell: bash
@@ -129,9 +133,11 @@ jobs:
           RELEASE_TAG: ${{ steps.provenance.outputs.release_tag }}
         run: |
           set -euo pipefail
-          mapfile -d '' assets < <(find release-assets -type f -print0 | LC_ALL=C sort -z)
-          assets+=(release-asset-sha256.txt)
-          gh release upload "${RELEASE_TAG}" "${assets[@]}"
+          mapfile -d '' assets < <(
+            find release-assets -type f ! -empty -print0 | LC_ALL=C sort -z
+          )
+          assets+=(release-asset-sha256.txt zero-byte-release-assets.txt)
+          gh release upload --clobber "${RELEASE_TAG}" "${assets[@]}"
 
       - name: Reverify published assets
         shell: bash
@@ -141,7 +147,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          expected_count="$(( $(find release-assets -type f | wc -l) + 1 ))"
+          expected_count="$(( $(find release-assets -type f ! -empty | wc -l) + 2 ))"
           release_json="$(gh release view "${RELEASE_TAG}" --json assets,isPrerelease,targetCommitish)"
           test "$(jq '.assets | length' <<<"${release_json}")" -eq "${expected_count}"
           test "$(jq -r .isPrerelease <<<"${release_json}")" = true
