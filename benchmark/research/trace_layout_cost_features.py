@@ -1,8 +1,9 @@
 """Collect machine-readable LayoutInference cost features without a GPU.
 
 The 18 PrimFuncs are byte-identity guarded against the runtime A/B matrix used
-on T4 and consumer Blackwell.  Each unchanged PrimFunc is inferred under the
-selected layout policies for explicit CUDA architecture targets.  This script
+on T4 and consumer Blackwell. Each unchanged PrimFunc is inferred under the
+selected layout policies for explicit CUDA architecture targets. Small CUDA
+and CPU probes also verify the target-aware built-in default. This script
 performs no device compilation or execution.
 """
 
@@ -29,7 +30,7 @@ POLICIES = tuple(
     policy.strip()
     for policy in os.environ.get(
         "TILELANG_LAYOUT_TRACE_POLICIES",
-        "register-count,io-aware,io-aware-regularized",
+        "target-default,register-count,io-aware,io-aware-regularized",
     ).split(",")
     if policy.strip()
 )
@@ -81,6 +82,8 @@ EXPECTED_TRACE_FIELDS = {
     "model",
     *INTEGER_TRACE_FIELDS,
 }
+BUILT_IN_DEFAULT_POLICY = "built-in-default"
+CPU_TARGET = "cpu"
 
 
 @dataclass(frozen=True)
@@ -306,15 +309,23 @@ def build_cases() -> list[TraceCase]:
     return cases
 
 
+def expected_trace_model(arch: str, policy: str) -> str:
+    if policy in {"target-default", BUILT_IN_DEFAULT_POLICY}:
+        return "register-count" if arch == CPU_TARGET else "io-aware-regularized"
+    return policy
+
+
 def infer_case(case: TraceCase, arch: str, policy: str, trace_enabled: bool) -> None:
-    target = tvm.target.Target({"kind": "cuda", "arch": arch})
-    config: dict[str, Any] = {"tl.layout_cost_model": policy}
+    target = tvm.target.Target("c") if arch == CPU_TARGET else tvm.target.Target({"kind": "cuda", "arch": arch})
+    config: dict[str, Any] = {}
+    if policy != BUILT_IN_DEFAULT_POLICY:
+        config["tl.layout_cost_model"] = policy
     if trace_enabled:
         config["tl.enable_layout_cost_trace"] = True
     with target, tvm.transform.PassContext(config=config):
         module = tvm.IRModule({"main": case.program})
         module = tvm.tirx.transform.BindTarget(target)(module)
-        module = tl.transform.MaterializeKernelLaunch()(module)
+        module = tl.transform.MaterializeKernelLaunch(lower_thread_binding=arch != CPU_TARGET)(module)
         tl.transform.LayoutInference()(module)
 
 
@@ -401,6 +412,7 @@ def parse_child_output(
                 "canonical_primfunc_sha256": match.group(2),
                 "arch": arch,
                 "policy": policy,
+                "resolved_model": expected_trace_model(arch, policy),
                 "trace_records": [],
                 "errors": [],
             }
@@ -412,8 +424,11 @@ def parse_child_output(
                 continue
             try:
                 record = parse_trace_record(line)
-                if record["model"] != policy:
-                    raise ValueError(f"trace model {record['model']!r} differs from child policy {policy!r}")
+                expected_model = expected_trace_model(arch, policy)
+                if record["model"] != expected_model:
+                    raise ValueError(
+                        f"trace model {record['model']!r} differs from expected resolution {expected_model!r} for child policy {policy!r}"
+                    )
                 current["trace_records"].append(record)
             except Exception as error:  # noqa: BLE001 - retain all parse failures
                 current["errors"].append(f"{type(error).__name__}: {error}")
@@ -548,10 +563,11 @@ def parent_main() -> int:
         "evidence_boundary": (
             "CPU-only LayoutInference trace over the same 18 unchanged PrimFuncs used by the T4 and consumer "
             "Blackwell runtime A/B. It records decomposed rank, IO, register, and spill features for every "
-            "selected policy on explicit CUDA targets and performs no device compilation, resource measurement, "
-            "correctness execution, or runtime timing."
+            "selected policy on explicit CUDA targets, plus target-default resolution probes for CUDA and CPU. "
+            "It performs no device compilation, resource measurement, correctness execution, or runtime timing."
         ),
         "default_off_probe": {},
+        "default_resolution_probes": [],
         "results": [],
         "failures": [],
         "status": "running",
@@ -576,6 +592,53 @@ def parent_main() -> int:
     }
     if payload["default_off_probe"]["status"] != "complete":
         payload["failures"].append("default-off probe emitted a trace or failed")
+
+    for probe_arch, probe_policy in (
+        (TARGET_ARCHES[0], BUILT_IN_DEFAULT_POLICY),
+        (CPU_TARGET, "target-default"),
+        (CPU_TARGET, BUILT_IN_DEFAULT_POLICY),
+    ):
+        completed = run_child(
+            arch=probe_arch,
+            policy=probe_policy,
+            trace_enabled=True,
+            case_name=cases[0].name,
+        )
+        log_chunks.append(
+            f"===== resolution-probe arch={probe_arch} policy={probe_policy} returncode={completed.returncode} =====\n{completed.stdout}"
+        )
+        parsed, parse_errors = parse_child_output(
+            completed.stdout,
+            arch=probe_arch,
+            policy=probe_policy,
+        )
+        case_errors = [error for parsed_case in parsed for error in parsed_case["errors"]]
+        trace_records = [record for parsed_case in parsed for record in parsed_case["trace_records"]]
+        selected_record_count = sum(record["phase"] == "selected" for record in trace_records)
+        actual_models = sorted({record["model"] for record in trace_records})
+        probe_status = (
+            "complete"
+            if completed.returncode == 0 and len(parsed) == 1 and selected_record_count > 0 and not parse_errors and not case_errors
+            else "failed"
+        )
+        payload["default_resolution_probes"].append(
+            {
+                "arch": probe_arch,
+                "policy": probe_policy,
+                "resolved_model": expected_trace_model(probe_arch, probe_policy),
+                "case": cases[0].name,
+                "returncode": completed.returncode,
+                "parsed_case_count": len(parsed),
+                "trace_record_count": len(trace_records),
+                "selected_record_count": selected_record_count,
+                "actual_models": actual_models,
+                "parse_errors": parse_errors,
+                "case_errors": case_errors,
+                "status": probe_status,
+            }
+        )
+        if probe_status != "complete":
+            payload["failures"].append(f"default resolution probe failed: arch={probe_arch} policy={probe_policy}")
 
     for arch in TARGET_ARCHES:
         for policy in POLICIES:
@@ -653,8 +716,8 @@ def parent_main() -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--child", action="store_true")
-    parser.add_argument("--arch", choices=TARGET_ARCHES)
-    parser.add_argument("--policy", choices=POLICIES)
+    parser.add_argument("--arch", choices=(*TARGET_ARCHES, CPU_TARGET))
+    parser.add_argument("--policy", choices=(*POLICIES, BUILT_IN_DEFAULT_POLICY))
     parser.add_argument("--trace-enabled", choices=("true", "false"))
     parser.add_argument("--case")
     return parser.parse_args()
