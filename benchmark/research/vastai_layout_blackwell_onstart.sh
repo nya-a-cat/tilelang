@@ -3,8 +3,8 @@ set -euo pipefail
 
 EVIDENCE_ROOT=/workspace/evidence
 RUNNER_PATH=/workspace/run_layout_divergent_blackwell.py
-RUNNER_SOURCE_SHA=4369b41eaac751fdbd5ba931de8c9e544cad6a3f
-RUNNER_SHA256=9a9a114cf515146a3950ea716ec428341c031a889ba5ab3aec1ef350f6dae3fd
+RUNNER_SOURCE_SHA=4160d8af580030c305b09f85158a43aa24cea3a2
+RUNNER_SHA256=564bf794fafbd14f0d1db9f32299cd051d73d6d3c7055142b36ebd77f4cb802e
 RUNNER_URL="https://raw.githubusercontent.com/nya-a-cat/tilelang/${RUNNER_SOURCE_SHA}/benchmark/research/run_layout_divergent_blackwell.py"
 CONTAINER_IMAGE="vastai/pytorch@sha256:6ee5f68a3c11bd89e9364771bf6b929d5f266c4382fb3628d751b5e89241d462"
 STARTED_UNIX="$(date +%s)"

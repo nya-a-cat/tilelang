@@ -11,13 +11,15 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $VastCli = "C:\Users\element\.local\bin\vastai.exe"
+$ScpCommand = Get-Command scp.exe -ErrorAction SilentlyContinue
+$ScpCli = if ($null -ne $ScpCommand) { $ScpCommand.Source } else { "" }
 $ExpectedGpuName = "RTX 5060 Ti"
 $ExpectedComputeCapability = 1200
 $DiskGb = 20
 $Image = "vastai/pytorch@sha256:6ee5f68a3c11bd89e9364771bf6b929d5f266c4382fb3628d751b5e89241d462"
 $ImageDigest = "sha256:6ee5f68a3c11bd89e9364771bf6b929d5f266c4382fb3628d751b5e89241d462"
-$RunnerSourceSha = "4369b41eaac751fdbd5ba931de8c9e544cad6a3f"
-$RunnerSha256 = "9a9a114cf515146a3950ea716ec428341c031a889ba5ab3aec1ef350f6dae3fd"
+$RunnerSourceSha = "4160d8af580030c305b09f85158a43aa24cea3a2"
+$RunnerSha256 = "564bf794fafbd14f0d1db9f32299cd051d73d6d3c7055142b36ebd77f4cb802e"
 $RunnerUrl = "https://raw.githubusercontent.com/nya-a-cat/tilelang/$RunnerSourceSha/benchmark/research/run_layout_divergent_blackwell.py"
 $ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepositoryRoot = Split-Path -Parent (Split-Path -Parent $ScriptDirectory)
@@ -29,6 +31,9 @@ $OfferQuery = "gpu_name=RTX_5060_Ti num_gpus=1 compute_cap=1200 reliability>=0.9
 
 if (-not (Test-Path -LiteralPath $VastCli -PathType Leaf)) {
     throw "Vast CLI is missing at $VastCli"
+}
+if ([string]::IsNullOrWhiteSpace($ScpCli) -or -not (Test-Path -LiteralPath $ScpCli -PathType Leaf)) {
+    throw "OpenSSH scp.exe is unavailable"
 }
 if (-not (Test-Path -LiteralPath $OnstartPath -PathType Leaf)) {
     throw "Onstart script is missing at $OnstartPath"
@@ -124,6 +129,45 @@ function Save-ContainerLogs {
     catch {
         ("log fetch failed: " + $_.Exception.Message) | Set-Content -LiteralPath $Path -Encoding utf8
         return ""
+    }
+}
+
+function Get-ScpEndpoint {
+    param([Parameter(Mandatory = $true)][long]$InstanceId)
+    $url = (Invoke-VastText -VastArguments @("scp-url", [string]$InstanceId)).Trim()
+    if ($url -notmatch '^scp://(?<user>[^@/]+)@(?<host>\[[^\]]+\]|[^:/]+):(?<port>[0-9]+)/?$') {
+        throw "Unexpected Vast scp-url format"
+    }
+    return [pscustomobject]@{
+        User = $Matches["user"]
+        Host = $Matches["host"]
+        Port = [int]$Matches["port"]
+    }
+}
+
+function Copy-RemoteEvidence {
+    param(
+        [Parameter(Mandatory = $true)][long]$InstanceId,
+        [Parameter(Mandatory = $true)][string]$Directory
+    )
+    $endpoint = Get-ScpEndpoint -InstanceId $InstanceId
+    $knownHosts = Join-Path $ResolvedEvidenceDirectory "vast-known-hosts"
+    $remoteSource = "$($endpoint.User)@$($endpoint.Host):/workspace/evidence/."
+    $arguments = @(
+        "-q", "-r",
+        "-P", [string]$endpoint.Port,
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "ConnectionAttempts=2",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=$knownHosts",
+        $remoteSource,
+        $Directory
+    )
+    $output = & $ScpCli @arguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $detail = (($output | Select-Object -Last 20) -join "`n")
+        throw "scp evidence copy failed with exit code $LASTEXITCODE`: $detail"
     }
 }
 
@@ -278,11 +322,10 @@ try {
         throw "Vast experiment exceeded the $MaximumRuntimeMinutes minute watchdog"
     }
 
-    $remoteTarget = "local:" + ($RemoteEvidenceDirectory -replace '\\', '/')
     $copyError = $null
     for ($attempt = 1; $attempt -le 4; $attempt++) {
         try {
-            Invoke-VastText -VastArguments @("copy", "C.$InstanceId`:/workspace/evidence", $remoteTarget) | Out-Null
+            Copy-RemoteEvidence -InstanceId $InstanceId -Directory $RemoteEvidenceDirectory
             $copyError = $null
             break
         }
@@ -311,10 +354,10 @@ try {
     }
     $lifecycle = Get-Content -Raw -LiteralPath $lifecyclePath | ConvertFrom-Json
     $result = Get-Content -Raw -LiteralPath $resultPath | ConvertFrom-Json
+    $CopyVerified = $true
     if ($lifecycle.status -ne "complete" -or $result.status -ne "complete") {
         throw "Remote run was not complete: lifecycle=$($lifecycle.status), result=$($result.status)"
     }
-    $CopyVerified = $true
 }
 catch {
     $Failure = $_
