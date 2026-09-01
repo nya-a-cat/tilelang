@@ -4,6 +4,8 @@ param(
     [decimal]$MaximumHourlyUsd = 0.12,
     [int]$MaximumRuntimeMinutes = 30,
     [int]$PollSeconds = 20,
+    [int]$FailureDebugMinutes = 0,
+    [string]$SshIdentity = "C:\Users\element\.ssh\vec_vast_20260818_v2",
     [string]$EvidenceDirectory = ""
 )
 
@@ -13,13 +15,14 @@ $ErrorActionPreference = "Stop"
 $VastCli = "C:\Users\element\.local\bin\vastai.exe"
 $ScpCommand = Get-Command scp.exe -ErrorAction SilentlyContinue
 $ScpCli = if ($null -ne $ScpCommand) { $ScpCommand.Source } else { "" }
+$SshPublicKey = "$SshIdentity.pub"
 $ExpectedGpuName = "RTX 5060 Ti"
 $ExpectedComputeCapability = 1200
 $DiskGb = 20
 $Image = "vastai/pytorch@sha256:6ee5f68a3c11bd89e9364771bf6b929d5f266c4382fb3628d751b5e89241d462"
 $ImageDigest = "sha256:6ee5f68a3c11bd89e9364771bf6b929d5f266c4382fb3628d751b5e89241d462"
-$RunnerSourceSha = "4160d8af580030c305b09f85158a43aa24cea3a2"
-$RunnerSha256 = "564bf794fafbd14f0d1db9f32299cd051d73d6d3c7055142b36ebd77f4cb802e"
+$RunnerSourceSha = "1869b29976f0a3d3561dfa2807307e3b5ba59211"
+$RunnerSha256 = "125e95735eb105b8a695de7b192c342e4c84db4f2c82d61e0d5fbc28f9684055"
 $RunnerUrl = "https://raw.githubusercontent.com/nya-a-cat/tilelang/$RunnerSourceSha/benchmark/research/run_layout_divergent_blackwell.py"
 $ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepositoryRoot = Split-Path -Parent (Split-Path -Parent $ScriptDirectory)
@@ -35,6 +38,12 @@ if (-not (Test-Path -LiteralPath $VastCli -PathType Leaf)) {
 if ([string]::IsNullOrWhiteSpace($ScpCli) -or -not (Test-Path -LiteralPath $ScpCli -PathType Leaf)) {
     throw "OpenSSH scp.exe is unavailable"
 }
+if (-not (Test-Path -LiteralPath $SshIdentity -PathType Leaf)) {
+    throw "SSH private key is missing at $SshIdentity"
+}
+if (-not (Test-Path -LiteralPath $SshPublicKey -PathType Leaf)) {
+    throw "SSH public key is missing at $SshPublicKey"
+}
 if (-not (Test-Path -LiteralPath $OnstartPath -PathType Leaf)) {
     throw "Onstart script is missing at $OnstartPath"
 }
@@ -43,6 +52,9 @@ if ($MaximumRuntimeMinutes -lt 5 -or $MaximumRuntimeMinutes -gt 60) {
 }
 if ($PollSeconds -lt 10 -or $PollSeconds -gt 60) {
     throw "PollSeconds must be between 10 and 60"
+}
+if ($FailureDebugMinutes -lt 0 -or $FailureDebugMinutes -gt 30) {
+    throw "FailureDebugMinutes must be between 0 and 30"
 }
 
 if ([string]::IsNullOrWhiteSpace($EvidenceDirectory)) {
@@ -159,8 +171,10 @@ function Copy-RemoteEvidence {
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10",
         "-o", "ConnectionAttempts=2",
+        "-o", "IdentitiesOnly=yes",
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=$knownHosts",
+        "-i", $SshIdentity,
         $remoteSource,
         $Directory
     )
@@ -248,6 +262,8 @@ $preflight = [ordered]@{
     runner_url = $RunnerUrl
     onstart_path = $OnstartPath
     onstart_sha256 = $onstartSha256
+    ssh_public_key_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $SshPublicKey).Hash.ToLowerInvariant()
+    failure_debug_minutes = $FailureDebugMinutes
     selected_offer = $offer
 }
 Write-JsonFile -Value $preflight -Path (Join-Path $ResolvedEvidenceDirectory "controller-preflight.json")
@@ -265,6 +281,9 @@ $CreateAttemptAt = $null
 $Failure = $null
 $DestroyVerified = $false
 $CopyVerified = $false
+$DebugWindowEntered = $false
+$DebugWindowStartedAt = $null
+$DebugWindowFinishedAt = $null
 $pollHistory = [System.Collections.Generic.List[object]]::new()
 $controllerLogPath = Join-Path $ResolvedEvidenceDirectory "vast-container.log"
 
@@ -293,6 +312,8 @@ try {
     $InstanceId = [long]$newContract
     $InstanceCreatedAt = $CreateAttemptAt
     Write-Host "Created Vast instance $InstanceId"
+    Invoke-VastJson -VastArguments @("attach", "ssh", [string]$InstanceId, $SshPublicKey, "--raw") | Out-Null
+    Write-Host "Attached the pinned experiment SSH public key"
 
     $deadline = $InstanceCreatedAt.AddMinutes($MaximumRuntimeMinutes)
     $completionSeen = $false
@@ -362,6 +383,27 @@ try {
 catch {
     $Failure = $_
     Write-Warning $_.Exception.Message
+    if ($null -ne $InstanceId -and $FailureDebugMinutes -gt 0) {
+        $DebugWindowEntered = $true
+        $DebugWindowStartedAt = [DateTimeOffset]::UtcNow
+        $debugDeadline = $DebugWindowStartedAt.AddMinutes($FailureDebugMinutes)
+        Write-Host "Failure debug window opened for up to $FailureDebugMinutes minutes on instance $InstanceId"
+        while ([DateTimeOffset]::UtcNow -lt $debugDeadline) {
+            try {
+                $allInstances = @(Get-AllInstances)
+                $stillPresent = $allInstances | Where-Object { [long]$_.id -eq $InstanceId } | Select-Object -First 1
+                if ($null -eq $stillPresent) {
+                    break
+                }
+            }
+            catch {
+                Write-Warning "Debug-window status check failed: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds ([Math]::Min($PollSeconds, 30))
+        }
+        $DebugWindowFinishedAt = [DateTimeOffset]::UtcNow
+        Write-Host "Failure debug window closed"
+    }
 }
 finally {
     if ($null -eq $InstanceId) {
@@ -432,6 +474,10 @@ finally {
         internet_up_cost_per_tb = Get-ObjectProperty -Value $offer -Name "internet_up_cost_per_tb"
         copy_verified = $CopyVerified
         destroy_verified = $DestroyVerified
+        failure_debug_minutes = $FailureDebugMinutes
+        debug_window_entered = $DebugWindowEntered
+        debug_window_started_unix = if ($null -ne $DebugWindowStartedAt) { $DebugWindowStartedAt.ToUnixTimeSeconds() } else { $null }
+        debug_window_finished_unix = if ($null -ne $DebugWindowFinishedAt) { $DebugWindowFinishedAt.ToUnixTimeSeconds() } else { $null }
         failure = if ($null -ne $Failure) { $Failure.Exception.Message } else { $null }
     }
     Write-JsonFile -Value $summary -Path (Join-Path $ResolvedEvidenceDirectory "controller-summary.json")
