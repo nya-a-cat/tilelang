@@ -29,6 +29,8 @@ import tilelang.language as T
 RPC_PREFIX = "TILELANG_COMMIT_AB_RPC="
 LABEL = os.environ.get("TILELANG_COMMIT_AB_LABEL", "unknown")
 SOURCE_COMMIT = os.environ.get("TILELANG_COMMIT_AB_SOURCE_COMMIT", "unknown")
+SUITE = os.environ.get("TILELANG_COMMIT_AB_SUITE", "layout")
+SUITE_CASES = {"layout": 18, "reduction": 12}
 INVENTORY_PATH = Path(
     os.environ.get(
         "TILELANG_COMMIT_AB_INVENTORY",
@@ -197,6 +199,110 @@ def make_transpose(
     return with_symbol(main, symbol)
 
 
+def make_row_reduce(
+    batch: int,
+    width: int,
+    dtype: str,
+    op: str,
+    threads: int,
+    symbol: str,
+) -> Any:
+    @T.prim_func
+    def main(A: T.Tensor((batch, width), dtype), B: T.Tensor((batch,), dtype)):
+        with T.Kernel(batch, threads=threads) as bx:
+            values = T.alloc_fragment((width,), dtype)
+            result = T.alloc_fragment((1,), dtype)
+            T.copy(A[bx, 0], values)
+            if op == "sum":
+                T.reduce_sum(values, result, dim=0)
+            elif op == "max":
+                T.reduce_max(values, result, dim=0, clear=True)
+            elif op == "min":
+                T.reduce_min(values, result, dim=0, clear=True)
+            elif op == "abssum":
+                T.reduce_abssum(values, result, dim=0)
+            elif op == "bitor":
+                T.reduce_bitor(values, result, dim=0, clear=True)
+            B[bx] = result[0]
+
+    return with_symbol(main, symbol)
+
+
+def make_rmsnorm(rows: int, width: int, symbol: str) -> Any:
+    @T.prim_func
+    def main(A: T.Tensor((rows, width), T.float32), B: T.Tensor((rows, width), T.float32)):
+        with T.Kernel(rows, threads=128) as bx:
+            values = T.alloc_fragment((width,), T.float32)
+            squares = T.alloc_fragment((width,), T.float32)
+            total = T.alloc_fragment((1,), T.float32)
+            T.copy(A[bx, 0], values)
+            for j in T.Parallel(width):
+                squares[j] = values[j] * values[j]
+            T.reduce_sum(squares, total, dim=0)
+            scale = T.rsqrt(total[0] / width + 1e-6)
+            for j in T.Parallel(width):
+                values[j] *= scale
+            T.copy(values, B[bx, 0])
+
+    return with_symbol(main, symbol)
+
+
+def make_softmax(rows: int, width: int, symbol: str) -> Any:
+    @T.prim_func
+    def main(A: T.Tensor((rows, width), T.float32), B: T.Tensor((rows, width), T.float32)):
+        with T.Kernel(rows, threads=128) as bx:
+            values = T.alloc_fragment((width,), T.float32)
+            maximum = T.alloc_fragment((1,), T.float32)
+            total = T.alloc_fragment((1,), T.float32)
+            T.copy(A[bx, 0], values)
+            T.reduce_max(values, maximum, dim=0, clear=True)
+            for j in T.Parallel(width):
+                values[j] = T.exp(values[j] - maximum[0])
+            T.reduce_sum(values, total, dim=0)
+            for j in T.Parallel(width):
+                values[j] /= total[0]
+            T.copy(values, B[bx, 0])
+
+    return with_symbol(main, symbol)
+
+
+def make_layernorm(rows: int, width: int, symbol: str) -> Any:
+    @T.prim_func
+    def main(
+        X: T.Tensor((rows, width), T.float16),
+        Gamma: T.Tensor((width,), T.float16),
+        Beta: T.Tensor((width,), T.float16),
+        Y: T.Tensor((rows, width), T.float16),
+    ):
+        with T.Kernel(rows, threads=128) as bx:
+            x_shared = T.alloc_shared((width,), T.float16)
+            gamma_shared = T.alloc_shared((width,), T.float16)
+            beta_shared = T.alloc_shared((width,), T.float16)
+            values = T.alloc_fragment((width,), T.float32)
+            squares = T.alloc_fragment((width,), T.float32)
+            sum_value = T.alloc_fragment((1,), T.float32)
+            sumsq = T.alloc_fragment((1,), T.float32)
+
+            T.copy(X[bx, 0], x_shared)
+            T.copy(Gamma, gamma_shared)
+            T.copy(Beta, beta_shared)
+            for j in T.Parallel(width):
+                values[j] = T.cast(x_shared[j], T.float32)
+                squares[j] = values[j] * values[j]
+            T.reduce_sum(values, sum_value, dim=0)
+            T.reduce_sum(squares, sumsq, dim=0)
+            mean = sum_value[0] / width
+            rstd = T.rsqrt(sumsq[0] / width - mean * mean + 1e-5)
+            for j in T.Parallel(width):
+                x_shared[j] = T.cast(
+                    (values[j] - mean) * rstd * T.cast(gamma_shared[j], T.float32) + T.cast(beta_shared[j], T.float32),
+                    T.float16,
+                )
+            T.copy(x_shared, Y[bx, 0])
+
+    return with_symbol(main, symbol)
+
+
 def deterministic_cpu_tensor(
     shape: tuple[int, ...],
     dtype: torch.dtype,
@@ -212,11 +318,24 @@ def deterministic_cpu_tensor(
     return tensor, digest
 
 
+def deterministic_int_cpu_tensor(
+    shape: tuple[int, ...],
+    salt: int,
+) -> tuple[torch.Tensor, str]:
+    count = 1
+    for extent in shape:
+        count *= extent
+    values = torch.arange(count, dtype=torch.int64)
+    tensor = (((values * (29 + salt * 2) + 7 + salt) % 65521) - 32760).reshape(shape).to(torch.int32)
+    digest = sha256_bytes(tensor.contiguous().numpy().tobytes())
+    return tensor, digest
+
+
 def to_cuda(cpu_tensor: torch.Tensor) -> torch.Tensor:
     return cpu_tensor.to(device="cuda", non_blocking=False)
 
 
-def build_cases() -> list[BenchmarkCase]:
+def build_layout_cases() -> list[BenchmarkCase]:
     cases: list[BenchmarkCase] = []
 
     for rows, cols, threads in (
@@ -344,6 +463,127 @@ def build_cases() -> list[BenchmarkCase]:
     return cases
 
 
+def bitwise_or_reference(source: torch.Tensor) -> torch.Tensor:
+    result = source[:, 0].clone()
+    for column in range(1, source.shape[1]):
+        result.bitwise_or_(source[:, column])
+    return result
+
+
+def build_reduction_cases() -> list[BenchmarkCase]:
+    cases: list[BenchmarkCase] = []
+    for op, batch, width, dtype, torch_dtype, threads in (
+        ("sum", 1, 128, "float32", torch.float32, 128),
+        ("max", 4, 1024, "float32", torch.float32, 128),
+        ("min", 8, 4096, "float32", torch.float32, 256),
+        ("abssum", 4, 16384, "float32", torch.float32, 256),
+        ("bitor", 8, 4096, "int32", torch.int32, 256),
+    ):
+        name = f"reduce_{op}_{dtype}_b{batch}_n{width}_t{threads}"
+        if torch_dtype == torch.int32:
+            source_cpu, source_hash = deterministic_int_cpu_tensor((batch, width), batch + width)
+        else:
+            source_cpu, source_hash = deterministic_cpu_tensor((batch, width), torch_dtype, batch + width)
+        source = to_cuda(source_cpu)
+        if op == "sum":
+            reference = source.sum(dim=1).to(torch_dtype)
+        elif op == "max":
+            reference = source.max(dim=1).values
+        elif op == "min":
+            reference = source.min(dim=1).values
+        elif op == "abssum":
+            reference = source.abs().sum(dim=1).to(torch_dtype)
+        elif op == "bitor":
+            reference = bitwise_or_reference(source_cpu).to(device="cuda")
+        else:
+            raise ValueError(op)
+        cases.append(
+            BenchmarkCase(
+                name=name,
+                family="reduction",
+                program=make_row_reduce(batch, width, dtype, op, threads, f"commit_ab_{name}"),
+                inputs=(source,),
+                input_sha256=(source_hash,),
+                output_shape=(batch,),
+                output_dtype=torch_dtype,
+                reference=reference,
+                atol=2e-3 if op == "abssum" else 1e-5 if torch_dtype == torch.float32 else 0.0,
+                rtol=2e-3 if op == "abssum" else 1e-5 if torch_dtype == torch.float32 else 0.0,
+            )
+        )
+
+    for rows, width in ((1, 128), (32, 4096), (1280, 16384)):
+        name = f"softmax_f32_b{rows}_h{width}_t128"
+        source_cpu, source_hash = deterministic_cpu_tensor((rows, width), torch.float32, rows + width)
+        source = to_cuda(source_cpu)
+        cases.append(
+            BenchmarkCase(
+                name=name,
+                family="softmax",
+                program=make_softmax(rows, width, f"commit_ab_{name}"),
+                inputs=(source,),
+                input_sha256=(source_hash,),
+                output_shape=(rows, width),
+                output_dtype=torch.float32,
+                reference=torch.softmax(source, dim=1),
+                atol=2e-4,
+                rtol=2e-3,
+            )
+        )
+
+    for rows, width in ((1, 128), (32, 4096), (1280, 8192)):
+        name = f"rmsnorm_f32_b{rows}_h{width}_t128"
+        source_cpu, source_hash = deterministic_cpu_tensor((rows, width), torch.float32, rows + width + 1)
+        source = to_cuda(source_cpu)
+        cases.append(
+            BenchmarkCase(
+                name=name,
+                family="rmsnorm",
+                program=make_rmsnorm(rows, width, f"commit_ab_{name}"),
+                inputs=(source,),
+                input_sha256=(source_hash,),
+                output_shape=(rows, width),
+                output_dtype=torch.float32,
+                reference=source * torch.rsqrt(source.square().mean(dim=1, keepdim=True) + 1e-6),
+                atol=2e-3,
+                rtol=2e-3,
+            )
+        )
+
+    rows, width = 1280, 4096
+    name = f"layernorm_f16_b{rows}_h{width}_t128"
+    source_cpu, source_hash = deterministic_cpu_tensor((rows, width), torch.float16, rows + width + 2)
+    gamma_cpu, gamma_hash = deterministic_cpu_tensor((width,), torch.float16, width + 3)
+    beta_cpu, beta_hash = deterministic_cpu_tensor((width,), torch.float16, width + 4)
+    source, gamma, beta = map(to_cuda, (source_cpu, gamma_cpu, beta_cpu))
+    cases.append(
+        BenchmarkCase(
+            name=name,
+            family="layernorm",
+            program=make_layernorm(rows, width, f"commit_ab_{name}"),
+            inputs=(source, gamma, beta),
+            input_sha256=(source_hash, gamma_hash, beta_hash),
+            output_shape=(rows, width),
+            output_dtype=torch.float16,
+            reference=torch.nn.functional.layer_norm(source, (width,), gamma, beta, eps=1e-5),
+            atol=2e-2,
+            rtol=2e-2,
+        )
+    )
+
+    if len(cases) != SUITE_CASES["reduction"]:
+        raise RuntimeError(f"expected {SUITE_CASES['reduction']} frozen reduction cases, got {len(cases)}")
+    return cases
+
+
+def build_cases() -> list[BenchmarkCase]:
+    if SUITE == "layout":
+        return build_layout_cases()
+    if SUITE == "reduction":
+        return build_reduction_cases()
+    raise ValueError(f"unsupported suite: {SUITE!r}")
+
+
 def compile_case(case: BenchmarkCase) -> tuple[RuntimeCase, dict[str, Any]]:
     canonical_ir = str(case.program)
     output = torch.empty(case.output_shape, device="cuda", dtype=case.output_dtype)
@@ -464,6 +704,7 @@ def runtime_call(runtime: RuntimeCase, mode: str) -> Callable[[], None]:
 def system_inventory() -> dict[str, Any]:
     return {
         "label": LABEL,
+        "suite": SUITE,
         "source_commit": SOURCE_COMMIT,
         "platform": platform.platform(),
         "python": sys.version,
@@ -489,14 +730,20 @@ def main() -> int:
     started = time.time()
     runtimes: dict[str, RuntimeCase] = {}
     inventory: dict[str, Any] = {
-        "schema": "tilelang-fixed-commit-worker-inventory-v1",
+        "schema": "tilelang-fixed-commit-worker-inventory-v2",
         "status": "failed",
+        "suite": SUITE,
         "system": system_inventory(),
         "cases": [],
         "started_unix": started,
     }
     try:
-        for case in build_cases():
+        if SUITE not in SUITE_CASES:
+            raise ValueError(f"unsupported suite: {SUITE!r}")
+        cases = build_cases()
+        if len(cases) != SUITE_CASES[SUITE]:
+            raise RuntimeError(f"suite case count drifted: {SUITE}={len(cases)}")
+        for case in cases:
             runtime, case_inventory = compile_case(case)
             runtimes[case.name] = runtime
             inventory["cases"].append(case_inventory)
@@ -523,6 +770,7 @@ def main() -> int:
         {
             "status": "ready",
             "label": LABEL,
+            "suite": SUITE,
             "source_commit": SOURCE_COMMIT,
             "case_names": list(runtimes),
             "graph_cases": [name for name, runtime in runtimes.items() if runtime.graph_call is not None],

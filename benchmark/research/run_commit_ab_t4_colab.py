@@ -1,9 +1,10 @@
-"""Run a fixed-baseline versus candidate TileLang A/B on one Colab T4.
+"""Run a fixed-baseline versus candidate TileLang A/B suite on one Colab T4.
 
 Upload ``benchmark_commit_ab_t4.py`` beside this controller in ``WORK_DIR``.
 The controller hash-checks every input, creates isolated Python environments
 and TileLang caches, then alternates persistent baseline/candidate workers for
-30 paired cycles. Only the installed TileLang compiler/runtime version changes.
+30 paired cycles. The installed TileLang compiler/runtime version is the sole
+experimental variable.
 """
 
 from __future__ import annotations
@@ -50,14 +51,42 @@ CANDIDATE_OVERLAY_ASSETS = {
 }
 
 WORKER_NAME = "benchmark_commit_ab_t4.py"
-WORKER_SHA256 = "4ab35bcf32c15e3be4552e6a128d9fc69d30d3dc53110b0e14fae05bcd572b56"
+WORKER_SHA256 = "2e16921098db7457b38c841e30d40bcf4956da8fef9af98c3f988ef7bf8d7667"
 RPC_PREFIX = "TILELANG_COMMIT_AB_RPC="
-WORK_DIR = Path("/tmp/tilelang-fixed-commit-ab")
+SUITE_CONFIGS = {
+    "layout": {
+        "case_count": 18,
+        "workload": "layout/elementwise",
+        "evidence_boundary": (
+            "This is an advisory free-T4 SM75 screen of the frozen 18-case layout/elementwise workload. "
+            "It attributes observed differences to fixed baseline versus candidate TileLang compiler/runtime "
+            "commits under default settings. Reduction/normalization, subgraphs, models, external suites, cold-L2, "
+            "A100, H100, B200, RTX 5090, and MI300X primary gates remain open."
+        ),
+    },
+    "reduction": {
+        "case_count": 12,
+        "workload": "reduction/normalization",
+        "evidence_boundary": (
+            "This is an advisory free-T4 SM75 screen of the frozen 12-case reduction/normalization workload: "
+            "direct sum, max, min, absolute-sum, and bitwise-or reductions plus Softmax, RMSNorm, and LayerNorm. "
+            "It attributes observed differences to fixed baseline versus candidate TileLang compiler/runtime "
+            "commits under default settings. Subgraphs, models, external suites, cold-L2, A100, H100, B200, "
+            "RTX 5090, and MI300X primary gates remain open."
+        ),
+    },
+}
+SUITE = os.environ.get("TILELANG_COMMIT_AB_SUITE", "layout")
+if SUITE not in SUITE_CONFIGS:
+    raise ValueError(f"unsupported TILELANG_COMMIT_AB_SUITE: {SUITE!r}")
+SUITE_CONFIG = SUITE_CONFIGS[SUITE]
+CASE_COUNT = int(SUITE_CONFIG["case_count"])
+WORK_DIR = Path(f"/tmp/tilelang-fixed-commit-ab-{SUITE}")
 WORKER_UPLOAD_PATH = Path(os.environ.get("TILELANG_WORKER_UPLOAD_PATH", f"/tmp/{WORKER_NAME}"))
-OUTPUT_DIR = Path("/tmp/tilelang-fixed-commit-ab-evidence")
-RESULT_PATH = OUTPUT_DIR / "tilelang-fixed-commit-ab-t4.json"
-GZIP_PATH = OUTPUT_DIR / "tilelang-fixed-commit-ab-t4.json.gz"
-REPORT_PATH = OUTPUT_DIR / "tilelang-fixed-commit-ab-t4-report.md"
+OUTPUT_DIR = Path(f"/tmp/tilelang-fixed-commit-ab-{SUITE}-evidence")
+RESULT_PATH = OUTPUT_DIR / f"tilelang-fixed-commit-ab-{SUITE}-t4.json"
+GZIP_PATH = OUTPUT_DIR / f"tilelang-fixed-commit-ab-{SUITE}-t4.json.gz"
+REPORT_PATH = OUTPUT_DIR / f"tilelang-fixed-commit-ab-{SUITE}-t4-report.md"
 CHECKSUM_PATH = OUTPUT_DIR / "SHA256SUMS"
 BASELINE_ENV = WORK_DIR / "venv-baseline"
 CANDIDATE_ENV = WORK_DIR / "venv-candidate"
@@ -211,6 +240,7 @@ class WorkerClient:
                 "TILELANG_CACHE_DIR": str(self.cache_dir),
                 "TILELANG_COMMIT_AB_LABEL": self.label,
                 "TILELANG_COMMIT_AB_SOURCE_COMMIT": self.source_commit,
+                "TILELANG_COMMIT_AB_SUITE": SUITE,
                 "TILELANG_COMMIT_AB_INVENTORY": str(self.inventory_path),
             }
         )
@@ -453,10 +483,12 @@ def load_and_compare_inventories() -> tuple[dict[str, Any], dict[str, Any]]:
     candidate = json.loads(CANDIDATE_INVENTORY.read_text(encoding="utf-8"))
     if baseline.get("status") != "ready" or candidate.get("status") != "ready":
         raise RuntimeError("a worker inventory is incomplete")
+    if baseline.get("suite") != SUITE or candidate.get("suite") != SUITE:
+        raise RuntimeError(f"worker inventory suite mismatch for {SUITE}")
     baseline_cases = {case["name"]: case for case in baseline["cases"]}
     candidate_cases = {case["name"]: case for case in candidate["cases"]}
-    if list(baseline_cases) != list(candidate_cases) or len(baseline_cases) != 18:
-        raise RuntimeError("baseline and candidate case lists differ from the frozen 18-case suite")
+    if list(baseline_cases) != list(candidate_cases) or len(baseline_cases) != CASE_COUNT:
+        raise RuntimeError(f"baseline and candidate case lists differ from the frozen {CASE_COUNT}-case {SUITE} suite")
     identity_fields = (
         "family",
         "canonical_primfunc_sha256",
@@ -612,7 +644,7 @@ def aggregate_results(cases: list[dict[str, Any]]) -> dict[str, Any]:
             families[case["family"]][mode].append(float(case[mode]["event_candidate_speedup_over_baseline"]))
     return {
         "complete_cases": len(cases),
-        "total_cases": 18,
+        "total_cases": CASE_COUNT,
         "eager_event_speedup_geomean": geometric_mean([float(case["eager"]["event_candidate_speedup_over_baseline"]) for case in cases]),
         "cuda_graph_event_speedup_geomean": geometric_mean(
             [float(case["cuda_graph"]["event_candidate_speedup_over_baseline"]) for case in cases]
@@ -633,15 +665,16 @@ def aggregate_results(cases: list[dict[str, Any]]) -> dict[str, Any]:
 def report_markdown(payload: dict[str, Any]) -> str:
     aggregate = payload["aggregate"]
     lines = [
-        "# TileLang fixed-commit A/B: free T4 screen",
+        f"# TileLang fixed-commit A/B: free T4 {SUITE} screen",
         "",
-        f"- Status: `{payload['status']}`; correctness-complete cases: `18/18`.",
+        f"- Status: `{payload['status']}`; correctness-complete cases: `{CASE_COUNT}/{CASE_COUNT}`.",
+        f"- Frozen suite: `{SUITE}` ({SUITE_CONFIG['workload']}).",
         f"- Fixed baseline: `{BASELINE_COMMIT}` (build-only scaffold `{BASELINE_BUILD_COMMIT}`).",
         f"- Candidate compiler/runtime: `{CANDIDATE_COMMIT}`.",
         "- Comparison: byte-identical PrimFuncs and inputs, isolated environments and caches, default backend settings.",
         f"- Eager CUDA-event geometric mean: `{aggregate['eager_event_speedup_geomean']:.6f}x`.",
         f"- CUDA Graph CUDA-event geometric mean: `{aggregate['cuda_graph_event_speedup_geomean']:.6f}x`.",
-        f"- Generated-source changes: `{aggregate['source_changed_cases']}/18` cases.",
+        f"- Generated-source changes: `{aggregate['source_changed_cases']}/{CASE_COUNT}` cases.",
         f"- Critical slices below 0.97x: `{len(aggregate['critical_regressions_below_0_97'])}`.",
         "",
         "## Per-case results",
@@ -701,9 +734,11 @@ def main() -> int:
     runner_source_sha = os.environ.get("TILELANG_RUNNER_SOURCE_SHA", "")
     controller_sha256 = os.environ.get("TILELANG_CONTROLLER_SHA256", "")
     payload: dict[str, Any] = {
-        "schema": "tilelang-fixed-commit-colab-ab-v1",
+        "schema": "tilelang-fixed-commit-colab-ab-v2",
         "status": "failed",
         "repository": REPOSITORY,
+        "suite": SUITE,
+        "suite_case_count": CASE_COUNT,
         "baseline_commit": BASELINE_COMMIT,
         "baseline_build_commit": BASELINE_BUILD_COMMIT,
         "candidate_commit": CANDIDATE_COMMIT,
@@ -713,12 +748,7 @@ def main() -> int:
             "python": sys.version,
             "nvidia_smi": command_output(["nvidia-smi"]),
         },
-        "evidence_boundary": (
-            "This is an advisory free-T4 SM75 screen of the frozen 18-case layout/elementwise workload. "
-            "It attributes observed differences only to fixed baseline versus candidate TileLang compiler/runtime "
-            "commits under default settings. Reduction/normalization, subgraphs, models, external suites, cold-L2, "
-            "A100, H100, B200, RTX 5090, and MI300X primary gates remain open."
-        ),
+        "evidence_boundary": SUITE_CONFIG["evidence_boundary"],
     }
     exit_code = 0
     try:
@@ -752,10 +782,12 @@ def main() -> int:
             "baseline": workers["baseline"].start(),
             "candidate": workers["candidate"].start(),
         }
+        if ready["baseline"].get("suite") != SUITE or ready["candidate"].get("suite") != SUITE:
+            raise RuntimeError(f"worker ready suite mismatch for {SUITE}")
         baseline_inventory, candidate_inventory = load_and_compare_inventories()
         cases = run_benchmark(workers, baseline_inventory, candidate_inventory)
         aggregate = aggregate_results(cases)
-        if aggregate["complete_cases"] != 18:
+        if aggregate["complete_cases"] != CASE_COUNT:
             raise RuntimeError(f"case completion drifted: {aggregate}")
         payload.update(
             {
@@ -764,6 +796,8 @@ def main() -> int:
                 "controller_sha256": controller_sha256,
                 "worker_sha256": WORKER_SHA256,
                 "protocol": {
+                    "suite": SUITE,
+                    "case_count": CASE_COUNT,
                     "cycles": CYCLES,
                     "paired_order_even": ["baseline", "candidate", "candidate", "baseline"],
                     "paired_order_odd": ["candidate", "baseline", "baseline", "candidate"],
