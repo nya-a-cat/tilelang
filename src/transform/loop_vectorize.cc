@@ -663,6 +663,14 @@ private:
           GetMaxCPAsyncVectorizeLength(GetCPAsyncBitsPerCall(node).value_or(0));
       buffer_vector_infos_.push_back({Buffer(), vectorize_length, false, {}});
       return arith::IRMutatorWithAnalyzer::VisitExpr_(node);
+    } else if (node->op.same_as(builtin::reinterpret()) &&
+               !tl_config::ReinterpretVectorizationDisabled()) {
+      // Reinterpret is lane-wise and TLVectorizer has an explicit rewrite
+      // that preserves the lane count.  Treating it as an opaque call adds a
+      // false invariance constraint from its buffer-load argument and can
+      // collapse otherwise legal grouped-load vectorization to one or two
+      // lanes (for example int4 unpacking from uint8 fragments).
+      return arith::IRMutatorWithAnalyzer::VisitExpr_(node);
     } else if (node->op == builtin::address_of() ||
                node->op == tl::access_ptr()) {
       // address_of and tl.access_ptr have buffer load value so we should

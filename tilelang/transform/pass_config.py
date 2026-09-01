@@ -307,6 +307,13 @@ class PassConfigKey(str, Enum):
     ```
     """
 
+    TL_DISABLE_REINTERPRET_VECTORIZATION = "tl.disable_reinterpret_vectorization"
+    """Restore legacy vectorization planning for ``reinterpret`` calls.
+
+    The default planner treats bit reinterpretation as a transparent lane-wise
+    operation. Set this flag to True only for backend A/B testing or rollback.
+    """
+
     # TIR related configs: TIR_XX
 
     TIR_ENABLE_EQUIV_TERMS_IN_CSE = "tir.enable_equiv_terms_in_cse_tir"

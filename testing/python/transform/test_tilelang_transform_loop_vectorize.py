@@ -257,6 +257,24 @@ def test_large_coefficient_boundary_invariant_index_remains_vectorizable():
     assert _vectorized_extents(transformed["main"]) == [vector_size]
 
 
+def test_reinterpret_is_transparent_to_vectorization_planning():
+    """Lane-wise bit reinterpretation must not scalarize a contiguous loop."""
+    extent = 4
+
+    @T.prim_func
+    def main(
+        input: T.Tensor((extent,), T.uint8),
+        output: T.Tensor((extent,), T.int8),
+    ):
+        with T.Kernel(1, threads=extent):
+            for i in T.vectorized(extent):
+                output[i] = tvm.tirx.reinterpret(T.int8, input[i])
+
+    transformed = _run_vectorized_loop_legalizer(main)
+
+    assert _vectorized_extents(transformed["main"]) == [extent]
+
+
 def test_overflow_promotion_preserves_atomic_vector_lanes():
     """Widening a dynamic row offset must not break x4 atomic lanes."""
     extent = 128

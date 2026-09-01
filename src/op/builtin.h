@@ -100,6 +100,8 @@ static constexpr const char *kEnableLayoutCostTrace =
     "tl.enable_layout_cost_trace";
 static constexpr const char *kEnableVectorizePlannerVerbose =
     "tl.enable_vectorize_planner_verbose";
+static constexpr const char *kDisableReinterpretVectorization =
+    "tl.disable_reinterpret_vectorization";
 static constexpr const char *kDisableLoopUnswitching =
     "tl.disable_loop_unswitching";
 static constexpr const char *kLoopUnswitchingAllowNonTrivialElse =

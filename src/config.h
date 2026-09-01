@@ -59,6 +59,14 @@ inline bool VectorizePlannerVerboseEnabled() {
       .value_or(Bool(false));
 }
 
+/*! \brief Restore the legacy opaque-call treatment of reinterpret. */
+inline bool ReinterpretVectorizationDisabled() {
+  auto ctxt = tvm::transform::PassContext::Current();
+  return ctxt
+      ->GetConfig("tl.disable_reinterpret_vectorization", ffi::Optional<Bool>())
+      .value_or(Bool(false));
+}
+
 /*!
  * \brief Check if 256-bit vectorization is disabled.
  */
