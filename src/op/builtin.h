@@ -94,6 +94,8 @@ static constexpr const char *kEnableReducerPlanVerbose =
 // coalescing of every fragment<->global copy, weighted by bytes moved —
 // with register count as the tiebreak.
 static constexpr const char *kLayoutCostModel = "tl.layout_cost_model";
+static constexpr const char *kEnableLayoutCostTrace =
+    "tl.enable_layout_cost_trace";
 static constexpr const char *kEnableVectorizePlannerVerbose =
     "tl.enable_vectorize_planner_verbose";
 static constexpr const char *kDisableLoopUnswitching =

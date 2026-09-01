@@ -140,6 +140,15 @@ struct StatementTraffic {
   int64_t Time() const { return std::max(bw, issue); }
 };
 
+struct StatementCharge {
+  int64_t mem{0};
+  int64_t bw{0};
+  int64_t issue{0};
+  int64_t measured{0};
+  int64_t worst_case{0};
+  int64_t unavailable{0};
+};
+
 void LogProbe(int member_idx, const char *what, const StatementProbe &probe) {
   const char *state = probe.accesses.empty()
                           ? "no-global-access"
@@ -983,7 +992,8 @@ public:
     DLOG(INFO) << "[LayoutCost] register-count score begin: members="
                << FormatVector(members);
     AttemptCost cost;
-    cost.mem = CountSpilledBytes(members, infer_list, tmp_layout_map);
+    cost.spill = CountSpilledBytes(members, infer_list, tmp_layout_map);
+    cost.mem = cost.spill;
     cost.regs = CountRegisterSlots(tmp_layout_map);
     DLOG(INFO) << "[LayoutCost] register-count score end: mem(spill)="
                << cost.mem << " regs=" << cost.regs;
@@ -1010,7 +1020,8 @@ public:
     AttemptCost cost;
     // Spill traffic enters the same byte-denominated channel as the global
     // estimates below, competing rather than vetoing.
-    cost.mem = CountSpilledBytes(members, infer_list, tmp_layout_map);
+    cost.spill = CountSpilledBytes(members, infer_list, tmp_layout_map);
+    cost.mem = cost.spill;
     cost.regs = CountRegisterSlots(tmp_layout_map);
 
     for (int idx : members) {
@@ -1055,8 +1066,8 @@ public:
         }
         DLOG(INFO) << "[LayoutCost] member " << idx << " copy fragment layout: "
                    << frag_layout.value()->DebugOutput();
-        int64_t statement_mem =
-            CachedStatementMem(idx, frag_layout.value(), [&]() {
+        StatementCharge statement =
+            CachedStatementCost(idx, frag_layout.value(), [&]() {
               std::optional<StatementProbe> probe;
               try {
                 probe = BuildCopyProbe(copy_op, frag_layout.value(),
@@ -1069,9 +1080,9 @@ public:
               }
               return ChargeStatement(probe, idx, "copy");
             });
-        cost.mem += statement_mem;
+        AccumulateCharge(&cost, statement);
         DLOG(INFO) << "[LayoutCost] member " << idx
-                   << " copy contribution=" << statement_mem
+                   << " copy contribution=" << statement.mem
                    << " running_mem=" << cost.mem;
       } else if (const auto *loop = infer_list[idx].as<ParallelOpNode>()) {
         ParallelOp loop_op = GetRef<ParallelOp>(loop);
@@ -1095,13 +1106,13 @@ public:
           }
           return ChargeStatement(probe, idx, "parallel-loop");
         };
-        int64_t statement_mem =
+        StatementCharge statement =
             loop_layout.defined()
-                ? CachedStatementMem(idx, loop_layout, compute)
+                ? CachedStatementCost(idx, loop_layout, compute)
                 : compute();
-        cost.mem += statement_mem;
+        AccumulateCharge(&cost, statement);
         DLOG(INFO) << "[LayoutCost] member " << idx
-                   << " parallel-loop contribution=" << statement_mem
+                   << " parallel-loop contribution=" << statement.mem
                    << " running_mem=" << cost.mem;
       } else {
         DLOG(INFO) << "[LayoutCost] member " << idx
@@ -1117,20 +1128,34 @@ public:
   const char *Name() const final { return "io-aware"; }
 
 private:
+  static void AccumulateCharge(AttemptCost *cost,
+                               const StatementCharge &statement) {
+    cost->mem += statement.mem;
+    cost->global_mem += statement.mem;
+    cost->global_bw += statement.bw;
+    cost->global_issue += statement.issue;
+    cost->measured_statements += statement.measured;
+    cost->worst_case_statements += statement.worst_case;
+    cost->unavailable_statements += statement.unavailable;
+  }
+
   /*! \brief Final charge of one prepared statement, honoring the probe's
    *  three-state protocol (zero / worst-case / measured). */
-  static int64_t ChargeStatement(const std::optional<StatementProbe> &probe,
-                                 int member_idx, const char *what) {
+  static StatementCharge
+  ChargeStatement(const std::optional<StatementProbe> &probe, int member_idx,
+                  const char *what) {
     if (!probe.has_value()) {
       DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
                  << " probe unavailable; contribution=0";
-      return 0; // nothing sensible to charge
+      StatementCharge charge;
+      charge.unavailable = 1;
+      return charge; // nothing sensible to charge
     }
     LogProbe(member_idx, what, *probe);
     if (probe->accesses.empty()) {
       DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
                  << " has no direct global traffic; contribution=0";
-      return 0;
+      return StatementCharge{};
     }
     std::optional<StatementTraffic> traffic;
     if (probe->measurable) {
@@ -1141,13 +1166,22 @@ private:
                  << " measured: bw=" << traffic->bw
                  << " issue=" << traffic->issue
                  << " contribution=max(bw,issue)=" << traffic->Time();
-      return traffic->Time();
+      StatementCharge charge;
+      charge.mem = traffic->Time();
+      charge.bw = traffic->bw;
+      charge.issue = traffic->issue;
+      charge.measured = 1;
+      return charge;
     }
     int64_t worst_case = WorstCaseBytes(*probe);
     DLOG(INFO) << "[LayoutCost] member " << member_idx << ' ' << what
                << " outside the measurable model; worst-case contribution="
                << worst_case;
-    return worst_case;
+    StatementCharge charge;
+    charge.mem = worst_case;
+    charge.bw = worst_case;
+    charge.worst_case = 1;
+    return charge;
   }
 
   /*! \brief Memoize a statement's charge by (op index, layout): the charge
@@ -1156,27 +1190,28 @@ private:
    *  those attempts then score the statement for free. Structural layout
    *  equality; entries per index stay tiny (one per distinct layout). */
   template <typename F>
-  int64_t CachedStatementMem(int idx, const Fragment &layout,
-                             F &&compute) const {
+  StatementCharge CachedStatementCost(int idx, const Fragment &layout,
+                                      F &&compute) const {
     auto &entries = stmt_cache_[idx];
-    for (const auto &[cached_layout, mem] : entries) {
+    for (const auto &[cached_layout, cost] : entries) {
       if (cached_layout->IsEqual(layout.get())) {
         DLOG(INFO) << "[LayoutCost] member " << idx
-                   << " statement cache hit: contribution=" << mem;
-        return mem;
+                   << " statement cache hit: contribution=" << cost.mem;
+        return cost;
       }
     }
     DLOG(INFO) << "[LayoutCost] member " << idx
                << " statement cache miss: cached_layouts=" << entries.size();
-    int64_t mem = compute();
-    entries.emplace_back(layout, mem);
+    StatementCharge cost = compute();
+    entries.emplace_back(layout, cost);
     DLOG(INFO) << "[LayoutCost] member " << idx
-               << " statement cache store: contribution=" << mem;
-    return mem;
+               << " statement cache store: contribution=" << cost.mem;
+    return cost;
   }
 
   Target target_;
-  mutable std::unordered_map<int, std::vector<std::pair<Fragment, int64_t>>>
+  mutable std::unordered_map<int,
+                             std::vector<std::pair<Fragment, StatementCharge>>>
       stmt_cache_;
 };
 

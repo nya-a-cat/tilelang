@@ -124,6 +124,12 @@ class PassConfigKey(str, Enum):
     ``TILELANG_LAYOUT_COST_MODEL`` environment variable supplies the
     default. Default: 'register-count'"""
 
+    TL_ENABLE_LAYOUT_COST_TRACE = "tl.enable_layout_cost_trace"
+    """Emit machine-readable INFO records for free-mode layout attempts and
+    the final selection. The trace decomposes the existing score into spill,
+    global-memory, bandwidth, issue-depth, and register-proxy fields without
+    changing candidate ordering. Default: False"""
+
     TL_REDUCER_FORCE_BASELINE = "tl.reducer_force_baseline"
     """Force the canonical FullParticipant baseline for every reducer epoch,
     disabling narrow physical plans (compact storage / sub-block collectives).

@@ -135,9 +135,17 @@ def test_register_count_is_default_layout_cost_model():
     default = infer()
     register_count = infer({"tl.layout_cost_model": "register-count"})
     io_aware = infer({"tl.layout_cost_model": "io-aware"})
+    traced_register_count = infer(
+        {"tl.layout_cost_model": "register-count", "tl.enable_layout_cost_trace": True}
+    )
+    traced_io_aware = infer(
+        {"tl.layout_cost_model": "io-aware", "tl.enable_layout_cost_trace": True}
+    )
 
     tvm.ir.assert_structural_equal(default, register_count)
     assert not tvm.ir.structural_equal(default, io_aware)
+    tvm.ir.assert_structural_equal(register_count, traced_register_count)
+    tvm.ir.assert_structural_equal(io_aware, traced_io_aware)
 
 
 def test_static_ragged_copy_minimizes_full_thread_padding():

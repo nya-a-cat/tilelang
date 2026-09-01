@@ -40,6 +40,16 @@ inline std::string LayoutCostModelName() {
 }
 
 /*!
+ * \brief Emit one machine-readable INFO record for every free-mode layout
+ * attempt and final selection. Disabled by default.
+ */
+inline bool LayoutCostTraceEnabled() {
+  auto ctxt = tvm::transform::PassContext::Current();
+  return ctxt->GetConfig("tl.enable_layout_cost_trace", ffi::Optional<Bool>())
+      .value_or(Bool(false));
+}
+
+/*!
  * \brief Check if vectorize planner verbose output is enabled.
  */
 inline bool VectorizePlannerVerboseEnabled() {

@@ -46,6 +46,16 @@ namespace tl {
 struct AttemptCost {
   int64_t mem{0};
   int64_t regs{0};
+  // Diagnostic decomposition of `mem`.  These fields do not participate in
+  // ordering; they make a traced attempt suitable for calibrating a future
+  // architecture-aware model without changing the current policies.
+  int64_t spill{0};
+  int64_t global_mem{0};
+  int64_t global_bw{0};
+  int64_t global_issue{0};
+  int64_t measured_statements{0};
+  int64_t worst_case_statements{0};
+  int64_t unavailable_statements{0};
   bool BetterThan(const AttemptCost &other) const {
     if (mem != other.mem) {
       return mem < other.mem;

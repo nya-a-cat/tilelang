@@ -1457,6 +1457,23 @@ private:
     std::unique_ptr<LayoutCostModel> cost_model =
         LayoutCostModel::Create(tl_config::LayoutCostModelName(), target_);
     DLOG(INFO) << "[InferInFreeMode] cost model: " << cost_model->Name();
+    const bool trace_costs = tl_config::LayoutCostTraceEnabled();
+    auto trace = [&](const char *phase, int component, int attempt_root,
+                     const AttemptCost &cost) {
+      if (!trace_costs) {
+        return;
+      }
+      LOG(INFO) << "TILELANG_LAYOUT_COST_TRACE schema=v1 phase=" << phase
+                << " model=" << cost_model->Name() << " component=" << component
+                << " attempt_root=" << attempt_root << " mem=" << cost.mem
+                << " regs=" << cost.regs << " spill=" << cost.spill
+                << " global_mem=" << cost.global_mem
+                << " global_bw=" << cost.global_bw
+                << " global_issue=" << cost.global_issue
+                << " measured=" << cost.measured_statements
+                << " worst_case=" << cost.worst_case_statements
+                << " unavailable=" << cost.unavailable_statements;
+    };
     for (auto &&[root, members] : components) {
       DLOG(INFO) << "======================= processing component " << root
                  << '\n';
@@ -1488,6 +1505,7 @@ private:
                    << " cost model " << cost_model->Name()
                    << " output: mem=" << outcome->cost.mem
                    << " regs=" << outcome->cost.regs;
+        trace("attempt", root, attempt_infer_root, outcome->cost);
         // Keep the cheapest attempt; ties resolve to the earliest root so
         // the selection stays deterministic (and, with the cost model
         // disabled, byte-identical to the legacy register ordering).
@@ -1528,6 +1546,7 @@ private:
                  << best_infer_root << " cost model " << cost_model->Name()
                  << " output: mem=" << best_cost.mem
                  << " regs=" << best_cost.regs;
+      trace("selected", root, best_infer_root, best_cost);
     }
   }
 };
