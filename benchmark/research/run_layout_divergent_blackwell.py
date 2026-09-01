@@ -53,6 +53,12 @@ MANIFEST = EVIDENCE_ROOT / "SHA256SUMS"
 EXPECTED_CAPABILITY = (12, 0)
 EXPECTED_GPU_NAME = os.environ.get("TILELANG_EXPECTED_GPU_NAME", "RTX 5060 Ti")
 RUN_LOGS: list[str] = []
+RUNNER_MANIFEST_EXCLUDES = {
+    "FINAL_SHA256SUMS",
+    "VAST_RUN_DONE",
+    "vast-lifecycle.json",
+    "vast-onstart.log",
+}
 
 
 def sha256(path: Path) -> str:
@@ -249,7 +255,7 @@ def execute_benchmark() -> tuple[subprocess.CompletedProcess[str], dict[str, obj
 def write_manifest() -> None:
     entries = []
     for path in sorted(EVIDENCE_ROOT.iterdir(), key=lambda item: item.name):
-        if path.is_file() and path != MANIFEST:
+        if path.is_file() and path != MANIFEST and path.name not in RUNNER_MANIFEST_EXCLUDES:
             entries.append(f"{sha256(path)}  {path.name}")
     MANIFEST.write_text("\n".join(entries) + "\n", encoding="utf-8")
 
