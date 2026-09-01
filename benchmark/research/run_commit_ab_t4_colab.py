@@ -51,7 +51,7 @@ CANDIDATE_OVERLAY_ASSETS = {
 }
 
 WORKER_NAME = "benchmark_commit_ab_t4.py"
-WORKER_SHA256 = "2e16921098db7457b38c841e30d40bcf4956da8fef9af98c3f988ef7bf8d7667"
+WORKER_SHA256 = "8d9e4abefb841c1f70100741521dd243e9300f85b021bd844119a03d976156b3"
 RPC_PREFIX = "TILELANG_COMMIT_AB_RPC="
 SUITE_CONFIGS = {
     "layout": {
@@ -81,12 +81,17 @@ if SUITE not in SUITE_CONFIGS:
     raise ValueError(f"unsupported TILELANG_COMMIT_AB_SUITE: {SUITE!r}")
 SUITE_CONFIG = SUITE_CONFIGS[SUITE]
 CASE_COUNT = int(SUITE_CONFIG["case_count"])
-WORK_DIR = Path(f"/tmp/tilelang-fixed-commit-ab-{SUITE}")
+CAPTURE_SASS = os.environ.get("TILELANG_COMMIT_AB_CAPTURE_SASS", "0") == "1"
+SASS_ONLY = os.environ.get("TILELANG_COMMIT_AB_SASS_ONLY", "0") == "1"
+if SASS_ONLY and not CAPTURE_SASS:
+    raise ValueError("TILELANG_COMMIT_AB_SASS_ONLY requires TILELANG_COMMIT_AB_CAPTURE_SASS=1")
+RUN_NAME = f"{SUITE}-sass" if SASS_ONLY else SUITE
+WORK_DIR = Path(f"/tmp/tilelang-fixed-commit-ab-{RUN_NAME}")
 WORKER_UPLOAD_PATH = Path(os.environ.get("TILELANG_WORKER_UPLOAD_PATH", f"/tmp/{WORKER_NAME}"))
-OUTPUT_DIR = Path(f"/tmp/tilelang-fixed-commit-ab-{SUITE}-evidence")
-RESULT_PATH = OUTPUT_DIR / f"tilelang-fixed-commit-ab-{SUITE}-t4.json"
-GZIP_PATH = OUTPUT_DIR / f"tilelang-fixed-commit-ab-{SUITE}-t4.json.gz"
-REPORT_PATH = OUTPUT_DIR / f"tilelang-fixed-commit-ab-{SUITE}-t4-report.md"
+OUTPUT_DIR = Path(f"/tmp/tilelang-fixed-commit-ab-{RUN_NAME}-evidence")
+RESULT_PATH = OUTPUT_DIR / f"tilelang-fixed-commit-ab-{RUN_NAME}-t4.json"
+GZIP_PATH = OUTPUT_DIR / f"tilelang-fixed-commit-ab-{RUN_NAME}-t4.json.gz"
+REPORT_PATH = OUTPUT_DIR / f"tilelang-fixed-commit-ab-{RUN_NAME}-t4-report.md"
 CHECKSUM_PATH = OUTPUT_DIR / "SHA256SUMS"
 BASELINE_ENV = WORK_DIR / "venv-baseline"
 CANDIDATE_ENV = WORK_DIR / "venv-candidate"
@@ -241,6 +246,7 @@ class WorkerClient:
                 "TILELANG_COMMIT_AB_LABEL": self.label,
                 "TILELANG_COMMIT_AB_SOURCE_COMMIT": self.source_commit,
                 "TILELANG_COMMIT_AB_SUITE": SUITE,
+                "TILELANG_COMMIT_AB_CAPTURE_SASS": "1" if CAPTURE_SASS else "0",
                 "TILELANG_COMMIT_AB_INVENTORY": str(self.inventory_path),
             }
         )
@@ -485,6 +491,8 @@ def load_and_compare_inventories() -> tuple[dict[str, Any], dict[str, Any]]:
         raise RuntimeError("a worker inventory is incomplete")
     if baseline.get("suite") != SUITE or candidate.get("suite") != SUITE:
         raise RuntimeError(f"worker inventory suite mismatch for {SUITE}")
+    if baseline.get("capture_sass") is not CAPTURE_SASS or candidate.get("capture_sass") is not CAPTURE_SASS:
+        raise RuntimeError(f"worker SASS capture mismatch: expected {CAPTURE_SASS}")
     baseline_cases = {case["name"]: case for case in baseline["cases"]}
     candidate_cases = {case["name"]: case for case in candidate["cases"]}
     if list(baseline_cases) != list(candidate_cases) or len(baseline_cases) != CASE_COUNT:
@@ -507,6 +515,95 @@ def load_and_compare_inventories() -> tuple[dict[str, Any], dict[str, Any]]:
     if baseline_gpu != [7, 5] or candidate_gpu != [7, 5]:
         raise RuntimeError(f"expected T4 SM75 workers, got {baseline_gpu!r} and {candidate_gpu!r}")
     return baseline, candidate
+
+
+def summarize_sass_capture(capture: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(capture, dict):
+        raise RuntimeError("requested SASS capture is missing")
+    required = ("sass_sha256", "sass_chars", "instruction_count", "groups", "opcodes", "duration_seconds")
+    missing = [field for field in required if field not in capture]
+    if missing:
+        raise RuntimeError(f"SASS capture fields are missing: {missing}")
+    return {
+        "sass_sha256": capture["sass_sha256"],
+        "sass_chars": capture["sass_chars"],
+        "registers": capture.get("registers"),
+        "instruction_count": capture["instruction_count"],
+        "groups": capture["groups"],
+        "opcodes": capture["opcodes"],
+        "duration_seconds": capture["duration_seconds"],
+    }
+
+
+def build_sass_diagnostic_cases(
+    baseline_inventory: dict[str, Any],
+    candidate_inventory: dict[str, Any],
+) -> list[dict[str, Any]]:
+    baseline_cases = {case["name"]: case for case in baseline_inventory["cases"]}
+    candidate_cases = {case["name"]: case for case in candidate_inventory["cases"]}
+    results: list[dict[str, Any]] = []
+    for name, baseline_case in baseline_cases.items():
+        candidate_case = candidate_cases[name]
+        baseline_sass = summarize_sass_capture(baseline_case.get("sass_capture"))
+        candidate_sass = summarize_sass_capture(candidate_case.get("sass_capture"))
+        group_names = sorted(set(baseline_sass["groups"]) | set(candidate_sass["groups"]))
+        group_delta = {
+            group: int(candidate_sass["groups"].get(group, 0)) - int(baseline_sass["groups"].get(group, 0)) for group in group_names
+        }
+        baseline_registers = baseline_sass.get("registers")
+        candidate_registers = candidate_sass.get("registers")
+        register_delta = (
+            int(candidate_registers) - int(baseline_registers)
+            if baseline_registers is not None and candidate_registers is not None
+            else None
+        )
+        results.append(
+            {
+                "name": name,
+                "family": baseline_case["family"],
+                "status": "complete",
+                "canonical_primfunc_sha256": baseline_case["canonical_primfunc_sha256"],
+                "generated_source_changed": (baseline_case["generated_source_sha256"] != candidate_case["generated_source_sha256"]),
+                "sass_changed": baseline_sass["sass_sha256"] != candidate_sass["sass_sha256"],
+                "baseline": {
+                    "dynamic_shared_bytes": baseline_case["dynamic_shared_bytes"],
+                    "sass": baseline_sass,
+                },
+                "candidate": {
+                    "dynamic_shared_bytes": candidate_case["dynamic_shared_bytes"],
+                    "sass": candidate_sass,
+                },
+                "candidate_minus_baseline": {
+                    "dynamic_shared_bytes": (int(candidate_case["dynamic_shared_bytes"]) - int(baseline_case["dynamic_shared_bytes"])),
+                    "registers": register_delta,
+                    "instruction_count": (int(candidate_sass["instruction_count"]) - int(baseline_sass["instruction_count"])),
+                    "groups": group_delta,
+                },
+            }
+        )
+    return results
+
+
+def aggregate_sass_results(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    group_names = sorted({group for case in cases for label in ("baseline", "candidate") for group in case[label]["sass"]["groups"]})
+    group_totals = {
+        label: {group: sum(int(case[label]["sass"]["groups"].get(group, 0)) for case in cases) for group in group_names}
+        for label in ("baseline", "candidate")
+    }
+    return {
+        "complete_cases": len(cases),
+        "total_cases": CASE_COUNT,
+        "source_changed_cases": sum(bool(case["generated_source_changed"]) for case in cases),
+        "sass_changed_cases": sum(bool(case["sass_changed"]) for case in cases),
+        "instruction_count": {
+            label: sum(int(case[label]["sass"]["instruction_count"]) for case in cases) for label in ("baseline", "candidate")
+        },
+        "group_totals": group_totals,
+        "barrier_reduced_cases": [case["name"] for case in cases if int(case["candidate_minus_baseline"]["groups"].get("barrier", 0)) < 0],
+        "barrier_increased_cases": [
+            case["name"] for case in cases if int(case["candidate_minus_baseline"]["groups"].get("barrier", 0)) > 0
+        ],
+    }
 
 
 def measure_mode(
@@ -662,7 +759,64 @@ def aggregate_results(cases: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def sass_report_markdown(payload: dict[str, Any]) -> str:
+    aggregate = payload["aggregate"]
+    baseline_groups = aggregate["group_totals"]["baseline"]
+    candidate_groups = aggregate["group_totals"]["candidate"]
+    lines = [
+        f"# TileLang fixed-commit A/B: free T4 {SUITE} SASS diagnostic",
+        "",
+        f"- Status: `{payload['status']}`; disassembled cases: `{CASE_COUNT}/{CASE_COUNT}`.",
+        f"- Fixed baseline: `{BASELINE_COMMIT}` (build-only scaffold `{BASELINE_BUILD_COMMIT}`).",
+        f"- Candidate compiler/runtime: `{CANDIDATE_COMMIT}`.",
+        f"- Generated-source changes: `{aggregate['source_changed_cases']}/{CASE_COUNT}` cases.",
+        f"- SASS changes: `{aggregate['sass_changed_cases']}/{CASE_COUNT}` cases.",
+        f"- Total static instructions: `{aggregate['instruction_count']['baseline']}` → `{aggregate['instruction_count']['candidate']}`.",
+        f"- Total barrier instructions: `{baseline_groups.get('barrier', 0)}` → `{candidate_groups.get('barrier', 0)}`.",
+        f"- Total shuffle instructions: `{baseline_groups.get('shuffle', 0)}` → `{candidate_groups.get('shuffle', 0)}`.",
+        "",
+        "## Per-case static metrics",
+        "",
+        "| Case | Barriers | Shuffles | Shared load/store | Instructions | Registers | Dynamic shared bytes |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for case in payload["cases"]:
+        baseline = case["baseline"]
+        candidate = case["candidate"]
+        baseline_groups = baseline["sass"]["groups"]
+        candidate_groups = candidate["sass"]["groups"]
+        lines.append(
+            f"| `{case['name']}` | "
+            f"{baseline_groups.get('barrier', 0)}→{candidate_groups.get('barrier', 0)} | "
+            f"{baseline_groups.get('shuffle', 0)}→{candidate_groups.get('shuffle', 0)} | "
+            f"{baseline_groups.get('shared_load', 0)}/{baseline_groups.get('shared_store', 0)}→"
+            f"{candidate_groups.get('shared_load', 0)}/{candidate_groups.get('shared_store', 0)} | "
+            f"{baseline['sass']['instruction_count']}→{candidate['sass']['instruction_count']} | "
+            f"{baseline['sass'].get('registers')}→{candidate['sass'].get('registers')} | "
+            f"{baseline['dynamic_shared_bytes']}→{candidate['dynamic_shared_bytes']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Protocol",
+            "",
+            "Each isolated worker compiles and correctness-checks the same frozen PrimFuncs, then recompiles its "
+            "generated CUDA source through the installed TileLang `JITKernel._get_sass` path for the resident T4 "
+            "target. The result retains complete SASS, opcode counts, compiler resources, dynamic shared memory, "
+            "generated source, inputs, environments, and setup records. This diagnostic performs no runtime timing.",
+            "",
+            "## Evidence boundary",
+            "",
+            payload["evidence_boundary"],
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def report_markdown(payload: dict[str, Any]) -> str:
+    if payload.get("sass_only"):
+        return sass_report_markdown(payload)
     aggregate = payload["aggregate"]
     lines = [
         f"# TileLang fixed-commit A/B: free T4 {SUITE} screen",
@@ -734,11 +888,13 @@ def main() -> int:
     runner_source_sha = os.environ.get("TILELANG_RUNNER_SOURCE_SHA", "")
     controller_sha256 = os.environ.get("TILELANG_CONTROLLER_SHA256", "")
     payload: dict[str, Any] = {
-        "schema": "tilelang-fixed-commit-colab-ab-v2",
+        "schema": "tilelang-fixed-commit-colab-ab-v3",
         "status": "failed",
         "repository": REPOSITORY,
         "suite": SUITE,
         "suite_case_count": CASE_COUNT,
+        "capture_sass": CAPTURE_SASS,
+        "sass_only": SASS_ONLY,
         "baseline_commit": BASELINE_COMMIT,
         "baseline_build_commit": BASELINE_BUILD_COMMIT,
         "candidate_commit": CANDIDATE_COMMIT,
@@ -748,7 +904,14 @@ def main() -> int:
             "python": sys.version,
             "nvidia_smi": command_output(["nvidia-smi"]),
         },
-        "evidence_boundary": SUITE_CONFIG["evidence_boundary"],
+        "evidence_boundary": (
+            "This is a compile-and-disassemble diagnostic on one free Colab T4 SM75. It compares generated source, "
+            "SASS, static instruction mix, registers, and dynamic shared memory for the fixed TileLang commits. "
+            "Runtime conclusions remain in the paired 30-cycle reduction release; this diagnostic contains no "
+            "runtime timing. A100, H100, B200, RTX 5090, and MI300X machine-code gates remain open."
+            if SASS_ONLY
+            else SUITE_CONFIG["evidence_boundary"]
+        ),
     }
     exit_code = 0
     try:
@@ -784,9 +947,35 @@ def main() -> int:
         }
         if ready["baseline"].get("suite") != SUITE or ready["candidate"].get("suite") != SUITE:
             raise RuntimeError(f"worker ready suite mismatch for {SUITE}")
+        if ready["baseline"].get("capture_sass") is not CAPTURE_SASS or ready["candidate"].get("capture_sass") is not CAPTURE_SASS:
+            raise RuntimeError(f"worker ready SASS capture mismatch: expected {CAPTURE_SASS}")
         baseline_inventory, candidate_inventory = load_and_compare_inventories()
-        cases = run_benchmark(workers, baseline_inventory, candidate_inventory)
-        aggregate = aggregate_results(cases)
+        if SASS_ONLY:
+            cases = build_sass_diagnostic_cases(baseline_inventory, candidate_inventory)
+            aggregate = aggregate_sass_results(cases)
+            protocol = {
+                "suite": SUITE,
+                "case_count": CASE_COUNT,
+                "mode": "compile-and-disassemble",
+                "runtime_measurement": False,
+                "sass_method": "JITKernel._get_sass generated-source recompile",
+                "pass_configs": None,
+            }
+        else:
+            cases = run_benchmark(workers, baseline_inventory, candidate_inventory)
+            aggregate = aggregate_results(cases)
+            protocol = {
+                "suite": SUITE,
+                "case_count": CASE_COUNT,
+                "cycles": CYCLES,
+                "paired_order_even": ["baseline", "candidate", "candidate", "baseline"],
+                "paired_order_odd": ["candidate", "baseline", "baseline", "candidate"],
+                "warm_seconds_per_variant_mode": WARM_SECONDS,
+                "minimum_batch_ms": MIN_BATCH_MS,
+                "minimum_sample_seconds_per_variant_mode": 3.0,
+                "pass_configs": None,
+                "cache_mode": "hot_l2",
+            }
         if aggregate["complete_cases"] != CASE_COUNT:
             raise RuntimeError(f"case completion drifted: {aggregate}")
         payload.update(
@@ -795,18 +984,7 @@ def main() -> int:
                 "runner_source_sha": runner_source_sha,
                 "controller_sha256": controller_sha256,
                 "worker_sha256": WORKER_SHA256,
-                "protocol": {
-                    "suite": SUITE,
-                    "case_count": CASE_COUNT,
-                    "cycles": CYCLES,
-                    "paired_order_even": ["baseline", "candidate", "candidate", "baseline"],
-                    "paired_order_odd": ["candidate", "baseline", "baseline", "candidate"],
-                    "warm_seconds_per_variant_mode": WARM_SECONDS,
-                    "minimum_batch_ms": MIN_BATCH_MS,
-                    "minimum_sample_seconds_per_variant_mode": 3.0,
-                    "pass_configs": None,
-                    "cache_mode": "hot_l2",
-                },
+                "protocol": protocol,
                 "environment": environment,
                 "worker_ready": ready,
                 "baseline_inventory": baseline_inventory,

@@ -1,25 +1,28 @@
-"""Version-neutral TileLang worker for fixed-commit T4 A/B measurements.
+"""Version-neutral TileLang worker for fixed-commit T4 A/B evidence.
 
 The controller launches this exact file under two isolated Python environments.
-Each worker compiles the same 18 frozen PrimFuncs with its installed TileLang
-defaults, validates deterministic inputs, and serves bounded timing commands.
-No layout policy or candidate-only pass configuration is supplied.
+Each worker compiles one frozen suite with its installed TileLang defaults,
+validates deterministic inputs, and serves bounded timing commands. An explicit
+diagnostic mode recompiles generated CUDA source to SASS for instruction-level
+comparison. No layout policy or candidate-only pass configuration is supplied.
 """
 
 from __future__ import annotations
 
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import sys
 import time
 import traceback
 from typing import Any
-from collections.abc import Callable
 
 import torch
 import tilelang
@@ -31,6 +34,15 @@ LABEL = os.environ.get("TILELANG_COMMIT_AB_LABEL", "unknown")
 SOURCE_COMMIT = os.environ.get("TILELANG_COMMIT_AB_SOURCE_COMMIT", "unknown")
 SUITE = os.environ.get("TILELANG_COMMIT_AB_SUITE", "layout")
 SUITE_CASES = {"layout": 18, "reduction": 12}
+CAPTURE_SASS = os.environ.get("TILELANG_COMMIT_AB_CAPTURE_SASS", "0") == "1"
+SASS_INSTRUCTION_RE = re.compile(
+    r"^\s*/\*[0-9a-fA-F]+\*/\s+(?:@!?P\d+\s+)?(?P<opcode>[A-Za-z][A-Za-z0-9_.]*)",
+    re.MULTILINE,
+)
+SASS_REGISTER_PATTERNS = (
+    re.compile(r"SHI_REGISTERS=(\d+)"),
+    re.compile(r'\.sectioninfo\s+@"SHI_REGISTERS=(\d+)"'),
+)
 INVENTORY_PATH = Path(
     os.environ.get(
         "TILELANG_COMMIT_AB_INVENTORY",
@@ -78,6 +90,53 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def dynamic_shared_bytes(kernel: Any) -> int:
+    artifact = getattr(kernel, "artifact", None)
+    device_mod = getattr(artifact, "device_mod", None)
+    functions = getattr(device_mod, "functions", {})
+    values = [int(func.attrs.get("dyn_shared_memory_buf", 0)) for func in functions.values()]
+    return max(values, default=0)
+
+
+def capture_sass(kernel: Any) -> dict[str, Any]:
+    getter = getattr(kernel, "_get_sass", None)
+    if getter is None:
+        raise RuntimeError("installed TileLang JITKernel does not expose _get_sass")
+    started = time.perf_counter()
+    sass = getter(verbose=False)
+    if not isinstance(sass, str) or not sass.strip():
+        raise RuntimeError("SASS capture returned no disassembly")
+    opcodes = Counter(match.group("opcode").upper() for match in SASS_INSTRUCTION_RE.finditer(sass))
+
+    def count_prefixes(*prefixes: str) -> int:
+        return sum(count for opcode, count in opcodes.items() if opcode.startswith(prefixes))
+
+    registers = None
+    for pattern in SASS_REGISTER_PATTERNS:
+        match = pattern.search(sass)
+        if match is not None:
+            registers = int(match.group(1))
+            break
+    return {
+        "method": "JITKernel._get_sass generated-source recompile",
+        "duration_seconds": time.perf_counter() - started,
+        "sass_sha256": sha256_text(sass),
+        "sass_chars": len(sass),
+        "registers": registers,
+        "instruction_count": sum(opcodes.values()),
+        "groups": {
+            "barrier": count_prefixes("BAR", "MBAR"),
+            "shuffle": count_prefixes("SHFL"),
+            "shared_load": count_prefixes("LDS", "LDSM"),
+            "shared_store": count_prefixes("STS"),
+            "global_load": count_prefixes("LDG"),
+            "global_store": count_prefixes("STG"),
+        },
+        "opcodes": dict(opcodes.most_common()),
+        "sass": sass,
+    }
 
 
 def command_output(command: list[str]) -> str:
@@ -624,6 +683,7 @@ def compile_case(case: BenchmarkCase) -> tuple[RuntimeCase, dict[str, Any]]:
 
     generated_source = kernel.get_kernel_source()
     resource_usage = json_safe(getattr(kernel, "resource_usage", {}))
+    sass_capture = capture_sass(kernel) if CAPTURE_SASS else None
     runtime = RuntimeCase(
         spec=case,
         kernel=kernel,
@@ -648,6 +708,8 @@ def compile_case(case: BenchmarkCase) -> tuple[RuntimeCase, dict[str, Any]]:
         "generated_source_sha256": sha256_text(generated_source),
         "generated_source": generated_source,
         "resource_usage": resource_usage,
+        "dynamic_shared_bytes": dynamic_shared_bytes(kernel),
+        "sass_capture": sass_capture,
         "cuda_graph_captured": graph_call is not None,
         "cuda_graph_capture_error": graph_capture_error,
     }
@@ -705,6 +767,7 @@ def system_inventory() -> dict[str, Any]:
     return {
         "label": LABEL,
         "suite": SUITE,
+        "capture_sass": CAPTURE_SASS,
         "source_commit": SOURCE_COMMIT,
         "platform": platform.platform(),
         "python": sys.version,
@@ -730,9 +793,10 @@ def main() -> int:
     started = time.time()
     runtimes: dict[str, RuntimeCase] = {}
     inventory: dict[str, Any] = {
-        "schema": "tilelang-fixed-commit-worker-inventory-v2",
+        "schema": "tilelang-fixed-commit-worker-inventory-v3",
         "status": "failed",
         "suite": SUITE,
+        "capture_sass": CAPTURE_SASS,
         "system": system_inventory(),
         "cases": [],
         "started_unix": started,
@@ -771,6 +835,7 @@ def main() -> int:
             "status": "ready",
             "label": LABEL,
             "suite": SUITE,
+            "capture_sass": CAPTURE_SASS,
             "source_commit": SOURCE_COMMIT,
             "case_names": list(runtimes),
             "graph_cases": [name for name, runtime in runtimes.items() if runtime.graph_call is not None],
