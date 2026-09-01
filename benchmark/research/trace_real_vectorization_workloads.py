@@ -37,7 +37,16 @@ from tilelang.cuda.backend import tilelang_callback_cuda_compile
 
 REPOSITORY = "nya-a-cat/tilelang"
 CONFIG_KEY = "tl.vectorize_local_parallel"
-MODES = ("planner", "legacy")
+INPLACE_CONFIG_KEY = "tl.storage_rewrite_detect_inplace"
+MODES = tuple(
+    mode.strip()
+    for mode in os.environ.get(
+        "TILELANG_REAL_VECTOR_MODES",
+        "planner,legacy",
+    ).split(",")
+    if mode.strip()
+)
+VALID_MODES = {"planner", "legacy", "planner_inplace"}
 DEFAULT_ARCHES = "sm_75,sm_80,sm_90a,sm_100a,sm_120a"
 RESULT_PATH = Path(
     os.environ.get(
@@ -80,6 +89,15 @@ PACKED_TYPE_RE = re.compile(
 
 if not ARCHES or len(set(ARCHES)) != len(ARCHES):
     raise ValueError("TILELANG_REAL_VECTOR_ARCHES must contain distinct architectures")
+if (
+    not MODES
+    or len(set(MODES)) != len(MODES)
+    or not set(MODES) <= VALID_MODES
+    or not {"planner", "legacy"} <= set(MODES)
+):
+    raise ValueError(
+        "TILELANG_REAL_VECTOR_MODES must contain planner and legacy, with optional planner_inplace"
+    )
 if MAX_WORKERS < 1:
     raise ValueError("TILELANG_REAL_VECTOR_COMPILE_WORKERS must be positive")
 
@@ -230,7 +248,8 @@ def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
             for mode in MODES:
                 target = tvm.target.Target({"kind": "cuda", "arch": arch})
                 pass_configs = dict(workload["pass_configs"])
-                pass_configs[CONFIG_KEY] = mode == "planner"
+                pass_configs[CONFIG_KEY] = mode != "legacy"
+                pass_configs[INPLACE_CONFIG_KEY] = mode == "planner_inplace"
                 started = time.perf_counter()
                 with tvm.transform.PassContext(opt_level=3, config=pass_configs), target:
                     artifact = tl.lower(
@@ -371,6 +390,10 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
     sass_changed = 0
     planner_packed_gain = 0
     comparisons = 0
+    inplace_source_changed = 0
+    inplace_sass_changed = 0
+    inplace_instruction_reduced = 0
+    inplace_register_reduced = 0
     for workload in workload_records:
         by_key = {(case["arch"], case["mode"]): case for case in workload["cases"]}
         workload["comparisons"] = []
@@ -402,6 +425,40 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
             sass_changed += int(sass_delta)
             planner_packed_gain += int(packed_delta > 0)
             comparisons += 1
+        if "planner_inplace" in MODES:
+            workload["inplace_comparisons"] = []
+            for arch in ARCHES:
+                planner = by_key[(arch, "planner")]
+                inplace = by_key[(arch, "planner_inplace")]
+                source_delta = inplace["source_sha256"] != planner["source_sha256"]
+                sass_delta = inplace["sass_sha256"] != planner["sass_sha256"]
+                planner_regs = max(
+                    (int(item["n_regs"]) for item in planner["resources"].values()),
+                    default=0,
+                )
+                inplace_regs = max(
+                    (int(item["n_regs"]) for item in inplace["resources"].values()),
+                    default=0,
+                )
+                workload["inplace_comparisons"].append(
+                    {
+                        "arch": arch,
+                        "source_changed": source_delta,
+                        "sass_changed": sass_delta,
+                        "inplace_minus_planner": {
+                            "source_bytes": inplace["source_bytes"] - planner["source_bytes"],
+                            "cubin_bytes": inplace["cubin_bytes"] - planner["cubin_bytes"],
+                            "instruction_count": inplace["instruction_count"] - planner["instruction_count"],
+                            "max_registers": inplace_regs - planner_regs,
+                        },
+                    }
+                )
+                inplace_source_changed += int(source_delta)
+                inplace_sass_changed += int(sass_delta)
+                inplace_instruction_reduced += int(
+                    inplace["instruction_count"] < planner["instruction_count"]
+                )
+                inplace_register_reduced += int(inplace_regs < planner_regs)
     if source_changed == 0 or sass_changed == 0 or planner_packed_gain == 0:
         raise RuntimeError(
             "planner/legacy trace produced no material source, SASS, or packed-type difference"
@@ -411,6 +468,13 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
         "source_changed": source_changed,
         "sass_changed": sass_changed,
         "planner_packed_gain": planner_packed_gain,
+        "inplace_comparisons": len(ARCHES) * len(workload_records)
+        if "planner_inplace" in MODES
+        else 0,
+        "inplace_source_changed": inplace_source_changed,
+        "inplace_sass_changed": inplace_sass_changed,
+        "inplace_instruction_reduced": inplace_instruction_reduced,
+        "inplace_register_reduced": inplace_register_reduced,
     }
 
 
@@ -420,7 +484,7 @@ def write_report(payload: dict[str, Any]) -> None:
         "",
         f"- Source commit: `{payload['source_sha']}`",
         f"- Architectures: `{', '.join(payload['architectures'])}`",
-        "- Modes: planner and legacy gate from one installed TileLang build",
+        f"- Modes: `{', '.join(payload['modes'])}` from one installed TileLang build",
         "- Device compilation: yes, through TileLang's CUDA callback",
         "- GPU execution: no",
         "",
@@ -454,6 +518,33 @@ def write_report(payload: dict[str, Any]) -> None:
             "",
         ]
     )
+    if "planner_inplace" in payload["modes"]:
+        lines.extend(
+            [
+                "## Experimental inplace detector",
+                "",
+                "| Workload | Arch | instructions planner→inplace | registers planner→inplace | source/SASS changed |",
+                "|---|---:|---:|---:|---:|",
+            ]
+        )
+        for workload in payload["workloads"]:
+            by_key = {(case["arch"], case["mode"]): case for case in workload["cases"]}
+            for arch in payload["architectures"]:
+                planner = by_key[(arch, "planner")]
+                inplace = by_key[(arch, "planner_inplace")]
+
+                def max_registers(case: dict[str, Any]) -> str:
+                    values = [int(item["n_regs"]) for item in case["resources"].values()]
+                    return str(max(values)) if values else "n/a"
+
+                lines.append(
+                    f"| `{workload['name']}` | `{arch}` | "
+                    f"{planner['instruction_count']}→{inplace['instruction_count']} | "
+                    f"{max_registers(planner)}→{max_registers(inplace)} | "
+                    f"{planner['source_sha256'] != inplace['source_sha256']}/"
+                    f"{planner['sass_sha256'] != inplace['sass_sha256']} |"
+                )
+        lines.append("")
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
     REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
 
