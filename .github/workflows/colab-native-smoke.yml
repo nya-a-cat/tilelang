@@ -37,6 +37,8 @@ jobs:
       TORCH_CPU_WHEEL_NAME: torch-2.11.0+cpu-cp313-cp313-manylinux_2_28_x86_64.whl
       TORCH_CPU_WHEEL_SHA256: 45025d7752dbc6b4c784c03afaee9c5f19730ce084b2e43fc9a2fe1677d9ff86
       TORCH_CPU_WHEEL_URL: https://download-r2.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp313-cp313-manylinux_2_28_x86_64.whl
+      NVDISASM_DEB_URL: https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-nvdisasm-13-0_13.0.85-1_amd64.deb
+      NVDISASM_DEB_SHA256: a0edae45d1debe83291254405afa1ee95a1f653e1fc59ea2cc6ffff6f49eefb5
     steps:
       - name: Start pinned manylinux image pull
         shell: bash
@@ -351,6 +353,13 @@ jobs:
           path: .cache/ci-toolchain
           key: colab-toolchain-v2-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-${{ hashFiles('maint/scripts/install_cached_cuda_toolchain.sh', 'maint/scripts/use_cached_cuda_sysroot.sh') }}
 
+      - name: Restore exact nvdisasm package
+        id: nvdisasm-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/cuda-binary-utils
+          key: cuda-binary-utils-${{ runner.os }}-${{ runner.arch }}-nvdisasm-13.0.85-${{ env.NVDISASM_DEB_SHA256 }}
+
       - name: Restore exact prebuilt TVM SDK
         id: tvm-sdk-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -387,6 +396,37 @@ jobs:
             cd .cache/prebuilt-tvm
             sha256sum --check SHA256SUMS
           )
+
+      - name: Prepare verified nvdisasm
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_root="${GITHUB_WORKSPACE}/.cache/cuda-binary-utils"
+          package="${cache_root}/cuda-nvdisasm-13-0_13.0.85-1_amd64.deb"
+          extract_root="${cache_root}/extract"
+          mkdir -p "${cache_root}"
+          if [[ ! -f "${package}" ]] || ! echo "${NVDISASM_DEB_SHA256}  ${package}" | sha256sum --check --status; then
+            rm -f -- "${package}" "${package}.part"
+            curl --fail --location --retry 5 --output "${package}.part" "${NVDISASM_DEB_URL}"
+            echo "${NVDISASM_DEB_SHA256}  ${package}.part" | sha256sum --check --strict
+            mv -- "${package}.part" "${package}"
+          fi
+          echo "${NVDISASM_DEB_SHA256}  ${package}" | sha256sum --check --strict
+          rm -rf -- "${extract_root}"
+          mkdir -p "${extract_root}"
+          dpkg-deb --extract "${package}" "${extract_root}"
+          nvdisasm="$(find "${extract_root}" -type f -path '*/bin/nvdisasm' -print -quit)"
+          test -n "${nvdisasm}"
+          test -x "${nvdisasm}"
+          "${nvdisasm}" --version
+          echo "NVDISASM=${nvdisasm}" >> "${GITHUB_ENV}"
+
+      - name: Save verified nvdisasm package
+        if: steps.nvdisasm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/cuda-binary-utils
+          key: cuda-binary-utils-${{ runner.os }}-${{ runner.arch }}-nvdisasm-13.0.85-${{ env.NVDISASM_DEB_SHA256 }}
 
       - name: Prepare exact relocatable CMake
         id: native-cmake

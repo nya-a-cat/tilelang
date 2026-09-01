@@ -339,7 +339,9 @@ def compile_case(item: dict[str, Any], nvdisasm: str) -> dict[str, Any]:
 
 
 def compile_all(compile_inputs: list[dict[str, Any]]) -> None:
-    nvdisasm = shutil.which("nvdisasm")
+    nvdisasm = os.environ.get("NVDISASM") or shutil.which("nvdisasm")
+    if nvdisasm is not None and not Path(nvdisasm).is_file():
+        raise RuntimeError(f"configured NVDISASM does not exist: {nvdisasm}")
     if nvdisasm is None:
         cuda_home = os.environ.get("CUDA_HOME")
         if cuda_home:
