@@ -334,8 +334,23 @@ def main() -> None:
                     "duration_seconds": payload["duration_seconds"],
                 },
                 sort_keys=True,
-            )
+            ),
+            flush=True,
         )
+        if payload.get("status") != "complete":
+            print(
+                "TILELANG_LAYOUT_BLACKWELL_ERROR="
+                + json.dumps(
+                    {
+                        "error": payload.get("error"),
+                        "status": payload.get("status"),
+                        "traceback_tail": str(payload.get("traceback", ""))[-6000:],
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
     if payload.get("status") != "complete":
         raise SystemExit(1)
 
