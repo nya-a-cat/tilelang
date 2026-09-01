@@ -1,0 +1,1205 @@
+name: Build verified native overlay
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact commit or ref to compile
+        required: true
+        type: string
+      native_base_ref:
+        description: Exact commit with a published Colab base wheel
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: colab-native-overlay-${{ inputs.source_ref }}-${{ inputs.native_base_ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-overlay:
+    if: github.repository == 'nya-a-cat/tilelang'
+    name: Ubuntu 22.04 CUDA native hot patch
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CUDA_VERSION: "13.0"
+      PYTHON_VERSION: "3.13"
+      MANYLINUX_PYTHON_TAG: cp313-cp313
+      TVM_SDK_CAPTURE_PYTHON_TAG: cp310
+      MANYLINUX_IMAGE_DIGEST: 012f4a50472412f18bb2b450c1cce7158434cfae4ae878591c2748a13a30c2be
+      CMAKE_WHEEL_VERSION: "4.4.2"
+      CMAKE_WHEEL_SHA256: 27b024e903ef985b37183d754a5c61230b56b41fe0971cd44b71b80c787ec594
+      CMAKE_WHEEL_URL: https://files.pythonhosted.org/packages/5d/b7/b8d0b15f57b37ac5b9e374169471f045da3a715b7f0f3af681011415d972/cmake-4.4.2-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      TORCH_CPU_WHEEL_NAME: torch-2.11.0+cpu-cp313-cp313-manylinux_2_28_x86_64.whl
+      TORCH_CPU_WHEEL_SHA256: 45025d7752dbc6b4c784c03afaee9c5f19730ce084b2e43fc9a2fe1677d9ff86
+      TORCH_CPU_WHEEL_URL: https://download-r2.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp313-cp313-manylinux_2_28_x86_64.whl
+    steps:
+      - name: Start pinned manylinux image pull
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
+          pull_log="${RUNNER_TEMP}/tilelang-native-manylinux-pull.log"
+          pull_pid="${RUNNER_TEMP}/tilelang-native-manylinux-pull.pid"
+          : > "${pull_log}"
+          nohup docker pull "${image}" > "${pull_log}" 2>&1 &
+          echo "$!" > "${pull_pid}"
+          echo "Started pinned manylinux image pull in process $(cat "${pull_pid}") while source and caches restore."
+
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+          submodules: false
+          persist-credentials: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          check-latest: false
+
+      - name: Restore pinned CPU PyTorch wheel
+        id: torch-cpu-wheel-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/torch-cpu-wheel
+          key: tilelang-trace-torch-cpu-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.TORCH_CPU_WHEEL_SHA256 }}
+
+      - name: Start pinned CPU PyTorch wheel download
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_root="${GITHUB_WORKSPACE}/.cache/torch-cpu-wheel"
+          wheel="${cache_root}/${TORCH_CPU_WHEEL_NAME}"
+          ready="${cache_root}/READY"
+          log="${RUNNER_TEMP}/tilelang-torch-cpu-wheel-download.log"
+          pid_file="${RUNNER_TEMP}/tilelang-torch-cpu-wheel-download.pid"
+          mkdir -p "${cache_root}"
+          rm -f -- "${ready}" "${pid_file}"
+
+          if [[ "${{ steps.torch-cpu-wheel-cache.outputs.cache-hit }}" == "true" ]]; then
+            echo "${TORCH_CPU_WHEEL_SHA256}  ${wheel}" | sha256sum --check --status
+            touch "${ready}"
+            echo "Verified cached ${TORCH_CPU_WHEEL_NAME}."
+            exit 0
+          fi
+
+          rm -f -- "${wheel}" "${wheel}.part"
+          : > "${log}"
+          export wheel ready
+          nohup bash --noprofile --norc -c '
+            set -euo pipefail
+            curl \
+              --fail \
+              --location \
+              --retry 5 \
+              --output "${wheel}.part" \
+              "${TORCH_CPU_WHEEL_URL}"
+            echo "${TORCH_CPU_WHEEL_SHA256}  ${wheel}.part" | sha256sum --check --status
+            mv -- "${wheel}.part" "${wheel}"
+            touch "${ready}"
+          ' > "${log}" 2>&1 &
+          echo "$!" > "${pid_file}"
+          echo "Started pinned CPU PyTorch wheel download in process $(cat "${pid_file}")."
+
+      - name: Resolve exact source and base wheel
+        id: refs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_BASE_REF: ${{ inputs.native_base_ref }}
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REPOSITORY}" = "nya-a-cat/tilelang"
+          source_sha="$(git rev-parse HEAD)"
+          git fetch --no-tags --depth=1 origin "${NATIVE_BASE_REF}"
+          base_sha="$(git rev-parse FETCH_HEAD)"
+
+          comparison_status="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/compare/${base_sha}...${source_sha}" \
+              --jq .status
+          )"
+          case "${comparison_status}" in
+            ahead|identical) ;;
+            *)
+              echo "Source ${source_sha} does not descend from native base ${base_sha}." >&2
+              exit 2
+              ;;
+          esac
+
+          base_tag=""
+          base_wheel_name=""
+          base_wheel_digest=""
+          for candidate_tag in "colab-wheel-${base_sha}" "colab-fast-${base_sha}"; do
+            release_json="$(
+              gh release view "${candidate_tag}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --json targetCommitish,assets 2>/dev/null || true
+            )"
+            if [[ -z "${release_json}" ]]; then
+              continue
+            fi
+            test "$(jq -r .targetCommitish <<<"${release_json}")" = "${base_sha}"
+            wheel_count="$(
+              jq '[.assets[] | select(.name | endswith(".whl"))] | length' \
+                <<<"${release_json}"
+            )"
+            test "${wheel_count}" -eq 1
+            base_tag="${candidate_tag}"
+            base_wheel_name="$(
+              jq -r '[.assets[] | select(.name | endswith(".whl"))][0].name' \
+                <<<"${release_json}"
+            )"
+            base_wheel_digest="$(
+              jq -r '[.assets[] | select(.name | endswith(".whl"))][0].digest // ""' \
+                <<<"${release_json}"
+            )"
+            break
+          done
+
+          if [[ -z "${base_tag}" || -z "${base_wheel_name}" ]]; then
+            echo "No unique published Colab wheel found for ${base_sha} in this fork." >&2
+            exit 2
+          fi
+
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+          echo "base_sha=${base_sha}" >> "${GITHUB_OUTPUT}"
+          echo "base_tag=${base_tag}" >> "${GITHUB_OUTPUT}"
+          echo "base_wheel_name=${base_wheel_name}" >> "${GITHUB_OUTPUT}"
+          echo "base_wheel_digest=${base_wheel_digest}" >> "${GITHUB_OUTPUT}"
+          echo "comparison_status=${comparison_status}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved ${source_sha} on ${base_tag}/${base_wheel_name}."
+
+      - name: Reject incompatible native hot-patch inputs
+        id: compatibility
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          BASE_SHA: ${{ steps.refs.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          mapfile -t changed_files < <(
+            git diff --name-only --diff-filter=ACDMRTUXB "${BASE_SHA}" "${SOURCE_SHA}"
+          )
+          incompatible=()
+          unsupported=()
+
+          for path in "${changed_files[@]}"; do
+            case "${path}" in
+              .gitmodules|3rdparty/*|CMakeLists.txt|*/CMakeLists.txt|cmake/*)
+                incompatible+=("${path}")
+                ;;
+              pyproject.toml|version_provider.py|VERSION)
+                incompatible+=("${path}")
+                ;;
+              tilelang/jit/adapter/cython/cython_wrapper.pyx|src/runtime/logging.cc)
+                incompatible+=("${path}")
+                ;;
+              .github/*|benchmark/*|docs/*|examples/*|maint/*|testing/*|src/*)
+                ;;
+              tilelang/*.py|tilelang/*.pyi|tilelang/*.md)
+                ;;
+              README.md|LICENSE|THIRDPARTYNOTICES.txt)
+                ;;
+              *)
+                unsupported+=("${path}")
+                ;;
+            esac
+          done
+
+          : > changed-files.txt
+          if (( ${#changed_files[@]} > 0 )); then
+            printf '%s\n' "${changed_files[@]}" > changed-files.txt
+          fi
+          if (( ${#incompatible[@]} > 0 )); then
+            echo "These changes require a complete wheel because they alter the build, ABI, or pinned SDK:" >&2
+            printf '  %s\n' "${incompatible[@]}" >&2
+            exit 2
+          fi
+          if (( ${#unsupported[@]} > 0 )); then
+            echo "These paths are outside the audited native hot-patch surface:" >&2
+            printf '  %s\n' "${unsupported[@]}" >&2
+            exit 2
+          fi
+          echo "Native hot patch accepted across ${#changed_files[@]} changed paths."
+
+      - name: Start exact base wheel download
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_TAG: ${{ steps.refs.outputs.base_tag }}
+          BASE_WHEEL_NAME: ${{ steps.refs.outputs.base_wheel_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p base-wheel
+          download_log="${RUNNER_TEMP}/tilelang-base-wheel-download.log"
+          download_pid="${RUNNER_TEMP}/tilelang-base-wheel-download.pid"
+          : > "${download_log}"
+          nohup gh release download "${BASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "${BASE_WHEEL_NAME}" \
+            --pattern SHA256SUMS \
+            --pattern source-revisions.txt \
+            --dir base-wheel \
+            > "${download_log}" 2>&1 &
+          echo "$!" > "${download_pid}"
+          echo "Started exact base wheel download in process $(cat "${download_pid}") while native caches restore."
+
+      - name: Resolve exact native dependency revisions
+        id: native-deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          cutlass_sha="$(git ls-tree HEAD 3rdparty/cutlass | awk '{ print $3 }')"
+          tvm_sha="$(git ls-tree HEAD 3rdparty/tvm | awk '{ print $3 }')"
+          [[ "${cutlass_sha}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${tvm_sha}" =~ ^[0-9a-f]{40}$ ]]
+          echo "cutlass_sha=${cutlass_sha}" >> "${GITHUB_OUTPUT}"
+          echo "tvm_sha=${tvm_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore exact native dependency trees
+        id: native-deps-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .git/modules/3rdparty
+            3rdparty/cutlass
+            3rdparty/tvm
+          key: tilelang-native-deps-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-deps.outputs.cutlass_sha }}-${{ steps.native-deps.outputs.tvm_sha }}-${{ hashFiles('.gitmodules') }}
+
+      - name: Initialize and verify exact native dependency trees
+        shell: bash
+        env:
+          CUTLASS_SHA: ${{ steps.native-deps.outputs.cutlass_sha }}
+          TVM_SHA: ${{ steps.native-deps.outputs.tvm_sha }}
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          if [[ "${{ steps.native-deps-cache.outputs.cache-hit }}" != "true" ]]; then
+            git submodule update --init --recursive --depth 1 --jobs "$(getconf _NPROCESSORS_ONLN)"
+          else
+            git submodule update --init --recursive --no-fetch
+          fi
+          test "$(git -C 3rdparty/cutlass rev-parse HEAD)" = "${CUTLASS_SHA}"
+          test "$(git -C 3rdparty/tvm rev-parse HEAD)" = "${TVM_SHA}"
+          git submodule status --recursive | tee submodule-revisions.txt
+          if grep -Eq '^[-+U]' submodule-revisions.txt; then
+            echo "Native dependency cache is incomplete or does not match the pinned revisions." >&2
+            exit 2
+          fi
+
+      - name: Save verified native dependency trees
+        if: steps.native-deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .git/modules/3rdparty
+            3rdparty/cutlass
+            3rdparty/tvm
+          key: tilelang-native-deps-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-deps.outputs.cutlass_sha }}-${{ steps.native-deps.outputs.tvm_sha }}-${{ hashFiles('.gitmodules') }}
+
+      - name: Resolve exact native build fingerprints
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          native_fingerprint="$({
+            echo "python_abi=${MANYLINUX_PYTHON_TAG}"
+            git ls-tree -r HEAD -- \
+              CMakeLists.txt \
+              cmake \
+              pyproject.toml \
+              src \
+              3rdparty/hip-headers \
+              tilelang/jit/adapter/cython/cython_wrapper.pyx
+            cat submodule-revisions.txt
+          } | sha256sum | awk '{ print $1 }')"
+          tvm_sdk_fingerprint="$({
+            git ls-tree -r HEAD -- \
+              CMakeLists.txt \
+              cmake \
+              pyproject.toml \
+              src/cpu/CMakeLists.txt \
+              src/cuda/CMakeLists.txt \
+              src/metal/CMakeLists.txt \
+              src/rocm/CMakeLists.txt \
+              src/webgpu/CMakeLists.txt \
+              src/runtime/logging.cc \
+              maint/scripts/install_cached_cuda_toolchain.sh \
+              maint/scripts/capture_prebuilt_tvm_sdk.sh
+            git ls-tree HEAD 3rdparty/tvm
+            echo "manylinux=${MANYLINUX_IMAGE_DIGEST}"
+            echo "cuda=${CUDA_VERSION}"
+            echo "backends=CUDA"
+          } | sha256sum | awk '{ print $1 }')"
+          echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
+          echo "native_fingerprint=${native_fingerprint}" >> "${GITHUB_OUTPUT}"
+          echo "tvm_sdk_fingerprint=${tvm_sdk_fingerprint}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore exact relocatable CUDA toolchain
+        id: toolchain-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/ci-toolchain
+          key: colab-toolchain-v2-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-${{ hashFiles('maint/scripts/install_cached_cuda_toolchain.sh', 'maint/scripts/use_cached_cuda_sysroot.sh') }}
+
+      - name: Restore exact prebuilt TVM SDK
+        id: tvm-sdk-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/prebuilt-tvm
+          key: colab-wheel-tvm-sdk-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.TVM_SDK_CAPTURE_PYTHON_TAG }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-cuda130-${{ steps.source.outputs.tvm_sdk_fingerprint }}
+
+      - name: Restore exact CMake distribution
+        id: native-cmake-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/native-cmake
+          key: tilelang-native-cmake-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.CMAKE_WHEEL_VERSION }}-${{ env.CMAKE_WHEEL_SHA256 }}
+
+      - name: Require bootstrapped native caches
+        if: steps.toolchain-cache.outputs.cache-hit != 'true' || steps.tvm-sdk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "::error::Fast native compile needs exact CUDA sysroot and TVM SDK caches. Run Build Colab wheel in fast-cuda mode once for this source ref, then retry."
+          exit 2
+
+      - name: Validate exact native build inputs
+        shell: bash
+        env:
+          TVM_SDK_FINGERPRINT: ${{ steps.source.outputs.tvm_sdk_fingerprint }}
+        run: |
+          set -euo pipefail
+          maint/scripts/use_cached_cuda_sysroot.sh \
+            "${GITHUB_WORKSPACE}/.cache/ci-toolchain" \
+            "${{ steps.toolchain-cache.outputs.cache-hit }}"
+          test "$(cat .cache/prebuilt-tvm/.tilelang-ci-cache-identity)" = \
+            "tvm_sdk_fingerprint=${TVM_SDK_FINGERPRINT}"
+          (
+            cd .cache/prebuilt-tvm
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Prepare exact relocatable CMake
+        id: native-cmake
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_root="${GITHUB_WORKSPACE}/.cache/native-cmake"
+          distribution_root="${cache_root}/root"
+          identity="${cache_root}/identity"
+          expected_identity="cmake=${CMAKE_WHEEL_VERSION};wheel_sha256=${CMAKE_WHEEL_SHA256}"
+          cmake_bin="${distribution_root}/cmake/data/bin/cmake"
+
+          if [[ "${{ steps.native-cmake-cache.outputs.cache-hit }}" == "true" ]]; then
+            test "$(<"${identity}")" = "${expected_identity}"
+            (
+              cd "${distribution_root}"
+              sha256sum --check ../SHA256SUMS
+            )
+          else
+            wheel="${RUNNER_TEMP}/cmake-${CMAKE_WHEEL_VERSION}.whl"
+            partial="${wheel}.part"
+            rm -f -- "${partial}"
+            curl \
+              --fail \
+              --location \
+              --retry 5 \
+              --output "${partial}" \
+              "${CMAKE_WHEEL_URL}"
+            echo "${CMAKE_WHEEL_SHA256}  ${partial}" | sha256sum --check --status
+            mv -- "${partial}" "${wheel}"
+            rm -rf -- "${distribution_root}"
+            mkdir -p "${distribution_root}"
+            python3 - "${wheel}" "${distribution_root}" <<'PY'
+          import stat
+          import sys
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          archive = Path(sys.argv[1])
+          destination_root = Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(archive) as bundle:
+              for info in bundle.infolist():
+                  path = PurePosixPath(info.filename)
+                  if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+                      raise SystemExit(f"Unsafe path in CMake wheel: {info.filename}")
+                  mode = info.external_attr >> 16
+                  if stat.S_ISLNK(mode):
+                      raise SystemExit(f"CMake wheel contains a symbolic link: {info.filename}")
+                  if info.is_dir():
+                      continue
+                  output = destination_root.joinpath(*path.parts)
+                  output.parent.mkdir(parents=True, exist_ok=True)
+                  output.write_bytes(bundle.read(info))
+                  output.chmod((mode & 0o777) or 0o644)
+          PY
+            rm -f -- "${wheel}"
+            (
+              cd "${distribution_root}"
+              find . -type f -print0 \
+                | LC_ALL=C sort -z \
+                | xargs -0 sha256sum \
+                > ../SHA256SUMS
+            )
+            printf '%s\n' "${expected_identity}" > "${identity}"
+          fi
+
+          test -x "${cmake_bin}"
+          test "$("${cmake_bin}" --version | awk 'NR == 1 { print $3 }')" = "${CMAKE_WHEEL_VERSION}"
+          {
+            echo "identity=${expected_identity}"
+            echo "cmake_binary=${cmake_bin}"
+            echo "cmake_binary_sha256=$(sha256sum "${cmake_bin}" | awk '{ print $1 }')"
+          } | tee "${cache_root}/provenance.txt"
+
+      - name: Save exact CMake distribution
+        if: steps.native-cmake-cache.outputs.cache-hit != 'true' && steps.native-cmake.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/native-cmake
+          key: tilelang-native-cmake-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.CMAKE_WHEEL_VERSION }}-${{ env.CMAKE_WHEEL_SHA256 }}
+
+      - name: Restore direct native compiler cache
+        id: manylinux-native-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/ccache
+          key: colab-native-direct-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-${{ steps.source.outputs.native_fingerprint }}
+          restore-keys: |
+            colab-native-direct-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-
+            colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-${{ steps.source.outputs.native_fingerprint }}
+            colab-wheel-ccache-v2-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-
+
+      - name: Configure pinned manylinux native compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          jobs="$(getconf _NPROCESSORS_ONLN)"
+          toolchain_root="${GITHUB_WORKSPACE}/.cache/ci-toolchain"
+          cuda_root="${toolchain_root}/cuda-13.0"
+          host_ccache_dir="${GITHUB_WORKSPACE}/.cache/ccache"
+          tvm_sdk_dir="${GITHUB_WORKSPACE}/.cache/prebuilt-tvm"
+          mkdir -p "${host_ccache_dir}"
+          {
+            echo "${toolchain_root}/bin"
+            echo "${cuda_root}/bin"
+          } >> "${GITHUB_PATH}"
+          {
+            echo "CMAKE_BUILD_PARALLEL_LEVEL=${jobs}"
+            echo "CMAKE_GENERATOR=Ninja"
+            echo "CUDAToolkit_ROOT=${cuda_root}"
+            echo "CUDA_HOME=${cuda_root}"
+            echo "LD_LIBRARY_PATH=${cuda_root}/lib64:${cuda_root}/lib64/stubs:${tvm_sdk_dir}"
+            echo "CCACHE_DIR=${host_ccache_dir}"
+            echo "CCACHE_MAXSIZE=2G"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "CCACHE_COMPILERCHECK=content"
+            echo "TILELANG_PREBUILT_TVM_LIB_DIR=${tvm_sdk_dir}"
+            echo "USE_CUDA=ON"
+            echo "USE_ROCM=OFF"
+            echo "MANYLINUX_IMAGE=quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
+          } >> "${GITHUB_ENV}"
+          echo "Using ${jobs} manylinux build workers; direct compiler cache exact hit=${{ steps.manylinux-native-cache.outputs.cache-hit }}"
+
+      - name: Confirm pinned manylinux image is ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          pull_log="${RUNNER_TEMP}/tilelang-native-manylinux-pull.log"
+          pull_pid_file="${RUNNER_TEMP}/tilelang-native-manylinux-pull.pid"
+          pull_pid="$(cat "${pull_pid_file}")"
+          deadline=$((SECONDS + 300))
+
+          while kill -0 "${pull_pid}" 2>/dev/null; do
+            if (( SECONDS >= deadline )); then
+              kill "${pull_pid}" 2>/dev/null || true
+              cat "${pull_log}" >&2
+              echo "Timed out while pulling the pinned manylinux image." >&2
+              exit 2
+            fi
+            sleep 0.2
+          done
+
+          if ! docker image inspect "${MANYLINUX_IMAGE}" >/dev/null 2>&1; then
+            cat "${pull_log}" >&2
+            echo "Pinned manylinux image pull failed." >&2
+            exit 2
+          fi
+          cat "${pull_log}"
+          docker image inspect \
+            "${MANYLINUX_IMAGE}" \
+            --format 'ready={{.Id}} platform={{.Os}}/{{.Architecture}}'
+
+      - name: Compile native CUDA targets
+        id: native-build
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/project" \
+            --workdir /project \
+            --env CMAKE_BUILD_PARALLEL_LEVEL \
+            --env CMAKE_GENERATOR=Ninja \
+            --env MANYLINUX_PYTHON_TAG \
+            --env CUDAToolkit_ROOT=/project/.cache/ci-toolchain/cuda-13.0 \
+            --env CUDA_HOME=/project/.cache/ci-toolchain/cuda-13.0 \
+            --env CCACHE_DIR=/project/.cache/ccache \
+            --env CCACHE_MAXSIZE=2G \
+            --env CCACHE_BASEDIR=/project \
+            --env CCACHE_NOHASHDIR=true \
+            --env CCACHE_COMPILERCHECK=content \
+            --env TILELANG_PREBUILT_TVM_LIB_DIR=/project/.cache/prebuilt-tvm \
+            --env USE_CUDA=ON \
+            --env USE_ROCM=OFF \
+            --env GIT_CONFIG_COUNT=1 \
+            --env GIT_CONFIG_KEY_0=safe.directory \
+            --env GIT_CONFIG_VALUE_0=/project \
+            "${MANYLINUX_IMAGE}" \
+            /bin/bash --noprofile --norc -c '
+          set -euo pipefail
+          export PATH="/project/.cache/native-cmake/root/cmake/data/bin:/project/.cache/ci-toolchain/bin:/project/.cache/ci-toolchain/cuda-13.0/bin:${PATH}"
+          export LD_LIBRARY_PATH="/project/.cache/ci-toolchain/cuda-13.0/lib64:/project/.cache/ci-toolchain/cuda-13.0/lib64/stubs:/project/.cache/prebuilt-tvm:${LD_LIBRARY_PATH:-}"
+          python_bin="/opt/python/${MANYLINUX_PYTHON_TAG}/bin/python"
+          python_version="$("${python_bin}" --version 2>&1)"
+          [[ "${python_version}" == Python\ 3.13.* ]]
+          ccache --zero-stats
+          cmake -S . -B build/native-smoke -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPython_EXECUTABLE="${python_bin}" \
+            -DPython3_EXECUTABLE="${python_bin}" \
+            -DTILELANG_PREBUILT_TVM_LIB_DIR="${TILELANG_PREBUILT_TVM_LIB_DIR}" \
+            -DTILELANG_RELEASE_BUILD=ON \
+            -DTILELANG_USE_CUDA_STUBS=ON \
+            -DUSE_Z3=OFF \
+            -DUSE_PYPI_Z3=OFF
+          cmake --build build/native-smoke \
+            --target tilelang cuda_stub cudart_stub nvrtc_stub \
+            --parallel "${CMAKE_BUILD_PARALLEL_LEVEL}"
+          {
+            "${python_bin}" --version
+            cmake --version | head -n 1
+            gcc --version | head -n 1
+            nvcc --version
+            ccache --show-stats
+          } | tee native-container-toolchain.txt
+          '
+
+      - name: Record native compile evidence
+        if: always() && steps.native-build.outcome != 'skipped'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p native-smoke-evidence
+          {
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "commit=${{ steps.source.outputs.commit }}"
+            echo "mode=verified_native_hot_patch"
+            echo "runner=ubuntu-22.04"
+            echo "python=${PYTHON_VERSION}"
+            echo "python_abi=${MANYLINUX_PYTHON_TAG}"
+            echo "cuda=13.0.88"
+            echo "manylinux_image=quay.io/pypa/manylinux_2_28_x86_64@sha256:${MANYLINUX_IMAGE_DIGEST}"
+            echo "tvm_sdk_fingerprint=${{ steps.source.outputs.tvm_sdk_fingerprint }}"
+            echo "native_fingerprint=${{ steps.source.outputs.native_fingerprint }}"
+            cat .cache/native-cmake/provenance.txt
+            if [[ -f native-container-toolchain.txt ]]; then
+              cat native-container-toolchain.txt
+            else
+              echo "container_toolchain_record=unavailable_after_compile_failure"
+            fi
+            ccache --show-stats
+            if [[ -d build/native-smoke/lib ]]; then
+              find build/native-smoke/lib -maxdepth 1 -type f -name '*.so' -print0 \
+                | sort -z \
+                | xargs -0 -r sha256sum
+            fi
+          } | tee native-smoke-evidence/native-compile.txt
+
+      - name: Package verified native development overlay
+        id: native-overlay
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          BASE_SHA: ${{ steps.refs.outputs.base_sha }}
+          BASE_TAG: ${{ steps.refs.outputs.base_tag }}
+          BASE_WHEEL_NAME: ${{ steps.refs.outputs.base_wheel_name }}
+          BASE_WHEEL_DIGEST: ${{ steps.refs.outputs.base_wheel_digest }}
+          COMPARISON_STATUS: ${{ steps.refs.outputs.comparison_status }}
+          TVM_SDK_FINGERPRINT: ${{ steps.source.outputs.tvm_sdk_fingerprint }}
+          NATIVE_FINGERPRINT: ${{ steps.source.outputs.native_fingerprint }}
+        run: |
+          set -euo pipefail
+          mkdir -p \
+            native-overlay-evidence \
+            native-overlay-stage/tilelang/lib \
+            base-native \
+            candidate-native
+
+          download_log="${RUNNER_TEMP}/tilelang-base-wheel-download.log"
+          download_pid_file="${RUNNER_TEMP}/tilelang-base-wheel-download.pid"
+          download_pid="$(cat "${download_pid_file}")"
+          deadline=$((SECONDS + 180))
+          while kill -0 "${download_pid}" 2>/dev/null; do
+            if (( SECONDS >= deadline )); then
+              kill "${download_pid}" 2>/dev/null || true
+              cat "${download_log}" >&2
+              echo "Timed out while downloading the exact base wheel." >&2
+              exit 2
+            fi
+            sleep 0.2
+          done
+          cat "${download_log}"
+
+          base_wheel="base-wheel/${BASE_WHEEL_NAME}"
+          test -f "${base_wheel}"
+          test -f base-wheel/SHA256SUMS
+          test -f base-wheel/source-revisions.txt
+          test "$(awk -F= '$1 == "commit" { print $2; exit }' base-wheel/source-revisions.txt)" = "${BASE_SHA}"
+
+          expected_wheel_hash="$(awk 'NR == 1 { print $1 }' base-wheel/SHA256SUMS)"
+          actual_wheel_hash="$(sha256sum "${base_wheel}" | awk '{ print $1 }')"
+          test "${actual_wheel_hash}" = "${expected_wheel_hash}"
+          if [[ -n "${BASE_WHEEL_DIGEST}" ]]; then
+            test "${BASE_WHEEL_DIGEST}" = "sha256:${actual_wheel_hash}"
+          fi
+
+          mapfile -t base_wheel_info < <(
+            python3 - "${base_wheel}" base-native <<'PY'
+          import stat
+          import sys
+          import zipfile
+          from email import message_from_bytes
+          from pathlib import Path, PurePosixPath
+
+          wheel_path = Path(sys.argv[1])
+          output_root = Path(sys.argv[2]).resolve()
+          metadata_entries = []
+          library_entries = []
+
+          with zipfile.ZipFile(wheel_path) as wheel:
+              for info in wheel.infolist():
+                  path = PurePosixPath(info.filename)
+                  if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+                      raise SystemExit(f"Unsafe path in base wheel: {info.filename}")
+                  mode = info.external_attr >> 16
+                  if stat.S_ISLNK(mode):
+                      raise SystemExit(f"Base wheel contains a symlink: {info.filename}")
+                  if info.filename.endswith(".dist-info/METADATA"):
+                      metadata_entries.append(info)
+                  if info.is_dir() or not info.filename.startswith("tilelang/lib/"):
+                      continue
+                  if len(path.parts) <= 2:
+                      continue
+                  library_entries.append(info)
+                  relative = Path(*path.parts[2:])
+                  destination = output_root / relative
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.write_bytes(wheel.read(info))
+                  destination.chmod((mode & 0o777) or 0o644)
+
+              tilelang_metadata = []
+              for info in metadata_entries:
+                  metadata = message_from_bytes(wheel.read(info))
+                  if (metadata.get("Name") or "").casefold() == "tilelang":
+                      tilelang_metadata.append(metadata)
+
+          if len(tilelang_metadata) != 1:
+              raise SystemExit("Base wheel must contain exactly one TileLang METADATA record.")
+          if not (output_root / "libtilelang.so").is_file():
+              raise SystemExit("Base wheel is missing tilelang/lib/libtilelang.so.")
+          if not library_entries:
+              raise SystemExit("Base wheel does not contain a native library tree.")
+
+          print(tilelang_metadata[0]["Version"])
+          print(len(library_entries))
+          PY
+          )
+          test "${#base_wheel_info[@]}" -eq 2
+          base_distribution_version="${base_wheel_info[0]}"
+          base_native_file_count="${base_wheel_info[1]}"
+
+          native_tree_digest() {
+            python3 - "$1" <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1]).resolve()
+          files = []
+          for path in root.rglob("*"):
+              if path.is_symlink():
+                  raise SystemExit(f"Native tree contains a symlink: {path}")
+              if path.is_file():
+                  files.append(path)
+
+          h = sha256()
+          for path in sorted(files, key=lambda p: p.relative_to(root).as_posix()):
+              relative = path.relative_to(root).as_posix().encode()
+              data = path.read_bytes()
+              h.update(len(relative).to_bytes(8, "big"))
+              h.update(relative)
+              h.update(len(data).to_bytes(8, "big"))
+              h.update(data)
+          print(h.hexdigest())
+          PY
+          }
+
+          base_native_hash="$(native_tree_digest base-native)"
+          for tvm_library in libtvm_runtime.so libtvm_compiler.so; do
+            test -f "base-native/${tvm_library}"
+            test -f ".cache/prebuilt-tvm/${tvm_library}"
+            if ! cmp -s \
+              "base-native/${tvm_library}" \
+              ".cache/prebuilt-tvm/${tvm_library}"; then
+              echo "Cached ${tvm_library} differs from the exact base wheel." >&2
+              exit 2
+            fi
+          done
+          cp -a -- base-native/. candidate-native/
+          install -m 0755 -- \
+            build/native-smoke/lib/libtilelang.so \
+            candidate-native/libtilelang.so
+
+          command -v patchelf
+          command -v readelf
+          command -v nm
+          base_lib="base-native/libtilelang.so"
+          candidate_lib="candidate-native/libtilelang.so"
+          for dependency in libcuda.so.1 libcuda.so; do
+            if patchelf --print-needed "${candidate_lib}" | grep -Fxq "${dependency}"; then
+              patchelf --remove-needed "${dependency}" "${candidate_lib}"
+            fi
+          done
+
+          base_rpath="$(patchelf --print-rpath "${base_lib}")"
+          if [[ "${base_rpath}" == /* || "${base_rpath}" == *":/"* || "${base_rpath}" == *"${GITHUB_WORKSPACE}"* ]]; then
+            echo "Base wheel contains an unsafe or non-relocatable RPATH: ${base_rpath}" >&2
+            exit 2
+          fi
+          patchelf --set-rpath "${base_rpath}" "${candidate_lib}"
+
+          base_soname="$(patchelf --print-soname "${base_lib}" || true)"
+          if [[ -n "${base_soname}" ]]; then
+            patchelf --set-soname "${base_soname}" "${candidate_lib}"
+          fi
+          test "$(patchelf --print-soname "${candidate_lib}" || true)" = "${base_soname}"
+          test "$(patchelf --print-rpath "${candidate_lib}")" = "${base_rpath}"
+
+          patchelf --print-needed "${base_lib}" | LC_ALL=C sort -u > base-needed.txt
+          patchelf --print-needed "${candidate_lib}" | LC_ALL=C sort -u > candidate-needed-before-normalization.txt
+          comm -23 \
+            base-needed.txt \
+            candidate-needed-before-normalization.txt \
+            > base-needed-missing-from-candidate.txt
+          while IFS= read -r dependency; do
+            if [[ -n "${dependency}" ]]; then
+              patchelf --add-needed "${dependency}" "${candidate_lib}"
+            fi
+          done < base-needed-missing-from-candidate.txt
+          patchelf --print-needed "${candidate_lib}" | LC_ALL=C sort -u > candidate-needed.txt
+          if ! diff -u base-needed.txt candidate-needed.txt; then
+            echo "Patched libtilelang.so changes its dynamic dependency set." >&2
+            exit 2
+          fi
+          test "$(patchelf --print-soname "${candidate_lib}" || true)" = "${base_soname}"
+          test "$(patchelf --print-rpath "${candidate_lib}")" = "${base_rpath}"
+
+          readelf -h "${base_lib}" \
+            | awk -F: '/Class:|Data:|Machine:/ { gsub(/^[ \t]+/, "", $2); print $1 "=" $2 }' \
+            > base-elf-header.txt
+          readelf -h "${candidate_lib}" \
+            | awk -F: '/Class:|Data:|Machine:/ { gsub(/^[ \t]+/, "", $2); print $1 "=" $2 }' \
+            > candidate-elf-header.txt
+          if ! diff -u base-elf-header.txt candidate-elf-header.txt; then
+            echo "Patched libtilelang.so changes the ELF platform identity." >&2
+            exit 2
+          fi
+
+          readelf --version-info "${base_lib}" \
+            | sed -n 's/.*Name: \([^ ]*\).*$/\1/p' \
+            | LC_ALL=C sort -u \
+            > base-required-symbol-versions.txt
+          readelf --version-info "${candidate_lib}" \
+            | sed -n 's/.*Name: \([^ ]*\).*$/\1/p' \
+            | LC_ALL=C sort -u \
+            > candidate-required-symbol-versions.txt
+          comm -23 \
+            candidate-required-symbol-versions.txt \
+            base-required-symbol-versions.txt \
+            > added-required-symbol-versions.txt
+          if [[ -s added-required-symbol-versions.txt ]]; then
+            echo "Patched libtilelang.so requires symbol versions absent from the base library:" >&2
+            cat added-required-symbol-versions.txt >&2
+            exit 2
+          fi
+
+          nm -D --defined-only "${base_lib}" \
+            | awk 'NF { print $NF }' | LC_ALL=C sort -u > base-defined-symbols.txt
+          nm -D --defined-only "${candidate_lib}" \
+            | awk 'NF { print $NF }' | LC_ALL=C sort -u > candidate-defined-symbols.txt
+          : > base-consumer-undefined-symbols.txt
+          while IFS= read -r consumer; do
+            if [[ "${consumer}" == "${base_lib}" ]]; then
+              continue
+            fi
+            if readelf -h "${consumer}" >/dev/null 2>&1; then
+              nm -D --undefined-only "${consumer}" 2>/dev/null \
+                | awk 'NF { print $NF }' \
+                >> base-consumer-undefined-symbols.txt || true
+            fi
+          done < <(find base-native -type f -name '*.so*' | LC_ALL=C sort)
+          LC_ALL=C sort -u -o \
+            base-consumer-undefined-symbols.txt \
+            base-consumer-undefined-symbols.txt
+          comm -12 \
+            base-defined-symbols.txt \
+            base-consumer-undefined-symbols.txt \
+            > required-libtilelang-symbols.txt
+          comm -23 \
+            required-libtilelang-symbols.txt \
+            candidate-defined-symbols.txt \
+            > missing-required-libtilelang-symbols.txt
+          if [[ -s missing-required-libtilelang-symbols.txt ]]; then
+            echo "Patched libtilelang.so removes symbols required by base-wheel consumers:" >&2
+            cat missing-required-libtilelang-symbols.txt >&2
+            exit 2
+          fi
+
+          result_native_hash="$(native_tree_digest candidate-native)"
+          patched_lib_hash="$(sha256sum "${candidate_lib}" | awk '{ print $1 }')"
+
+          if [[ -n "$(find src tilelang -type l -print -quit)" ]]; then
+            echo "Source overlay cannot contain symbolic links." >&2
+            exit 2
+          fi
+          cp -a -- src native-overlay-stage/tilelang/src
+          while IFS= read -r -d '' source_file; do
+            case "${source_file}" in
+              *.py|*.pyi|*.md)
+                install -D -m 0644 -- \
+                  "${source_file}" \
+                  "native-overlay-stage/${source_file}"
+                ;;
+            esac
+          done < <(git ls-files -z tilelang)
+          install -m 0755 -- \
+            "${candidate_lib}" \
+            native-overlay-stage/tilelang/lib/libtilelang.so
+
+          jq -n \
+            --arg schema "tilelang-python-overlay-identity-v1" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg source_sha "${SOURCE_SHA}" \
+            --arg native_base_sha "${BASE_SHA}" \
+            --arg overlay_kind "native-python-source" \
+            '{
+              schema: $schema,
+              repository: $repository,
+              source_sha: $source_sha,
+              native_base_sha: $native_base_sha,
+              overlay_kind: $overlay_kind
+            }' > native-overlay-stage/tilelang/_python_overlay_identity.json
+
+          (
+            cd native-overlay-stage
+            find tilelang -type f -print0 | LC_ALL=C sort -z > ../native-overlay-files.txt
+            tar \
+              --sort=name \
+              --mtime='UTC 1970-01-01' \
+              --owner=0 \
+              --group=0 \
+              --numeric-owner \
+              --no-recursion \
+              --null \
+              -cf - \
+              -T ../native-overlay-files.txt \
+              | gzip -n \
+              > ../native-overlay-evidence/tilelang-native-overlay.tar.gz
+          )
+
+          runtime_identity_hash="$(
+            sha256sum native-overlay-stage/tilelang/_python_overlay_identity.json \
+              | awk '{ print $1 }'
+          )"
+          overlay_hash="$(
+            sha256sum native-overlay-evidence/tilelang-native-overlay.tar.gz \
+              | awk '{ print $1 }'
+          )"
+          changed_json="$(
+            jq -Rsc 'split("\n") | map(select(length > 0))' changed-files.txt
+          )"
+          needed_json="$(
+            jq -Rsc 'split("\n") | map(select(length > 0))' candidate-needed.txt
+          )"
+
+          jq -n \
+            --arg schema "tilelang-colab-native-overlay-v1" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg source_sha "${SOURCE_SHA}" \
+            --arg native_base_sha "${BASE_SHA}" \
+            --arg native_base_tag "${BASE_TAG}" \
+            --arg base_wheel_name "${BASE_WHEEL_NAME}" \
+            --arg base_wheel_release_digest "${BASE_WHEEL_DIGEST}" \
+            --arg base_wheel_sha256 "${actual_wheel_hash}" \
+            --arg base_distribution_version "${base_distribution_version}" \
+            --arg base_native_tree_sha256 "${base_native_hash}" \
+            --arg result_native_tree_sha256 "${result_native_hash}" \
+            --arg patched_libtilelang_sha256 "${patched_lib_hash}" \
+            --arg overlay_sha256 "${overlay_hash}" \
+            --arg runtime_identity_sha256 "${runtime_identity_hash}" \
+            --arg comparison_status "${COMPARISON_STATUS}" \
+            --arg elf_soname "${base_soname}" \
+            --arg elf_rpath "${base_rpath}" \
+            --arg compatibility "native-library-hot-patch-abi-guard-v1" \
+            --arg manylinux_image_digest "${MANYLINUX_IMAGE_DIGEST}" \
+            --arg cmake_version "${CMAKE_WHEEL_VERSION}" \
+            --arg cmake_wheel_sha256 "${CMAKE_WHEEL_SHA256}" \
+            --arg cuda_version "13.0.88" \
+            --arg python_version "${PYTHON_VERSION}" \
+            --arg python_abi "${MANYLINUX_PYTHON_TAG}" \
+            --arg tvm_sdk_fingerprint "${TVM_SDK_FINGERPRINT}" \
+            --arg native_fingerprint "${NATIVE_FINGERPRINT}" \
+            --argjson base_native_file_count "${base_native_file_count}" \
+            --argjson changed_files "${changed_json}" \
+            --argjson elf_needed "${needed_json}" \
+            '{
+              schema: $schema,
+              repository: $repository,
+              source_sha: $source_sha,
+              native_base_sha: $native_base_sha,
+              native_base_tag: $native_base_tag,
+              base_wheel: {
+                name: $base_wheel_name,
+                release_digest: $base_wheel_release_digest,
+                sha256: $base_wheel_sha256
+              },
+              base_distribution_version: $base_distribution_version,
+              base_native_file_count: $base_native_file_count,
+              base_native_tree_sha256: $base_native_tree_sha256,
+              result_native_tree_sha256: $result_native_tree_sha256,
+              patched_libtilelang_sha256: $patched_libtilelang_sha256,
+              overlay_sha256: $overlay_sha256,
+              runtime_identity_sha256: $runtime_identity_sha256,
+              comparison_status: $comparison_status,
+              changed_files: $changed_files,
+              elf: {
+                soname: $elf_soname,
+                rpath: $elf_rpath,
+                needed: $elf_needed
+              },
+              build_environment: {
+                manylinux_image_digest: $manylinux_image_digest,
+                cmake_version: $cmake_version,
+                cmake_wheel_sha256: $cmake_wheel_sha256,
+                cuda_version: $cuda_version,
+                python_version: $python_version,
+                python_abi: $python_abi,
+                tvm_sdk_fingerprint: $tvm_sdk_fingerprint,
+                native_fingerprint: $native_fingerprint
+              },
+              compatibility: $compatibility
+            }' | tee native-overlay-evidence/native-overlay-manifest.json
+
+          {
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "source_sha=${SOURCE_SHA}"
+            echo "native_base_sha=${BASE_SHA}"
+            echo "native_base_tag=${BASE_TAG}"
+            echo "base_wheel_name=${BASE_WHEEL_NAME}"
+            echo "base_wheel_sha256=${actual_wheel_hash}"
+            echo "base_distribution_version=${base_distribution_version}"
+            echo "base_native_tree_sha256=${base_native_hash}"
+            echo "result_native_tree_sha256=${result_native_hash}"
+            echo "patched_libtilelang_sha256=${patched_lib_hash}"
+            echo "elf_soname=${base_soname}"
+            echo "elf_rpath=${base_rpath}"
+            echo "elf_needed_begin"
+            cat candidate-needed.txt
+            echo "elf_needed_end"
+            echo "restored_base_dependencies_begin"
+            cat base-needed-missing-from-candidate.txt
+            echo "restored_base_dependencies_end"
+            echo "required_symbol_versions_begin"
+            cat candidate-required-symbol-versions.txt
+            echo "required_symbol_versions_end"
+            echo "base_consumers_required_symbol_count=$(wc -l < required-libtilelang-symbols.txt)"
+            echo "missing_required_symbol_count=$(wc -l < missing-required-libtilelang-symbols.txt)"
+            echo "added_required_symbol_version_count=$(wc -l < added-required-symbol-versions.txt)"
+          } | tee native-overlay-evidence/elf-compatibility.txt
+
+          cp changed-files.txt native-overlay-evidence/
+          cp base-wheel/source-revisions.txt native-overlay-evidence/base-wheel-source-revisions.txt
+          cp maint/scripts/apply_colab_native_overlay.sh native-overlay-evidence/
+          chmod +x native-overlay-evidence/apply_colab_native_overlay.sh
+          (
+            cd native-overlay-evidence
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | LC_ALL=C sort -z \
+              | xargs -0 sha256sum \
+              > SHA256SUMS
+          )
+          ls -lh native-overlay-evidence
+
+      - name: Confirm pinned CPU PyTorch wheel is ready
+        id: torch-cpu-wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_root="${GITHUB_WORKSPACE}/.cache/torch-cpu-wheel"
+          wheel="${cache_root}/${TORCH_CPU_WHEEL_NAME}"
+          ready="${cache_root}/READY"
+          log="${RUNNER_TEMP}/tilelang-torch-cpu-wheel-download.log"
+          pid_file="${RUNNER_TEMP}/tilelang-torch-cpu-wheel-download.pid"
+          deadline=$((SECONDS + 300))
+
+          while [[ ! -f "${ready}" ]]; do
+            if [[ ! -f "${pid_file}" ]] || ! kill -0 "$(cat "${pid_file}")" 2>/dev/null; then
+              [[ -f "${log}" ]] && cat "${log}" >&2
+              echo "Pinned CPU PyTorch wheel download stopped before verification." >&2
+              exit 2
+            fi
+            if (( SECONDS >= deadline )); then
+              kill "$(cat "${pid_file}")" 2>/dev/null || true
+              [[ -f "${log}" ]] && cat "${log}" >&2
+              echo "Timed out while downloading pinned CPU PyTorch wheel." >&2
+              exit 2
+            fi
+            sleep 0.2
+          done
+
+          [[ -f "${log}" ]] && cat "${log}"
+          echo "${TORCH_CPU_WHEEL_SHA256}  ${wheel}" | sha256sum --check
+          printf 'wheel=%s\nsha256=%s\n' \
+            "${TORCH_CPU_WHEEL_NAME}" \
+            "${TORCH_CPU_WHEEL_SHA256}" \
+            | tee native-overlay-evidence/trace-torch-wheel.txt
+
+      - name: Save pinned CPU PyTorch wheel
+        if: steps.torch-cpu-wheel-cache.outputs.cache-hit != 'true' && steps.torch-cpu-wheel.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/torch-cpu-wheel
+          key: tilelang-trace-torch-cpu-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.TORCH_CPU_WHEEL_SHA256 }}
+
+      - name: Self-test native overlay installation
+        id: overlay-selftest
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          BASE_WHEEL_NAME: ${{ steps.refs.outputs.base_wheel_name }}
+        run: |
+          set -euo pipefail
+          python -m venv native-overlay-selftest
+          native-overlay-selftest/bin/python -m pip \
+            --disable-pip-version-check \
+            install \
+            ".cache/torch-cpu-wheel/${TORCH_CPU_WHEEL_NAME}"
+          native-overlay-selftest/bin/python -m pip \
+            --disable-pip-version-check \
+            install \
+            "base-wheel/${BASE_WHEEL_NAME}"
+          native-overlay-selftest/bin/python -m pip check
+          native-overlay-selftest/bin/python - <<'PY' | tee native-overlay-evidence/trace-python-runtime.txt
+          import platform
+          import torch
+
+          if platform.python_version_tuple()[:2] != ("3", "13"):
+              raise SystemExit(f"Expected Python 3.13, got {platform.python_version()}")
+          if torch.__version__ != "2.11.0+cpu" or torch.cuda.is_available():
+              raise SystemExit(f"Expected CPU-only torch 2.11.0, got {torch.__version__}, CUDA={torch.cuda.is_available()}")
+          print(f"python={platform.python_version()}")
+          print(f"torch={torch.__version__}")
+          print(f"torch_cuda_available={torch.cuda.is_available()}")
+          PY
+          native-overlay-selftest/bin/python -m pip freeze \
+            | LC_ALL=C sort \
+            > native-overlay-evidence/trace-python-environment.txt
+          PYTHON="${GITHUB_WORKSPACE}/native-overlay-selftest/bin/python" \
+            native-overlay-evidence/apply_colab_native_overlay.sh \
+              native-overlay-evidence/tilelang-native-overlay.tar.gz \
+              native-overlay-evidence/native-overlay-manifest.json \
+            | tee native-overlay-evidence/installer-selftest.txt
+
+          native-overlay-selftest/bin/python - \
+            native-overlay-evidence/native-overlay-manifest.json \
+            "${SOURCE_SHA}" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from importlib import metadata
+          from pathlib import Path
+
+          manifest = json.loads(Path(sys.argv[1]).read_text())
+          source_sha = sys.argv[2]
+          dist = metadata.distribution("tilelang")
+          package = Path(dist.locate_file("tilelang")).resolve()
+          identity_path = package / "_python_overlay_identity.json"
+          identity = json.loads(identity_path.read_text())
+          if identity.get("source_sha") != source_sha:
+              raise SystemExit("Installed runtime identity does not match the source commit.")
+          if not (package / "src").is_dir():
+              raise SystemExit("Installed native overlay is missing the complete source tree.")
+          library_hash = hashlib.sha256((package / "lib" / "libtilelang.so").read_bytes()).hexdigest()
+          if library_hash != manifest["patched_libtilelang_sha256"]:
+              raise SystemExit("Installed libtilelang.so does not match the manifest.")
+          print(f"selftest_package={package}")
+          print(f"selftest_version={dist.version}")
+          print(f"selftest_source_sha={source_sha}")
+          print(f"selftest_libtilelang_sha256={library_hash}")
+          PY
+
+          (
+            cd native-overlay-evidence
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | LC_ALL=C sort -z \
+              | xargs -0 -r sha256sum \
+              > SHA256SUMS
+          )
+
+      - name: Trace layout cost features without a GPU
+        id: layout-cost-trace
+        shell: bash
+        env:
+          TILELANG_SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          TILELANG_LAYOUT_TRACE_ARCHES: sm_75,sm_80,sm_90a,sm_100a,sm_120a
+          TILELANG_LAYOUT_TRACE_RESULT: native-overlay-evidence/layout-cost-trace.json
+          TILELANG_LAYOUT_TRACE_LOG: native-overlay-evidence/layout-cost-trace.log
+        run: |
+          set -euo pipefail
+          native-overlay-selftest/bin/python \
+            benchmark/research/trace_layout_cost_features.py
+          (
+            cd native-overlay-evidence
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | LC_ALL=C sort -z \
+              | xargs -0 -r sha256sum \
+              > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Save direct native compiler cache
+        if: always() && steps.manylinux-native-cache.outputs.cache-hit != 'true' && steps.native-build.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/ccache
+          key: colab-native-direct-ccache-v1-${{ runner.os }}-${{ runner.arch }}-cuda130-relocatable-${{ steps.source.outputs.native_fingerprint }}
+
+      - name: Upload native compile evidence
+        if: always() && steps.overlay-selftest.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tilelang-native-overlay-${{ steps.source.outputs.commit }}-on-${{ steps.refs.outputs.base_sha }}
+          path: |
+            native-smoke-evidence/*
+            native-overlay-evidence/*
+          if-no-files-found: error
+          retention-days: 7

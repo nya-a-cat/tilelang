@@ -1,0 +1,169 @@
+name: Prepare Colab Python overlay
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact candidate commit or ref
+        required: true
+        type: string
+      native_base_ref:
+        description: Exact commit with a published colab-wheel release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: colab-python-overlay-${{ inputs.source_ref }}-${{ inputs.native_base_ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare-overlay:
+    name: Verify native compatibility and package Python sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout candidate without native submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+          submodules: false
+
+      - name: Resolve exact refs and verify reusable wheel
+        id: refs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          NATIVE_BASE_REF: ${{ inputs.native_base_ref }}
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          git fetch --no-tags --depth=1 origin "${NATIVE_BASE_REF}"
+          base_sha="$(git rev-parse FETCH_HEAD)"
+          base_tag=""
+          base_wheel=""
+          for candidate_tag in "colab-fast-${base_sha}" "colab-wheel-${base_sha}"; do
+            if candidate_release="$(
+              gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${candidate_tag}" \
+                2>/dev/null
+            )"; then
+              candidate_wheel="$(
+                jq -c '[.assets[] | select(.name | endswith(".whl"))][0] | {name: .name, url: .browser_download_url, digest: .digest}' \
+                  <<<"${candidate_release}"
+              )"
+              if [[ "${candidate_wheel}" != "null" ]] && \
+                 jq -e '.digest | strings | test("^sha256:[0-9a-f]{64}$")' <<<"${candidate_wheel}" >/dev/null; then
+                base_tag="${candidate_tag}"
+                base_wheel="${candidate_wheel}"
+                break
+              fi
+            fi
+          done
+          test -n "${base_tag}"
+          test -n "${base_wheel}"
+
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+          echo "base_sha=${base_sha}" >> "${GITHUB_OUTPUT}"
+          echo "base_tag=${base_tag}" >> "${GITHUB_OUTPUT}"
+          echo "base_wheel=${base_wheel}" >> "${GITHUB_OUTPUT}"
+
+      - name: Reject native or packaging changes
+        id: compatibility
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          BASE_SHA: ${{ steps.refs.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          mapfile -t changed_files < <(git diff --name-only --diff-filter=ACDMRTUXB "${BASE_SHA}" "${SOURCE_SHA}")
+          native_sensitive=()
+
+          for path in "${changed_files[@]}"; do
+            case "${path}" in
+              .github/*|benchmark/*|docs/*|examples/*|maint/*|testing/*) ;;
+              tilelang/*.py|tilelang/*.pyi|tilelang/*.md) ;;
+              README.md|LICENSE|THIRDPARTYNOTICES.txt) ;;
+              *) native_sensitive+=("${path}") ;;
+            esac
+          done
+
+          printf '%s\n' "${changed_files[@]}" > changed-files.txt
+          if (( ${#native_sensitive[@]} > 0 )); then
+            printf 'Native or packaging changes require the cached full-wheel workflow:\n' >&2
+            printf '  %s\n' "${native_sensitive[@]}" >&2
+            exit 2
+          fi
+
+          echo "Compatible pure-Python overlay across ${#changed_files[@]} changed paths."
+
+      - name: Package complete pure-Python tree and provenance
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          BASE_SHA: ${{ steps.refs.outputs.base_sha }}
+          BASE_TAG: ${{ steps.refs.outputs.base_tag }}
+          BASE_WHEEL: ${{ steps.refs.outputs.base_wheel }}
+        run: |
+          set -euo pipefail
+          mkdir -p overlay
+          jq -n \
+            --arg schema "tilelang-python-overlay-identity-v1" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg source_sha "${SOURCE_SHA}" \
+            --arg native_base_sha "${BASE_SHA}" \
+            '{
+              schema: $schema,
+              repository: $repository,
+              source_sha: $source_sha,
+              native_base_sha: $native_base_sha
+            }' > tilelang/_python_overlay_identity.json
+
+          find tilelang -type f \( \
+              -name '*.py' -o \
+              -name '*.pyi' -o \
+              -name '*.md' -o \
+              -path 'tilelang/_python_overlay_identity.json' \
+            \) -print0 \
+            | sort -z > overlay-files.txt
+          tar --null -czf overlay/tilelang-python-overlay.tar.gz -T overlay-files.txt
+          cp maint/scripts/apply_colab_python_overlay.sh overlay/
+          chmod +x overlay/apply_colab_python_overlay.sh
+
+          overlay_sha256="$(sha256sum overlay/tilelang-python-overlay.tar.gz | awk '{ print $1 }')"
+          runtime_identity_sha256="$(sha256sum tilelang/_python_overlay_identity.json | awk '{ print $1 }')"
+          changed_json="$(jq -Rsc 'split("\n") | map(select(length > 0))' changed-files.txt)"
+          jq -n \
+            --arg schema "tilelang-colab-python-overlay-v1" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg source_sha "${SOURCE_SHA}" \
+            --arg native_base_sha "${BASE_SHA}" \
+            --arg native_base_tag "${BASE_TAG}" \
+            --arg overlay_sha256 "${overlay_sha256}" \
+            --arg runtime_identity_sha256 "${runtime_identity_sha256}" \
+            --argjson base_wheel "${BASE_WHEEL}" \
+            --argjson changed_files "${changed_json}" \
+            '{
+              schema: $schema,
+              repository: $repository,
+              source_sha: $source_sha,
+              native_base_sha: $native_base_sha,
+              native_base_tag: $native_base_tag,
+              base_wheel: $base_wheel,
+              overlay_sha256: $overlay_sha256,
+              runtime_identity_sha256: $runtime_identity_sha256,
+              changed_files: $changed_files,
+              compatibility: "pure-python-source-overlay"
+            }' | tee overlay/overlay-manifest.json
+          sha256sum overlay/* | tee overlay/SHA256SUMS
+
+      - name: Upload dynamic overlay artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tilelang-colab-overlay-${{ steps.refs.outputs.source_sha }}-on-${{ steps.refs.outputs.base_sha }}
+          path: overlay/*
+          if-no-files-found: error
+          retention-days: 7
