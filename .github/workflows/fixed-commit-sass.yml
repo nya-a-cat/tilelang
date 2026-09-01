@@ -1,0 +1,193 @@
+name: Fixed-commit SASS diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Full 40-character fork commit containing the diagnostic
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fixed-commit-sass-${{ inputs.source_ref }}
+  cancel-in-progress: false
+
+jobs:
+  sm75-static-sass:
+    if: github.repository == 'nya-a-cat/tilelang'
+    name: GPU-free sm_75 CUBIN/SASS
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      MANYLINUX_IMAGE_DIGEST: 012f4a50472412f18bb2b450c1cce7158434cfae4ae878591c2748a13a30c2be
+      INPUT_RELEASE_TAG: colab-fixed-commit-ab-reduction-2505e78fad5a6631f97c3c86631e9424aa63b15a
+      INPUT_RESULT_NAME: tilelang-fixed-commit-ab-reduction-t4.json
+      INPUT_RESULT_SHA256: 884d593c11d9111ed19023ea3e7c81a3152ede774ac43bf5f3c67bcce35de5c3
+      BASELINE_RELEASE_TAG: colab-fast-a66f3860fdc3c1e5f6f78d96ee02d2e89953eda2
+      BASELINE_WHEEL_NAME: tilelang-0.1.13+cu130.gita66f3860-cp39-abi3-linux_x86_64.whl
+      BASELINE_WHEEL_SHA256: 058138c5b6ece9c0c7b6b20ebbbc572f510e210a6a65f5ef974e118c04f65cc8
+      CANDIDATE_RELEASE_TAG: colab-fast-4df968c3a85e723dc1870c62a0745284660bffd3
+      CANDIDATE_WHEEL_NAME: tilelang-0.1.13+cu130.git4df968c3-cp39-abi3-linux_x86_64.whl
+      CANDIDATE_WHEEL_SHA256: f3ddcaa79cb10a5b61f4c8ed2eb6941fb30a3f53ddb45aeff2008b6824835f82
+
+    steps:
+      - name: Checkout exact diagnostic source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+          submodules: false
+          persist-credentials: false
+
+      - name: Verify exact fork commit
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [[ "${SOURCE_REF}" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "${SOURCE_REF}"
+          test "${GITHUB_REPOSITORY}" = "nya-a-cat/tilelang"
+
+      - name: Restore exact relocatable CUDA toolchain
+        id: toolchain-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/ci-toolchain
+          key: colab-toolchain-v2-${{ runner.os }}-${{ runner.arch }}-manylinux-${{ env.MANYLINUX_IMAGE_DIGEST }}-${{ hashFiles('maint/scripts/install_cached_cuda_toolchain.sh', 'maint/scripts/use_cached_cuda_sysroot.sh') }}
+
+      - name: Require and activate cached CUDA 13.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.toolchain-cache.outputs.cache-hit }}" != "true" ]]; then
+            echo "::error::Exact CUDA toolchain cache is unavailable; refusing a network bootstrap."
+            exit 2
+          fi
+          toolchain_root="${GITHUB_WORKSPACE}/.cache/ci-toolchain"
+          cuda_root="${toolchain_root}/cuda-13.0"
+          maint/scripts/use_cached_cuda_sysroot.sh "${toolchain_root}" true
+          {
+            echo "${toolchain_root}/bin"
+            echo "${cuda_root}/bin"
+          } >> "${GITHUB_PATH}"
+          {
+            echo "CUDA_HOME=${cuda_root}"
+            echo "CUDAToolkit_ROOT=${cuda_root}"
+            echo "LD_LIBRARY_PATH=${cuda_root}/lib64:${cuda_root}/lib64/stubs"
+          } >> "${GITHUB_ENV}"
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.13"
+          update-environment: true
+
+      - name: Download and verify frozen inputs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p inputs
+          gh release download "${INPUT_RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" --pattern "${INPUT_RESULT_NAME}" --dir inputs
+          gh release download "${BASELINE_RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" --pattern "${BASELINE_WHEEL_NAME}" --dir inputs
+          gh release download "${CANDIDATE_RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" --pattern "${CANDIDATE_WHEEL_NAME}" --dir inputs
+          {
+            printf '%s  %s\n' "${INPUT_RESULT_SHA256}" "inputs/${INPUT_RESULT_NAME}"
+            printf '%s  %s\n' "${BASELINE_WHEEL_SHA256}" "inputs/${BASELINE_WHEEL_NAME}"
+            printf '%s  %s\n' "${CANDIDATE_WHEEL_SHA256}" "inputs/${CANDIDATE_WHEEL_NAME}"
+          } | sha256sum --check --strict
+
+      - name: Compile and disassemble frozen sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python benchmark/research/compile_fixed_commit_sass.py \
+            --input-result "inputs/${INPUT_RESULT_NAME}" \
+            --baseline-wheel "inputs/${BASELINE_WHEEL_NAME}" \
+            --candidate-wheel "inputs/${CANDIDATE_WHEEL_NAME}" \
+            --nvcc "${CUDA_HOME}/bin/nvcc" \
+            --nvdisasm "${CUDA_HOME}/bin/nvdisasm" \
+            --cuda-home "${CUDA_HOME}" \
+            --work-dir "work/static-sass" \
+            --output-dir evidence
+
+      - name: Package deterministic evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cp benchmark/research/compile_fixed_commit_sass.py evidence/
+          cp .github/workflows/fixed-commit-sass.yml evidence/
+          if [[ -d work/static-sass/raw ]]; then
+            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+              -C work/static-sass/raw -cf - . \
+              | gzip -n -9 > evidence/tilelang-fixed-commit-sass-sm75-actions-raw.tar.gz
+          fi
+          if [[ -f evidence/tilelang-fixed-commit-sass-sm75-actions.json ]]; then
+            gzip -n -9 -c evidence/tilelang-fixed-commit-sass-sm75-actions.json \
+              > evidence/tilelang-fixed-commit-sass-sm75-actions.json.gz
+          fi
+          (
+            cd evidence
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+              | sort -z \
+              | xargs -0 -r sha256sum \
+              > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
+          )
+
+      - name: Upload workflow evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tilelang-fixed-commit-sass-${{ inputs.source_ref }}
+          path: evidence/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish fork-only prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          tag="actions-fixed-commit-sass-${SOURCE_REF}"
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "::error::Release tag already exists: ${tag}"
+            exit 2
+          fi
+          gh release create "${tag}" evidence/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${SOURCE_REF}" \
+            --title "Fixed-commit sm_75 SASS diagnostic ${SOURCE_REF:0:8}" \
+            --notes-file evidence/tilelang-fixed-commit-sass-sm75-actions-report.md \
+            --prerelease
+
+      - name: Verify fork release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          tag="actions-fixed-commit-sass-${SOURCE_REF}"
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
+          test "$(jq -r '.target_commitish' <<<"${release_json}")" = "${SOURCE_REF}"
+          test "$(jq -r '.prerelease' <<<"${release_json}")" = "true"
+          while read -r expected name; do
+            actual="$(jq -r --arg name "${name}" '.assets[] | select(.name == $name) | .digest' <<<"${release_json}")"
+            size="$(jq -r --arg name "${name}" '.assets[] | select(.name == $name) | .size' <<<"${release_json}")"
+            test "${actual}" = "sha256:${expected}"
+            test "${size}" = "$(stat -c %s "evidence/${name}")"
+          done < evidence/SHA256SUMS
+          echo "release_url=$(jq -r '.html_url' <<<"${release_json}")"
