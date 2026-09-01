@@ -4,7 +4,9 @@ Upload ``benchmark_commit_ab_t4.py`` beside this controller in ``WORK_DIR``.
 The controller hash-checks every input, creates isolated Python environments
 and TileLang caches, then alternates persistent baseline/candidate workers for
 30 paired cycles. The installed TileLang compiler/runtime version is the sole
-experimental variable.
+experimental variable. Candidate identity and overlay digests may be supplied
+as exact environment values so a new compiler candidate does not require a
+controller source edit.
 """
 
 from __future__ import annotations
@@ -30,9 +32,22 @@ import urllib.request
 
 
 REPOSITORY = "nya-a-cat/tilelang"
+
+
+def exact_hex_env(name: str, default: str, length: int) -> str:
+    value = os.environ.get(name, default)
+    if re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is None:
+        raise ValueError(f"{name} must contain exactly {length} lowercase hexadecimal characters")
+    return value
+
+
 BASELINE_COMMIT = "958d6d3bd24a31874a2bb189a9791347e855eecd"
 BASELINE_BUILD_COMMIT = "a66f3860fdc3c1e5f6f78d96ee02d2e89953eda2"
-CANDIDATE_COMMIT = "2ac416ac8e2c60be29bba792d6bf6ded8315467e"
+CANDIDATE_COMMIT = exact_hex_env(
+    "TILELANG_CANDIDATE_COMMIT",
+    "2ac416ac8e2c60be29bba792d6bf6ded8315467e",
+    40,
+)
 CANDIDATE_NATIVE_BASE = "4df968c3a85e723dc1870c62a0745284660bffd3"
 
 BASELINE_TAG = f"colab-fast-{BASELINE_BUILD_COMMIT}"
@@ -45,9 +60,21 @@ CANDIDATE_BASE_WHEEL_NAME = "tilelang-0.1.13+cu130.git4df968c3-cp39-abi3-linux_x
 CANDIDATE_BASE_WHEEL_SHA256 = "f3ddcaa79cb10a5b61f4c8ed2eb6941fb30a3f53ddb45aeff2008b6824835f82"
 CANDIDATE_OVERLAY_TAG = f"colab-native-{CANDIDATE_COMMIT}"
 CANDIDATE_OVERLAY_ASSETS = {
-    "apply_colab_native_overlay.sh": "945da1e58f8384ca09a8e5983e0c283bc716ba16372eb8f269de87deb7d96d98",
-    "native-overlay-manifest.json": "7cc1bd1fcf3e247d1d0f9193eaadc67d5138fd9de46fb02338725086dc5b28f2",
-    "tilelang-native-overlay.tar.gz": "d8cefd2cb79b583c18808ab9fef90b6c08c63435508f6c296686e6feb176680a",
+    "apply_colab_native_overlay.sh": exact_hex_env(
+        "TILELANG_CANDIDATE_OVERLAY_INSTALLER_SHA256",
+        "945da1e58f8384ca09a8e5983e0c283bc716ba16372eb8f269de87deb7d96d98",
+        64,
+    ),
+    "native-overlay-manifest.json": exact_hex_env(
+        "TILELANG_CANDIDATE_OVERLAY_MANIFEST_SHA256",
+        "7cc1bd1fcf3e247d1d0f9193eaadc67d5138fd9de46fb02338725086dc5b28f2",
+        64,
+    ),
+    "tilelang-native-overlay.tar.gz": exact_hex_env(
+        "TILELANG_CANDIDATE_OVERLAY_ARCHIVE_SHA256",
+        "d8cefd2cb79b583c18808ab9fef90b6c08c63435508f6c296686e6feb176680a",
+        64,
+    ),
 }
 
 WORKER_NAME = "benchmark_commit_ab_t4.py"
@@ -898,6 +925,8 @@ def main() -> int:
         "baseline_commit": BASELINE_COMMIT,
         "baseline_build_commit": BASELINE_BUILD_COMMIT,
         "candidate_commit": CANDIDATE_COMMIT,
+        "candidate_overlay_tag": CANDIDATE_OVERLAY_TAG,
+        "candidate_overlay_asset_sha256": CANDIDATE_OVERLAY_ASSETS,
         "started_unix": started,
         "controller_system": {
             "platform": platform.platform(),
