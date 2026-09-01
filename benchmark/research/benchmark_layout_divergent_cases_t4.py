@@ -2,7 +2,8 @@
 
 The scan constructs each PrimFunc once.  This benchmark reuses those exact
 program objects for T4 correctness, ptxas resources, eager launch timing, and
-CUDA Graph replay under ``register-count`` and ``io-aware``.
+CUDA Graph replay under the two policies selected by
+``TILELANG_LAYOUT_AB_POLICIES``.
 """
 
 from __future__ import annotations
@@ -11,11 +12,19 @@ import os
 
 os.environ.setdefault("TILELANG_LAYOUT_AB_RESULT", "/content/tilelang-layout-divergent-cases-t4.json")
 os.environ.setdefault("TILELANG_LAYOUT_AB_SCHEMA", "tilelang-layout-divergent-runtime-ab-v1")
+selected_policies = tuple(
+    policy.strip()
+    for policy in os.environ.get(
+        "TILELANG_LAYOUT_AB_POLICIES",
+        "register-count,io-aware",
+    ).split(",")
+    if policy.strip()
+)
 os.environ.setdefault(
     "TILELANG_LAYOUT_AB_EVIDENCE_BOUNDARY",
     (
         "One free Colab T4 measures unchanged PrimFuncs selected by the CPU-only layout-policy divergence scan. "
-        "It compares register-count and io-aware with correctness, ptxas resources, eager launches, and CUDA "
+        f"It compares {selected_policies!r} with correctness, ptxas resources, eager launches, and CUDA "
         "Graph replay. Other GPU architectures, model-level workloads, and the global 1.50x goal remain outside "
         "this evidence."
     ),

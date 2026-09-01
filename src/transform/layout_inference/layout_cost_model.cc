@@ -203,6 +203,27 @@ bool TryMultiplyPositive(int64_t lhs, int64_t rhs, int64_t *product) {
   return true;
 }
 
+// Provisional 256 KiB price calibrated on the existing 18-case T4/consumer-
+// Blackwell layout-divergence set. It remains opt-in until held-out operators
+// and the frozen multi-architecture matrix establish generalization.
+constexpr int64_t kRegularizedRegisterSlotPriceBytes = int64_t{1} << 18;
+
+/*! \brief Saturating non-negative `memory + price * registers` scalarization.
+ *
+ * Layout costs are estimates, so overflowing into a cheap negative score is
+ * worse than conservatively keeping the attempt at the end of the ordering. */
+int64_t RegisterRegularizedRank(int64_t memory, int64_t registers,
+                                int64_t register_price) {
+  const int64_t maximum = std::numeric_limits<int64_t>::max();
+  if (memory < 0 || registers < 0 || register_price < 0) {
+    return maximum;
+  }
+  if (register_price != 0 && registers > (maximum - memory) / register_price) {
+    return maximum;
+  }
+  return memory + registers * register_price;
+}
+
 /*! \brief Zero out vars outside the probe's own coordinate set: block
  *  indices inside region offsets shift every address of the statement
  *  equally and cancel out of both contiguity and segment geometry.
@@ -995,6 +1016,7 @@ public:
     cost.spill = CountSpilledBytes(members, infer_list, tmp_layout_map);
     cost.mem = cost.spill;
     cost.regs = CountRegisterSlots(tmp_layout_map);
+    cost.rank = cost.mem;
     DLOG(INFO) << "[LayoutCost] register-count score end: mem(spill)="
                << cost.mem << " regs=" << cost.regs;
     return cost;
@@ -1009,13 +1031,16 @@ public:
  *  opacity). Registers remain the lexicographic tiebreak. */
 class IOAwareCostModel final : public LayoutCostModel {
 public:
-  explicit IOAwareCostModel(Target target) : target_(std::move(target)) {}
+  IOAwareCostModel(Target target, std::string name,
+                   int64_t register_slot_price_bytes)
+      : target_(std::move(target)), name_(std::move(name)),
+        register_slot_price_bytes_(register_slot_price_bytes) {}
 
   AttemptCost Score(const std::vector<int> &members,
                     const std::vector<TileOperator> &infer_list,
                     const LayoutMap &tmp_layout_map) const final {
-    DLOG(INFO) << "[LayoutCost] io-aware score begin: members="
-               << FormatVector(members)
+    DLOG(INFO) << "[LayoutCost] " << name_
+               << " score begin: members=" << FormatVector(members)
                << " layout_entries=" << tmp_layout_map.size();
     AttemptCost cost;
     // Spill traffic enters the same byte-denominated channel as the global
@@ -1120,12 +1145,16 @@ public:
                    << " is outside the IO-aware statement model";
       }
     }
-    DLOG(INFO) << "[LayoutCost] io-aware score end: mem=" << cost.mem
-               << " regs=" << cost.regs;
+    cost.register_price = register_slot_price_bytes_;
+    cost.rank = RegisterRegularizedRank(cost.mem, cost.regs,
+                                        register_slot_price_bytes_);
+    DLOG(INFO) << "[LayoutCost] " << name_ << " score end: rank=" << cost.rank
+               << " mem=" << cost.mem << " regs=" << cost.regs
+               << " register_price=" << cost.register_price;
     return cost;
   }
 
-  const char *Name() const final { return "io-aware"; }
+  const char *Name() const final { return name_.c_str(); }
 
 private:
   static void AccumulateCharge(AttemptCost *cost,
@@ -1210,6 +1239,8 @@ private:
   }
 
   Target target_;
+  std::string name_;
+  int64_t register_slot_price_bytes_{0};
   mutable std::unordered_map<int,
                              std::vector<std::pair<Fragment, StatementCharge>>>
       stmt_cache_;
@@ -1220,14 +1251,19 @@ private:
 std::unique_ptr<LayoutCostModel>
 LayoutCostModel::Create(const std::string &name, Target target) {
   if (name == "io-aware") {
-    return std::make_unique<IOAwareCostModel>(std::move(target));
+    return std::make_unique<IOAwareCostModel>(std::move(target), name, 0);
+  }
+  if (name == "io-aware-regularized") {
+    return std::make_unique<IOAwareCostModel>(
+        std::move(target), name, kRegularizedRegisterSlotPriceBytes);
   }
   if (name == "register-count") {
     return std::make_unique<RegisterCountCostModel>();
   }
   LOG(FATAL) << "Unknown layout cost model \"" << name
              << "\" for pass config `tl.layout_cost_model`; valid values "
-                "are \"register-count\" (default) and \"io-aware\".";
+                "are \"register-count\" (default), \"io-aware\", and "
+                "\"io-aware-regularized\".";
   return nullptr; // unreachable
 }
 

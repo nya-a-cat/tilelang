@@ -1,9 +1,10 @@
 """Compile-only discovery of TileLang layout-policy decision divergence.
 
 Every matrix entry constructs one PrimFunc and runs that same object through
-``register-count`` and ``io-aware``.  LayoutInference is compared first.  CUDA
-source lowering runs only when the inferred modules differ, keeping this scan
-cheap enough for a CPU-only remote worker.  No device execution is required.
+the two policies selected by ``TILELANG_LAYOUT_SCAN_POLICIES``. LayoutInference
+is compared first. CUDA source lowering runs only when the inferred modules
+differ, keeping this scan cheap enough for a CPU-only remote worker. No device
+execution is required.
 """
 
 from __future__ import annotations
@@ -31,7 +32,16 @@ from tilelang.layout import Fragment
 from tvm.tirx.stmt_functor import post_order_visit
 
 
-POLICIES = ("register-count", "io-aware")
+POLICIES = tuple(
+    policy.strip()
+    for policy in os.environ.get(
+        "TILELANG_LAYOUT_SCAN_POLICIES",
+        "register-count,io-aware",
+    ).split(",")
+    if policy.strip()
+)
+if len(POLICIES) != 2 or len(set(POLICIES)) != 2:
+    raise ValueError("TILELANG_LAYOUT_SCAN_POLICIES must name exactly two distinct policies")
 TARGET_ARCHES = tuple(
     arch.strip()
     for arch in os.environ.get(

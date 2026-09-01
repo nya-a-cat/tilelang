@@ -30,8 +30,8 @@ from tilelang.contrib.kernel_resource_info import to_dict as resource_usage_to_d
 
 
 POLICIES = tuple(policy.strip() for policy in os.environ.get("TILELANG_LAYOUT_AB_POLICIES", "register-count,io-aware").split(","))
-if len(POLICIES) != 2 or any(not policy for policy in POLICIES):
-    raise ValueError("TILELANG_LAYOUT_AB_POLICIES must contain exactly two comma-separated policies")
+if len(POLICIES) != 2 or len(set(POLICIES)) != 2 or any(not policy for policy in POLICIES):
+    raise ValueError("TILELANG_LAYOUT_AB_POLICIES must contain exactly two distinct comma-separated policies")
 BASELINE_POLICY, CANDIDATE_POLICY = POLICIES
 CYCLES = int(os.environ.get("TILELANG_LAYOUT_AB_CYCLES", "30"))
 MIN_BATCH_MS = float(os.environ.get("TILELANG_LAYOUT_AB_MIN_BATCH_MS", "50"))

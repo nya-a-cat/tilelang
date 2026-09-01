@@ -1463,16 +1463,17 @@ private:
       if (!trace_costs) {
         return;
       }
-      LOG(INFO) << "TILELANG_LAYOUT_COST_TRACE schema=v1 phase=" << phase
+      LOG(INFO) << "TILELANG_LAYOUT_COST_TRACE schema=v2 phase=" << phase
                 << " model=" << cost_model->Name() << " component=" << component
-                << " attempt_root=" << attempt_root << " mem=" << cost.mem
-                << " regs=" << cost.regs << " spill=" << cost.spill
-                << " global_mem=" << cost.global_mem
+                << " attempt_root=" << attempt_root << " rank=" << cost.rank
+                << " mem=" << cost.mem << " regs=" << cost.regs
+                << " spill=" << cost.spill << " global_mem=" << cost.global_mem
                 << " global_bw=" << cost.global_bw
                 << " global_issue=" << cost.global_issue
                 << " measured=" << cost.measured_statements
                 << " worst_case=" << cost.worst_case_statements
-                << " unavailable=" << cost.unavailable_statements;
+                << " unavailable=" << cost.unavailable_statements
+                << " register_price=" << cost.register_price;
     };
     for (auto &&[root, members] : components) {
       DLOG(INFO) << "======================= processing component " << root
@@ -1503,7 +1504,8 @@ private:
         }
         DLOG(INFO) << "[InferInFreeMode] attempt root " << attempt_infer_root
                    << " cost model " << cost_model->Name()
-                   << " output: mem=" << outcome->cost.mem
+                   << " output: rank=" << outcome->cost.rank
+                   << " mem=" << outcome->cost.mem
                    << " regs=" << outcome->cost.regs;
         trace("attempt", root, attempt_infer_root, outcome->cost);
         // Keep the cheapest attempt; ties resolve to the earliest root so
@@ -1544,8 +1546,8 @@ private:
       layout_map = best_layout_map;
       DLOG(INFO) << "[InferInFreeMode] final selection: attempt root "
                  << best_infer_root << " cost model " << cost_model->Name()
-                 << " output: mem=" << best_cost.mem
-                 << " regs=" << best_cost.regs;
+                 << " output: rank=" << best_cost.rank
+                 << " mem=" << best_cost.mem << " regs=" << best_cost.regs;
       trace("selected", root, best_infer_root, best_cost);
     }
   }

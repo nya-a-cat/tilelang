@@ -1,9 +1,9 @@
 """Collect machine-readable LayoutInference cost features without a GPU.
 
 The 18 PrimFuncs are byte-identity guarded against the runtime A/B matrix used
-on T4 and consumer Blackwell.  Each unchanged PrimFunc is inferred under both
-layout policies for explicit CUDA architecture targets.  This script performs
-no device compilation or execution.
+on T4 and consumer Blackwell.  Each unchanged PrimFunc is inferred under the
+selected layout policies for explicit CUDA architecture targets.  This script
+performs no device compilation or execution.
 """
 
 import argparse
@@ -25,7 +25,16 @@ import tilelang.language as T
 from tilelang import tvm
 
 
-POLICIES = ("register-count", "io-aware")
+POLICIES = tuple(
+    policy.strip()
+    for policy in os.environ.get(
+        "TILELANG_LAYOUT_TRACE_POLICIES",
+        "register-count,io-aware,io-aware-regularized",
+    ).split(",")
+    if policy.strip()
+)
+if not POLICIES or len(set(POLICIES)) != len(POLICIES):
+    raise ValueError("TILELANG_LAYOUT_TRACE_POLICIES must name one or more distinct policies")
 TARGET_ARCHES = tuple(
     arch.strip()
     for arch in os.environ.get(
@@ -54,6 +63,7 @@ CASE_ERROR = "TILELANG_TRACE_CASE_ERROR"
 INTEGER_TRACE_FIELDS = {
     "component",
     "attempt_root",
+    "rank",
     "mem",
     "regs",
     "spill",
@@ -63,6 +73,7 @@ INTEGER_TRACE_FIELDS = {
     "measured",
     "worst_case",
     "unavailable",
+    "register_price",
 }
 EXPECTED_TRACE_FIELDS = {
     "schema",
@@ -327,9 +338,7 @@ def child_main(
         try:
             expected_hash = EXPECTED_PRIMFUNC_SHA256[case.name]
             if actual_hash != expected_hash:
-                raise RuntimeError(
-                    f"canonical PrimFunc hash drift: expected {expected_hash}, got {actual_hash}"
-                )
+                raise RuntimeError(f"canonical PrimFunc hash drift: expected {expected_hash}, got {actual_hash}")
             infer_case(case, arch, policy, trace_enabled)
         except Exception as error:  # noqa: BLE001 - preserve the remaining matrix
             failures += 1
@@ -360,7 +369,7 @@ def parse_trace_record(line: str) -> dict[str, Any]:
     missing = EXPECTED_TRACE_FIELDS - set(record)
     if missing:
         raise ValueError(f"trace record is missing fields: {sorted(missing)}")
-    if record["schema"] != "v1" or record["phase"] not in {"attempt", "selected"}:
+    if record["schema"] != "v2" or record["phase"] not in {"attempt", "selected"}:
         raise ValueError(f"unsupported trace record: {record}")
     return record
 
@@ -404,9 +413,7 @@ def parse_child_output(
             try:
                 record = parse_trace_record(line)
                 if record["model"] != policy:
-                    raise ValueError(
-                        f"trace model {record['model']!r} differs from child policy {policy!r}"
-                    )
+                    raise ValueError(f"trace model {record['model']!r} differs from child policy {policy!r}")
                 current["trace_records"].append(record)
             except Exception as error:  # noqa: BLE001 - retain all parse failures
                 current["errors"].append(f"{type(error).__name__}: {error}")
@@ -429,9 +436,7 @@ def parse_child_output(
                 current = None
                 continue
             if match.group(1) != current["name"]:
-                current["errors"].append(
-                    f"end marker names {match.group(1)!r}, expected {current['name']!r}"
-                )
+                current["errors"].append(f"end marker names {match.group(1)!r}, expected {current['name']!r}")
             parsed.append(current)
             current = None
 
@@ -445,6 +450,7 @@ def aggregate_case(case: dict[str, Any], family: str) -> dict[str, Any]:
     selected = [record for record in records if record["phase"] == "selected"]
     attempts = [record for record in records if record["phase"] == "attempt"]
     numeric_fields = (
+        "rank",
         "mem",
         "regs",
         "spill",
@@ -454,10 +460,9 @@ def aggregate_case(case: dict[str, Any], family: str) -> dict[str, Any]:
         "measured",
         "worst_case",
         "unavailable",
+        "register_price",
     )
-    selected_cost = {
-        field: sum(record[field] for record in selected) for field in numeric_fields
-    }
+    selected_cost = {field: sum(record[field] for record in selected) for field in numeric_fields}
     case.update(
         {
             "family": family,
@@ -523,7 +528,7 @@ def parent_main() -> int:
     cases = build_cases()
     case_families = {case.name: case.family for case in cases}
     payload: dict[str, Any] = {
-        "schema": "tilelang-layout-cost-feature-trace-v1",
+        "schema": "tilelang-layout-cost-feature-trace-v2",
         "repository": "nya-a-cat/tilelang",
         "source_sha": SOURCE_SHA,
         "script_sha256": sha256_file(Path(__file__).resolve()),
@@ -542,8 +547,9 @@ def parent_main() -> int:
         },
         "evidence_boundary": (
             "CPU-only LayoutInference trace over the same 18 unchanged PrimFuncs used by the T4 and consumer "
-            "Blackwell runtime A/B. It records existing policy features for explicit CUDA targets and performs "
-            "no device compilation, resource measurement, correctness execution, or runtime timing."
+            "Blackwell runtime A/B. It records decomposed rank, IO, register, and spill features for every "
+            "selected policy on explicit CUDA targets and performs no device compilation, resource measurement, "
+            "correctness execution, or runtime timing."
         ),
         "default_off_probe": {},
         "results": [],
@@ -558,9 +564,7 @@ def parent_main() -> int:
         trace_enabled=False,
         case_name=cases[0].name,
     )
-    log_chunks.append(
-        f"===== default-off arch={TARGET_ARCHES[0]} policy={POLICIES[0]} =====\n{probe.stdout}"
-    )
+    log_chunks.append(f"===== default-off arch={TARGET_ARCHES[0]} policy={POLICIES[0]} =====\n{probe.stdout}")
     probe_records = probe.stdout.count(TRACE_MARKER)
     payload["default_off_probe"] = {
         "arch": TARGET_ARCHES[0],
@@ -580,22 +584,15 @@ def parent_main() -> int:
                 policy=policy,
                 trace_enabled=True,
             )
-            log_chunks.append(
-                f"===== traced arch={arch} policy={policy} returncode={completed.returncode} =====\n"
-                f"{completed.stdout}"
-            )
+            log_chunks.append(f"===== traced arch={arch} policy={policy} returncode={completed.returncode} =====\n{completed.stdout}")
             parsed, parse_errors = parse_child_output(
                 completed.stdout,
                 arch=arch,
                 policy=policy,
             )
             if completed.returncode != 0:
-                payload["failures"].append(
-                    f"child failed: arch={arch} policy={policy} returncode={completed.returncode}"
-                )
-            payload["failures"].extend(
-                f"arch={arch} policy={policy}: {error}" for error in parse_errors
-            )
+                payload["failures"].append(f"child failed: arch={arch} policy={policy} returncode={completed.returncode}")
+            payload["failures"].extend(f"arch={arch} policy={policy}: {error}" for error in parse_errors)
 
             seen_names: set[str] = set()
             for parsed_case in parsed:
@@ -608,21 +605,15 @@ def parent_main() -> int:
                     family = case_families[name]
                 expected_hash = EXPECTED_PRIMFUNC_SHA256.get(name)
                 if parsed_case["canonical_primfunc_sha256"] != expected_hash:
-                    parsed_case["errors"].append(
-                        "canonical PrimFunc hash differs from the runtime A/B manifest"
-                    )
+                    parsed_case["errors"].append("canonical PrimFunc hash differs from the runtime A/B manifest")
                 result = aggregate_case(parsed_case, family)
                 payload["results"].append(result)
                 if result["status"] != "complete":
-                    payload["failures"].append(
-                        f"incomplete trace: arch={arch} policy={policy} case={name}"
-                    )
+                    payload["failures"].append(f"incomplete trace: arch={arch} policy={policy} case={name}")
 
             missing_names = set(case_families) - seen_names
             if missing_names:
-                payload["failures"].append(
-                    f"missing cases: arch={arch} policy={policy} names={sorted(missing_names)}"
-                )
+                payload["failures"].append(f"missing cases: arch={arch} policy={policy} names={sorted(missing_names)}")
             payload["completed_entry_count"] = len(payload["results"])
             payload["duration_seconds"] = time.time() - started
             write_json(payload)
@@ -638,9 +629,7 @@ def parent_main() -> int:
     payload["duration_seconds"] = payload["finished_unix"] - started
     payload["completed_entry_count"] = len(payload["results"])
     if payload["completed_entry_count"] != payload["expected_entry_count"]:
-        payload["failures"].append(
-            f"entry count {payload['completed_entry_count']} != {payload['expected_entry_count']}"
-        )
+        payload["failures"].append(f"entry count {payload['completed_entry_count']} != {payload['expected_entry_count']}")
     payload["status"] = "failed" if payload["failures"] else "complete"
     write_json(payload)
     print(

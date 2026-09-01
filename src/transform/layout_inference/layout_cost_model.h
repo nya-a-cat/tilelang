@@ -15,6 +15,10 @@
  *    tentative layouts; registers remain the lexicographic tiebreak.
  *    Available through `tl.layout_cost_model="io-aware"` for opt-in use
  *    and A/B comparisons.
+ *  - IOAwareRegularizedCostModel: uses the same statement traffic model and
+ *    adds a provisional byte-equivalent price for each fragment register
+ *    slot. This is an opt-in, single-lowering Pareto scalarization available
+ *    as `tl.layout_cost_model="io-aware-regularized"`.
  *
  * Concrete models live in the .cc; callers go through Create().
  */
@@ -35,8 +39,10 @@ namespace tvm {
 namespace tl {
 
 /*! \brief Score of one complete free-mode layout assignment. Compared
- *  lexicographically: estimated memory cost first, total register count as
- *  the tiebreak. `mem` includes the estimated local-memory traffic of
+ *  lexicographically: `rank` first, total register count as the tiebreak.
+ *  Existing policies set `rank == mem`; a regularized policy may add a
+ *  byte-equivalent register charge while leaving `mem` decomposable.
+ *  `mem` includes the estimated local-memory traffic of
  *  register-array spills (a thread-dependent register-array index demotes
  *  the whole array to local memory), priced in bytes so it competes
  *  honestly with the io-aware model's global traffic instead of vetoing
@@ -44,6 +50,7 @@ namespace tl {
  *  0, so their ordering is spill bytes, then register count — attempts
  *  without spills keep the historical register-count ordering untouched. */
 struct AttemptCost {
+  int64_t rank{0};
   int64_t mem{0};
   int64_t regs{0};
   // Diagnostic decomposition of `mem`.  These fields do not participate in
@@ -56,9 +63,10 @@ struct AttemptCost {
   int64_t measured_statements{0};
   int64_t worst_case_statements{0};
   int64_t unavailable_statements{0};
+  int64_t register_price{0};
   bool BetterThan(const AttemptCost &other) const {
-    if (mem != other.mem) {
-      return mem < other.mem;
+    if (rank != other.rank) {
+      return rank < other.rank;
     }
     return regs < other.regs;
   }
@@ -81,7 +89,8 @@ public:
   virtual const char *Name() const = 0;
 
   /*! \brief Instantiate the model selected by `tl.layout_cost_model`
-   *  by name ("io-aware" or "register-count" — each model's Name());
+   *  by name ("io-aware", "io-aware-regularized", or "register-count" —
+   *  each model's Name());
    *  unknown names are a hard error listing the valid values. `target`
    *  feeds the vectorizer's shared width-cap policy (MaxVectorLoadBits);
    *  the legacy model ignores it. */
