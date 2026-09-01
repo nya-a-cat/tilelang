@@ -332,7 +332,8 @@ class KernelCache:
             Set to "1", "true", "yes", or "on" to enable verbose compilation by default.
         TILELANG_LAYOUT_COST_MODEL : str
             Default value for the `tl.layout_cost_model` pass config when it is
-            not set explicitly in `pass_configs`. Unset keeps the built-in default.
+            not set explicitly in `pass_configs`. Unset keeps the built-in
+            target-aware default.
         """
 
         # Resolve env-var-derived pass-config defaults up front so they are

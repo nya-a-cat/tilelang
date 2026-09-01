@@ -23,7 +23,8 @@ from tilelang.backend.target import determine_target
 from tilelang.layout import Fragment
 from tvm.tirx.stmt_functor import post_order_visit
 
-# The two selection policies behind `tl.layout_cost_model`, by name.
+# The two endpoint policies recorded as goldens. The regularized model chooses
+# among the same attempts with a combined score and is tested separately.
 COST_MODELS = ("register-count", "io-aware")
 
 

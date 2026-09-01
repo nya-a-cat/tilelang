@@ -117,12 +117,16 @@ class PassConfigKey(str, Enum):
     "auto" makes the Python JIT compile the two concrete policies and select
     one using compiler-reported spills and an occupancy guard for the current
     CUDA device; it adds first-compilation work and no runtime dispatch;
+    "target-default" uses the single-lowering io-aware-regularized model on
+    CUDA and preserves register-count on other targets;
+    "io-aware-regularized" adds a byte-equivalent fragment-register price to
+    the IO score so small or register-heavy kernels retain compact layouts;
     "io-aware" scores estimated global-memory access cost (vector width /
     warp coalescing of every fragment<->global copy, weighted by bytes
     moved) with register count as the tiebreak; "register-count" is the
     total-register-slots-only ordering. When unset, the
     ``TILELANG_LAYOUT_COST_MODEL`` environment variable supplies the
-    default. Default: 'register-count'"""
+    default. Built-in default: 'target-default'."""
 
     TL_ENABLE_LAYOUT_COST_TRACE = "tl.enable_layout_cost_trace"
     """Emit machine-readable INFO records for free-mode layout attempts and

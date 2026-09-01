@@ -6,8 +6,7 @@
  * connected component and keeps the cheapest complete layout assignment.
  * What "cheapest" means is a pluggable policy behind LayoutCostModel:
  *
- *  - RegisterCountCostModel (default): total fragment register slots,
- *    nothing else.
+ *  - RegisterCountCostModel: total fragment register slots, nothing else.
  *  - IOAwareCostModel (layout RFC, design B2): walks the component's
  *    global-memory-touching statements (fragment<->global copies and
  *    parallel loops with direct global accesses) and charges each one
@@ -16,9 +15,10 @@
  *    Available through `tl.layout_cost_model="io-aware"` for opt-in use
  *    and A/B comparisons.
  *  - IOAwareRegularizedCostModel: uses the same statement traffic model and
- *    adds a provisional byte-equivalent price for each fragment register
- *    slot. This is an opt-in, single-lowering Pareto scalarization available
- *    as `tl.layout_cost_model="io-aware-regularized"`.
+ *    adds a byte-equivalent price for each fragment register slot. This
+ *    single-lowering scalarization is available as
+ *    `tl.layout_cost_model="io-aware-regularized"` and is selected by the
+ *    target-aware default on CUDA. Other targets keep RegisterCountCostModel.
  *
  * Concrete models live in the .cc; callers go through Create().
  */
@@ -89,8 +89,9 @@ public:
   virtual const char *Name() const = 0;
 
   /*! \brief Instantiate the model selected by `tl.layout_cost_model`
-   *  by name ("io-aware", "io-aware-regularized", or "register-count" —
-   *  each model's Name());
+   *  by name ("target-default", "io-aware", "io-aware-regularized", or
+   *  "register-count"). "target-default" resolves to io-aware-regularized on
+   *  CUDA and register-count elsewhere.
    *  unknown names are a hard error listing the valid values. `target`
    *  feeds the vectorizer's shared width-cap policy (MaxVectorLoadBits);
    *  the legacy model ignores it. */

@@ -28,15 +28,15 @@ inline bool ReducerPlanVerboseEnabled() {
 }
 
 /*!
- * \brief The cost model that ranks free-mode layout attempts. Valid
- *  values: "register-count" (default — total fragment register slots) and
- *  "io-aware" (bytes x vector-width/coalescing over fragment<->global
- *  traffic, registers as tiebreak).
+ * \brief The cost model that ranks free-mode layout attempts. Valid values:
+ *  "target-default" (CUDA uses register-regularized IO-aware scoring; other
+ *  targets retain register-count), "register-count", "io-aware", and
+ *  "io-aware-regularized".
  */
 inline std::string LayoutCostModelName() {
   auto ctxt = tvm::transform::PassContext::Current();
   return ctxt->GetConfig("tl.layout_cost_model", ffi::Optional<ffi::String>())
-      .value_or(ffi::String("register-count"));
+      .value_or(ffi::String("target-default"));
 }
 
 /*!

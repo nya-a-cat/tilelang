@@ -400,7 +400,7 @@ class Environment:
     TILELANG_DEFAULT_VERBOSE = EnvVar("TILELANG_VERBOSE", "0")
     TILELANG_LAYOUT_COST_MODEL = EnvVar(
         "TILELANG_LAYOUT_COST_MODEL", None
-    )  # default for the `tl.layout_cost_model` pass config; unset keeps the built-in default
+    )  # default for `tl.layout_cost_model`; unset keeps the target-aware built-in default
 
     # TVM integration
     SKIP_LOADING_TILELANG_SO = EnvVar("SKIP_LOADING_TILELANG_SO", "0")
@@ -519,7 +519,7 @@ class Environment:
 
     def get_default_layout_cost_model(self) -> str | None:
         """Default for the `tl.layout_cost_model` pass config, or None when
-        unset (the compiler then falls back to its built-in default). An
+        unset (the compiler then uses its target-aware built-in default). An
         explicit `pass_configs` entry always takes precedence over this."""
         value = self.TILELANG_LAYOUT_COST_MODEL
         if value is None:

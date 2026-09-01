@@ -6,6 +6,8 @@
 
 #include "layout_cost_model.h"
 
+#include "backend/common/target_utils.h"
+
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/op.h>
@@ -203,9 +205,11 @@ bool TryMultiplyPositive(int64_t lhs, int64_t rhs, int64_t *product) {
   return true;
 }
 
-// Provisional 256 KiB price calibrated on the existing 18-case T4/consumer-
-// Blackwell layout-divergence set. It remains opt-in until held-out operators
-// and the frozen multi-architecture matrix establish generalization.
+// A 256 KiB byte-equivalent regularization price per fragment slot, calibrated
+// on the existing 18-case T4/consumer-Blackwell layout-divergence set. The
+// target-aware default applies it on CUDA; explicit register-count remains the
+// compatibility escape hatch, and non-CUDA targets retain register-count until
+// separately calibrated.
 constexpr int64_t kRegularizedRegisterSlotPriceBytes = int64_t{1} << 18;
 
 /*! \brief Saturating non-negative `memory + price * registers` scalarization.
@@ -1250,6 +1254,14 @@ private:
 
 std::unique_ptr<LayoutCostModel>
 LayoutCostModel::Create(const std::string &name, Target target) {
+  if (name == "target-default") {
+    if (TargetIsCuda(target)) {
+      return std::make_unique<IOAwareCostModel>(
+          std::move(target), "io-aware-regularized",
+          kRegularizedRegisterSlotPriceBytes);
+    }
+    return std::make_unique<RegisterCountCostModel>();
+  }
   if (name == "io-aware") {
     return std::make_unique<IOAwareCostModel>(std::move(target), name, 0);
   }
@@ -1262,8 +1274,8 @@ LayoutCostModel::Create(const std::string &name, Target target) {
   }
   LOG(FATAL) << "Unknown layout cost model \"" << name
              << "\" for pass config `tl.layout_cost_model`; valid values "
-                "are \"register-count\" (default), \"io-aware\", and "
-                "\"io-aware-regularized\".";
+                "are \"target-default\" (default), \"register-count\", "
+                "\"io-aware\", and \"io-aware-regularized\".";
   return nullptr; // unreachable
 }
 
