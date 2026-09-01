@@ -53,6 +53,7 @@ WORKER_NAME = "benchmark_commit_ab_t4.py"
 WORKER_SHA256 = "4ab35bcf32c15e3be4552e6a128d9fc69d30d3dc53110b0e14fae05bcd572b56"
 RPC_PREFIX = "TILELANG_COMMIT_AB_RPC="
 WORK_DIR = Path("/tmp/tilelang-fixed-commit-ab")
+WORKER_UPLOAD_PATH = Path(os.environ.get("TILELANG_WORKER_UPLOAD_PATH", f"/tmp/{WORKER_NAME}"))
 OUTPUT_DIR = Path("/tmp/tilelang-fixed-commit-ab-evidence")
 RESULT_PATH = OUTPUT_DIR / "tilelang-fixed-commit-ab-t4.json"
 GZIP_PATH = OUTPUT_DIR / "tilelang-fixed-commit-ab-t4.json.gz"
@@ -292,8 +293,15 @@ def release_url(tag: str, name: str) -> str:
 
 def verify_worker() -> Path:
     worker = WORK_DIR / WORKER_NAME
-    if not worker.is_file():
-        raise RuntimeError(f"missing uploaded worker: {worker}")
+    source = worker if worker.is_file() else WORKER_UPLOAD_PATH
+    if not source.is_file():
+        raise RuntimeError(f"missing uploaded worker: checked {worker} and {WORKER_UPLOAD_PATH}")
+    actual_sha256 = sha256_file(source)
+    if actual_sha256 != WORKER_SHA256:
+        raise RuntimeError(f"worker hash mismatch: expected {WORKER_SHA256}, got {actual_sha256}")
+    if source != worker:
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, worker)
     actual_sha256 = sha256_file(worker)
     if actual_sha256 != WORKER_SHA256:
         raise RuntimeError(f"worker hash mismatch: expected {WORKER_SHA256}, got {actual_sha256}")
