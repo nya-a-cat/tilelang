@@ -31,6 +31,9 @@ jobs:
       CMAKE_WHEEL_VERSION: "4.4.2"
       CMAKE_WHEEL_SHA256: 27b024e903ef985b37183d754a5c61230b56b41fe0971cd44b71b80c787ec594
       CMAKE_WHEEL_URL: https://files.pythonhosted.org/packages/5d/b7/b8d0b15f57b37ac5b9e374169471f045da3a715b7f0f3af681011415d972/cmake-4.4.2-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      TORCH_CPU_WHEEL_NAME: torch-2.11.0+cpu-cp310-cp310-manylinux_2_28_x86_64.whl
+      TORCH_CPU_WHEEL_SHA256: f378df648bf7fb94bbc820dfec37d3d346bd1703c692a2215edebf6edcef8b75
+      TORCH_CPU_WHEEL_URL: https://download-r2.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp310-cp310-manylinux_2_28_x86_64.whl
     steps:
       - name: Start pinned manylinux image pull
         shell: bash
@@ -51,6 +54,50 @@ jobs:
           fetch-depth: 1
           submodules: false
           persist-credentials: false
+
+      - name: Restore pinned CPU PyTorch wheel
+        id: torch-cpu-wheel-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/torch-cpu-wheel
+          key: tilelang-trace-torch-cpu-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.TORCH_CPU_WHEEL_SHA256 }}
+
+      - name: Start pinned CPU PyTorch wheel download
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_root="${GITHUB_WORKSPACE}/.cache/torch-cpu-wheel"
+          wheel="${cache_root}/${TORCH_CPU_WHEEL_NAME}"
+          ready="${cache_root}/READY"
+          log="${RUNNER_TEMP}/tilelang-torch-cpu-wheel-download.log"
+          pid_file="${RUNNER_TEMP}/tilelang-torch-cpu-wheel-download.pid"
+          mkdir -p "${cache_root}"
+          rm -f -- "${ready}" "${pid_file}"
+
+          if [[ "${{ steps.torch-cpu-wheel-cache.outputs.cache-hit }}" == "true" ]]; then
+            echo "${TORCH_CPU_WHEEL_SHA256}  ${wheel}" | sha256sum --check --status
+            touch "${ready}"
+            echo "Verified cached ${TORCH_CPU_WHEEL_NAME}."
+            exit 0
+          fi
+
+          rm -f -- "${wheel}" "${wheel}.part"
+          : > "${log}"
+          export wheel ready
+          nohup bash --noprofile --norc -c '
+            set -euo pipefail
+            curl \
+              --fail \
+              --location \
+              --retry 5 \
+              --output "${wheel}.part" \
+              "${TORCH_CPU_WHEEL_URL}"
+            echo "${TORCH_CPU_WHEEL_SHA256}  ${wheel}.part" | sha256sum --check --status
+            mv -- "${wheel}.part" "${wheel}"
+            touch "${ready}"
+          ' > "${log}" 2>&1 &
+          echo "$!" > "${pid_file}"
+          echo "Started pinned CPU PyTorch wheel download in process $(cat "${pid_file}")."
 
       - name: Resolve exact source and base wheel
         id: refs
@@ -982,6 +1029,47 @@ jobs:
           )
           ls -lh native-overlay-evidence
 
+      - name: Confirm pinned CPU PyTorch wheel is ready
+        id: torch-cpu-wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_root="${GITHUB_WORKSPACE}/.cache/torch-cpu-wheel"
+          wheel="${cache_root}/${TORCH_CPU_WHEEL_NAME}"
+          ready="${cache_root}/READY"
+          log="${RUNNER_TEMP}/tilelang-torch-cpu-wheel-download.log"
+          pid_file="${RUNNER_TEMP}/tilelang-torch-cpu-wheel-download.pid"
+          deadline=$((SECONDS + 300))
+
+          while [[ ! -f "${ready}" ]]; do
+            if [[ ! -f "${pid_file}" ]] || ! kill -0 "$(cat "${pid_file}")" 2>/dev/null; then
+              [[ -f "${log}" ]] && cat "${log}" >&2
+              echo "Pinned CPU PyTorch wheel download stopped before verification." >&2
+              exit 2
+            fi
+            if (( SECONDS >= deadline )); then
+              kill "$(cat "${pid_file}")" 2>/dev/null || true
+              [[ -f "${log}" ]] && cat "${log}" >&2
+              echo "Timed out while downloading pinned CPU PyTorch wheel." >&2
+              exit 2
+            fi
+            sleep 0.2
+          done
+
+          [[ -f "${log}" ]] && cat "${log}"
+          echo "${TORCH_CPU_WHEEL_SHA256}  ${wheel}" | sha256sum --check
+          printf 'wheel=%s\nsha256=%s\n' \
+            "${TORCH_CPU_WHEEL_NAME}" \
+            "${TORCH_CPU_WHEEL_SHA256}" \
+            | tee native-overlay-evidence/trace-torch-wheel.txt
+
+      - name: Save pinned CPU PyTorch wheel
+        if: steps.torch-cpu-wheel-cache.outputs.cache-hit != 'true' && steps.torch-cpu-wheel.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/torch-cpu-wheel
+          key: tilelang-trace-torch-cpu-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.TORCH_CPU_WHEEL_SHA256 }}
+
       - name: Self-test native overlay installation
         id: overlay-selftest
         shell: bash
@@ -994,8 +1082,25 @@ jobs:
           native-overlay-selftest/bin/python -m pip \
             --disable-pip-version-check \
             install \
-            --no-deps \
+            ".cache/torch-cpu-wheel/${TORCH_CPU_WHEEL_NAME}"
+          native-overlay-selftest/bin/python -m pip \
+            --disable-pip-version-check \
+            install \
             "base-wheel/${BASE_WHEEL_NAME}"
+          native-overlay-selftest/bin/python -m pip check
+          native-overlay-selftest/bin/python - <<'PY' | tee native-overlay-evidence/trace-python-runtime.txt
+          import platform
+          import torch
+
+          if torch.__version__ != "2.11.0+cpu" or torch.cuda.is_available():
+              raise SystemExit(f"Expected CPU-only torch 2.11.0, got {torch.__version__}, CUDA={torch.cuda.is_available()}")
+          print(f"python={platform.python_version()}")
+          print(f"torch={torch.__version__}")
+          print(f"torch_cuda_available={torch.cuda.is_available()}")
+          PY
+          native-overlay-selftest/bin/python -m pip freeze \
+            | LC_ALL=C sort \
+            > native-overlay-evidence/trace-python-environment.txt
           PYTHON="${GITHUB_WORKSPACE}/native-overlay-selftest/bin/python" \
             native-overlay-evidence/apply_colab_native_overlay.sh \
               native-overlay-evidence/tilelang-native-overlay.tar.gz \
