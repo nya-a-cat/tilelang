@@ -131,6 +131,9 @@ CYCLES = 30
 WARM_SECONDS = 1.0
 MIN_BATCH_MS = 100.0
 MAX_BATCH_ITERS = 65536
+EVIDENCE_HOLD_SECONDS = int(os.environ.get("TILELANG_EVIDENCE_HOLD_SECONDS", "0"))
+if not 0 <= EVIDENCE_HOLD_SECONDS <= 300:
+    raise ValueError("TILELANG_EVIDENCE_HOLD_SECONDS must be between 0 and 300")
 HEX_40 = re.compile(r"[0-9a-f]{40}")
 HEX_64 = re.compile(r"[0-9a-f]{64}")
 
@@ -945,6 +948,7 @@ def main() -> int:
         "candidate_commit": CANDIDATE_COMMIT,
         "candidate_overlay_tag": CANDIDATE_OVERLAY_TAG,
         "candidate_overlay_asset_sha256": CANDIDATE_OVERLAY_ASSETS,
+        "evidence_hold_seconds": EVIDENCE_HOLD_SECONDS,
         "started_unix": started,
         "controller_system": {
             "platform": platform.platform(),
@@ -1087,6 +1091,22 @@ def main() -> int:
         ),
         flush=True,
     )
+    if EVIDENCE_HOLD_SECONDS:
+        print(
+            "TILELANG_FIXED_COMMIT_EVIDENCE_READY="
+            + json.dumps(
+                {
+                    "hold_seconds": EVIDENCE_HOLD_SECONDS,
+                    "result": str(RESULT_PATH),
+                    "gzip": str(GZIP_PATH),
+                    "report": str(REPORT_PATH),
+                    "checksums": str(CHECKSUM_PATH),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        time.sleep(EVIDENCE_HOLD_SECONDS)
     return exit_code
 
 
