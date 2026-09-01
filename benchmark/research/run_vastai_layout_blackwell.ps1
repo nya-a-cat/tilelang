@@ -25,7 +25,7 @@ $WorkspaceRoot = Split-Path -Parent $RepositoryRoot
 $OnstartPath = Join-Path $ScriptDirectory "vastai_layout_blackwell_onstart.sh"
 $RunStamp = [DateTimeOffset]::UtcNow.ToString("yyyyMMddTHHmmssZ")
 $Label = "tilelang-layout-blackwell-$RunStamp"
-$OfferQuery = "gpu_name=RTX_5060_Ti num_gpus=1 compute_cap=1200 reliability>=0.995 gpu_ram>=15000 cuda_vers>=12.8 driver_version>=580.00.00 disk_space>=30 disk_bw>=1000 inet_down>=250 inet_up>=100 inet_down_cost<=0.002 inet_up_cost<=0.002 direct_port_count>=2 cpu_arch=amd64"
+$OfferQuery = "gpu_name=RTX_5060_Ti num_gpus=1 compute_cap=1200 reliability>=0.995 gpu_ram>=15 cuda_vers>=12.8 driver_version>=580.00.00 disk_space>=30 disk_bw>=1000 inet_down>=250 inet_up>=100 inet_down_cost<=0.002 inet_up_cost<=0.002 direct_port_count>=2 cpu_arch=amd64"
 
 if (-not (Test-Path -LiteralPath $VastCli -PathType Leaf)) {
     throw "Vast CLI is missing at $VastCli"
