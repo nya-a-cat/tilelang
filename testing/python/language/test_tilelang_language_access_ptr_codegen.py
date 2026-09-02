@@ -187,7 +187,9 @@ def test_predicated_parallel_stage_auto_lowers_to_cp_async_without_gpu():
         ).kernel_source
     with tvm.transform.PassContext(
         opt_level=3,
-        config={tilelang.PassConfigKey.TL_ENABLE_ASYNC_COPY: False},
+        config={
+            tilelang.PassConfigKey.TL_DISABLE_PREDICATED_ASYNC_COPY: True,
+        },
     ):
         sync_source = tilelang.lower(
             main, target=target, enable_device_compile=False

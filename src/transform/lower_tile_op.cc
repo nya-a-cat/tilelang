@@ -1454,6 +1454,9 @@ private:
     if (TargetCudaHasAsyncCopy(target_)) {
       bool auto_async_copy_enabled =
           pass_ctx->GetConfig<Bool>(kEnableAsyncCopy, Bool(true)).value();
+      bool predicated_async_copy_enabled =
+          !pass_ctx->GetConfig<Bool>(kDisablePredicatedAsyncCopy, Bool(false))
+               .value();
       bool should_try_async_copy =
           parallel_prefer_async || auto_async_copy_enabled;
       if (should_try_async_copy) {
@@ -1463,7 +1466,8 @@ private:
             parallel_prefer_async ||
             (auto_async_copy_enabled &&
              (parallel_async_without_async_commit_wait ||
-              inject_result.injected_predicated_ptx_async_copy));
+              (predicated_async_copy_enabled &&
+               inject_result.injected_predicated_ptx_async_copy)));
         if (should_accept_async_copy) {
           lowered = inject_result.stmt;
         }

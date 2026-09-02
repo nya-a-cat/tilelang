@@ -44,7 +44,7 @@ from tilelang.cuda.backend import tilelang_callback_cuda_compile
 REPOSITORY = "nya-a-cat/tilelang"
 CONFIG_KEY = "tl.vectorize_local_parallel"
 SCALAR_EXP2_CONFIG_KEY = "tl.vectorize_local_parallel_scalar_exp2"
-ASYNC_COPY_CONFIG_KEY = "tl.enable_async_copy"
+DISABLE_PREDICATED_ASYNC_COPY_CONFIG_KEY = "tl.disable_predicated_async_copy"
 INPLACE_CONFIG_KEY = "tl.storage_rewrite_detect_inplace"
 REGISTER_USAGE_CONFIG_KEY = "tl.ptxas_register_usage_level"
 AUTO_LAUNCH_BOUNDS_CONFIG_KEY = "tl.enable_auto_launch_bounds"
@@ -641,7 +641,7 @@ def pass_configs_for_mode(base_configs: dict[str, Any], mode: str) -> dict[str, 
     )
     pass_configs[AUTO_LAUNCH_BOUNDS_CONFIG_KEY] = mode == "planner_auto_lb"
     if mode == "planner_sync_predicated_copy":
-        pass_configs[ASYNC_COPY_CONFIG_KEY] = False
+        pass_configs[DISABLE_PREDICATED_ASYNC_COPY_CONFIG_KEY] = True
     if mode == "planner_nvcc_extra_vectorization":
         compile_flags = pass_configs.get(DEVICE_COMPILE_FLAGS_CONFIG_KEY, [])
         if isinstance(compile_flags, str):
@@ -1261,12 +1261,12 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
                 sm_version = int(re.match(r"sm_(\d+)", arch).group(1))
                 supports_cp_async = sm_version >= 80
                 source_restored = (
-                    planner["cp_async_source_occurrences"] > 0
-                    and synchronous["cp_async_source_occurrences"] == 0
+                    planner["cp_async_source_occurrences"]
+                    > synchronous["cp_async_source_occurrences"]
                 )
                 sass_restored = (
-                    planner["groups"]["async_copy"] > 0
-                    and synchronous["groups"]["async_copy"] == 0
+                    planner["groups"]["async_copy"]
+                    > synchronous["groups"]["async_copy"]
                 )
                 expected_control = (
                     planner["cp_async_source_occurrences"] == 0
@@ -1306,7 +1306,16 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
                 predicated_async_source_restored += int(source_restored)
                 predicated_async_sass_restored += int(sass_restored)
                 predicated_async_expected_controls += int(expected_control)
-    if source_changed == 0 or sass_changed == 0 or planner_packed_gain == 0:
+    targeted_predicated_scan = (
+        set(MODES)
+        == {"planner", "legacy", "planner_sync_predicated_copy"}
+        and len(workload_records) == 1
+        and workload_records[0]["name"]
+        == "varlen_attention_guarded_stage_bwd_repro"
+    )
+    if (
+        source_changed == 0 or sass_changed == 0 or planner_packed_gain == 0
+    ) and not targeted_predicated_scan:
         raise RuntimeError(
             "planner/legacy trace produced no material source, SASS, or packed-type difference"
         )

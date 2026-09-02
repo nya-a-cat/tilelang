@@ -215,6 +215,13 @@ class PassConfigKey(str, Enum):
     Default: True
     """
 
+    TL_DISABLE_PREDICATED_ASYNC_COPY = "tl.disable_predicated_async_copy"
+    """Keep automatically detected predicated CUDA global-to-shared boundary
+    staging on synchronous loads and stores. Software-pipeline-managed copies
+    and explicit ``prefer_async=True`` loops retain their established async
+    behavior. This is a same-build differential-testing escape hatch.
+    Default: False"""
+
     TL_ENABLE_LOWER_LDGSTG = "tl.enable_lower_ldgstg"
     """Enable non-predicated LDG/STG lowering for global memory access.
     When enabled, converts Ramp-based global buffer load/store to ldg/stg intrinsics.
