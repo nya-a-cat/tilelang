@@ -42,6 +42,7 @@ from tilelang.cuda.backend import tilelang_callback_cuda_compile
 
 REPOSITORY = "nya-a-cat/tilelang"
 CONFIG_KEY = "tl.vectorize_local_parallel"
+SCALAR_EXP2_CONFIG_KEY = "tl.vectorize_local_parallel_scalar_exp2"
 INPLACE_CONFIG_KEY = "tl.storage_rewrite_detect_inplace"
 REGISTER_USAGE_CONFIG_KEY = "tl.ptxas_register_usage_level"
 AUTO_LAUNCH_BOUNDS_CONFIG_KEY = "tl.enable_auto_launch_bounds"
@@ -67,6 +68,7 @@ BASE_MODES = {
     "planner_reinterpret_legacy",
     "planner_int4x2_unpack_legacy",
     "planner_auto_lb",
+    "planner_scalar_exp2_vectorized",
 }
 REGISTER_USAGE_MODE_RE = re.compile(r"planner_ru(?P<level>\d+)$")
 LAUNCH_BOUNDS_MODE_RE = re.compile(r"planner_lb(?P<blocks>\d+)$")
@@ -144,7 +146,8 @@ if (
     raise ValueError(
         "TILELANG_REAL_VECTOR_MODES must contain planner and legacy; optional modes are "
         "planner_inplace, planner_reinterpret_legacy, planner_int4x2_unpack_legacy, "
-        "planner_auto_lb, planner_ru0 through planner_ru10, and planner_lb2 "
+        "planner_auto_lb, planner_scalar_exp2_vectorized, planner_ru0 through "
+        "planner_ru10, and planner_lb2 "
         "through planner_lb8"
     )
 if MAX_WORKERS < 1:
@@ -534,6 +537,7 @@ def lowering_source_mode(mode: str) -> str:
 def pass_configs_for_mode(base_configs: dict[str, Any], mode: str) -> dict[str, Any]:
     pass_configs = dict(base_configs)
     pass_configs[CONFIG_KEY] = mode != "legacy"
+    pass_configs[SCALAR_EXP2_CONFIG_KEY] = mode == "planner_scalar_exp2_vectorized"
     pass_configs[INPLACE_CONFIG_KEY] = mode == "planner_inplace"
     pass_configs[DISABLE_REINTERPRET_CONFIG_KEY] = mode == "planner_reinterpret_legacy"
     pass_configs[DISABLE_INT4X2_UNPACK_CONFIG_KEY] = (
@@ -839,6 +843,11 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
     int4x2_sass_changed = 0
     int4x2_instruction_reduced = 0
     int4x2_register_reduced = 0
+    scalar_exp2_source_changed = 0
+    scalar_exp2_instruction_nonregressed = 0
+    scalar_exp2_cubin_nonregressed = 0
+    scalar_exp2_spill_nonregressed = 0
+    scalar_exp2_strict_improvements = 0
     for workload in workload_records:
         by_key = {(case["arch"], case["mode"]): case for case in workload["cases"]}
         workload["comparisons"] = []
@@ -1019,6 +1028,56 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
                     planner["instruction_count"] < legacy_unpack["instruction_count"]
                 )
                 int4x2_register_reduced += int(planner_regs < legacy_regs)
+        if "planner_scalar_exp2_vectorized" in MODES:
+            workload["scalar_exp2_comparisons"] = []
+            for arch in ARCHES:
+                planner = by_key[(arch, "planner")]
+                vectorized = by_key[(arch, "planner_scalar_exp2_vectorized")]
+                planner_resources = list(planner["resources"].values())
+                vectorized_resources = list(vectorized["resources"].values())
+                planner_spills = sum(
+                    int(item["spill_store_bytes"]) + int(item["spill_load_bytes"])
+                    for item in planner_resources
+                )
+                vectorized_spills = sum(
+                    int(item["spill_store_bytes"]) + int(item["spill_load_bytes"])
+                    for item in vectorized_resources
+                )
+                source_delta = planner["source_sha256"] != vectorized["source_sha256"]
+                instruction_safe = (
+                    planner["instruction_count"] <= vectorized["instruction_count"]
+                )
+                cubin_safe = planner["cubin_bytes"] <= vectorized["cubin_bytes"]
+                spill_safe = planner_spills <= vectorized_spills
+                strict = (
+                    planner["instruction_count"] < vectorized["instruction_count"]
+                    or planner["cubin_bytes"] < vectorized["cubin_bytes"]
+                    or planner_spills < vectorized_spills
+                )
+                workload["scalar_exp2_comparisons"].append(
+                    {
+                        "arch": arch,
+                        "source_changed": source_delta,
+                        "planner_minus_vectorized": {
+                            "source_bytes": planner["source_bytes"]
+                            - vectorized["source_bytes"],
+                            "cubin_bytes": planner["cubin_bytes"]
+                            - vectorized["cubin_bytes"],
+                            "instruction_count": planner["instruction_count"]
+                            - vectorized["instruction_count"],
+                            "spill_bytes": planner_spills - vectorized_spills,
+                        },
+                        "instruction_nonregressed": instruction_safe,
+                        "cubin_nonregressed": cubin_safe,
+                        "spill_nonregressed": spill_safe,
+                        "strict_improvement": strict,
+                    }
+                )
+                scalar_exp2_source_changed += int(source_delta)
+                scalar_exp2_instruction_nonregressed += int(instruction_safe)
+                scalar_exp2_cubin_nonregressed += int(cubin_safe)
+                scalar_exp2_spill_nonregressed += int(spill_safe)
+                scalar_exp2_strict_improvements += int(strict)
     if source_changed == 0 or sass_changed == 0 or planner_packed_gain == 0:
         raise RuntimeError(
             "planner/legacy trace produced no material source, SASS, or packed-type difference"
@@ -1040,6 +1099,19 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
                 raise RuntimeError(f"int4x2 unpack peephole unexpectedly triggered for {arch}")
             if legacy_unpack["int4x2_unpack_occurrences"] != 0:
                 raise RuntimeError(f"int4x2 unpack rollback still emitted helper for {arch}")
+    if "planner_scalar_exp2_vectorized" in MODES:
+        scalar_exp2_comparisons = len(ARCHES) * len(workload_records)
+        if (
+            scalar_exp2_source_changed == 0
+            or scalar_exp2_instruction_nonregressed != scalar_exp2_comparisons
+            or scalar_exp2_cubin_nonregressed != scalar_exp2_comparisons
+            or scalar_exp2_spill_nonregressed != scalar_exp2_comparisons
+            or scalar_exp2_strict_improvements == 0
+        ):
+            raise RuntimeError(
+                "scalar-exp2 fallback failed source-change, machine-code "
+                "nonregression, or strict-improvement acceptance"
+            )
     return {
         "comparisons": comparisons,
         "source_changed": source_changed,
@@ -1070,6 +1142,14 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
         "int4x2_unpack_sass_changed": int4x2_sass_changed,
         "int4x2_unpack_instruction_reduced": int4x2_instruction_reduced,
         "int4x2_unpack_register_reduced": int4x2_register_reduced,
+        "scalar_exp2_comparisons": len(ARCHES) * len(workload_records)
+        if "planner_scalar_exp2_vectorized" in MODES
+        else 0,
+        "scalar_exp2_source_changed": scalar_exp2_source_changed,
+        "scalar_exp2_instruction_nonregressed": scalar_exp2_instruction_nonregressed,
+        "scalar_exp2_cubin_nonregressed": scalar_exp2_cubin_nonregressed,
+        "scalar_exp2_spill_nonregressed": scalar_exp2_spill_nonregressed,
+        "scalar_exp2_strict_improvements": scalar_exp2_strict_improvements,
     }
 
 
@@ -1573,6 +1653,37 @@ def write_report(payload: dict[str, Any]) -> None:
                     f"{legacy_reinterpret['instruction_count']}→"
                     f"{planner['instruction_count']} | "
                     f"{register_count(legacy_reinterpret)}→{register_count(planner)} |"
+                )
+        lines.append("")
+    if "planner_scalar_exp2_vectorized" in payload["modes"]:
+        lines.extend(
+            [
+                "## Scalar FP32 exp2 local-loop fallback",
+                "",
+                "| Workload | Arch | instructions vectorized→fallback | CUBIN bytes vectorized→fallback | spill bytes vectorized→fallback |",
+                "|---|---:|---:|---:|---:|",
+            ]
+        )
+        for workload in payload["workloads"]:
+            by_key = {
+                (case["arch"], case["mode"]): case for case in workload["cases"]
+            }
+            for arch in payload["architectures"]:
+                planner = by_key[(arch, "planner")]
+                vectorized = by_key[(arch, "planner_scalar_exp2_vectorized")]
+
+                def spill_bytes(case: dict[str, Any]) -> int:
+                    return sum(
+                        int(item["spill_store_bytes"])
+                        + int(item["spill_load_bytes"])
+                        for item in case["resources"].values()
+                    )
+
+                lines.append(
+                    f"| `{workload['name']}` | `{arch}` | "
+                    f"{vectorized['instruction_count']}→{planner['instruction_count']} | "
+                    f"{vectorized['cubin_bytes']}→{planner['cubin_bytes']} | "
+                    f"{spill_bytes(vectorized)}→{spill_bytes(planner)} |"
                 )
         lines.append("")
     if "planner_int4x2_unpack_legacy" in payload["modes"]:

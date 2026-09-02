@@ -93,11 +93,42 @@ def _parallel_vectorize_local_and_var_legacy():
             y[i] = x[i] * z
 
 
+@tilelang.jit
+def _parallel_scalar_exp2_local():
+    with T.Kernel(1) as _:
+        x = T.alloc_fragment([256], T.float32)
+        y = T.alloc_fragment([256], T.float32)
+        z = T.alloc_var(T.float32)
+        for i in T.parallel(256):
+            y[i] = T.exp2(x[i] * z)
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_VECTORIZE_LOCAL_PARALLEL_SCALAR_EXP2: True,
+    }
+)
+def _parallel_scalar_exp2_local_vectorized():
+    with T.Kernel(1) as _:
+        x = T.alloc_fragment([256], T.float32)
+        y = T.alloc_fragment([256], T.float32)
+        z = T.alloc_var(T.float32)
+        for i in T.parallel(256):
+            y[i] = T.exp2(x[i] * z)
+
+
 def test_parallel_vectorize_var():
     planner_source = _parallel_vectorize_local_and_var.get_kernel_source()
     legacy_source = _parallel_vectorize_local_and_var_legacy.get_kernel_source()
     assert "float2" in planner_source
     assert "float2" not in legacy_source
+
+
+def test_parallel_scalar_exp2_avoids_packed_live_ranges():
+    fallback_source = _parallel_scalar_exp2_local.get_kernel_source()
+    vectorized_source = _parallel_scalar_exp2_local_vectorized.get_kernel_source()
+    assert "float2" not in fallback_source
+    assert "float2" in vectorized_source
 
 
 if __name__ == "__main__":

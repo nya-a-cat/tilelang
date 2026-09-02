@@ -240,6 +240,12 @@ class PassConfigKey(str, Enum):
     1 for scalar or hazardous accesses. Set to False to restore the legacy gate
     for same-build differential testing. Default: True."""
 
+    TL_VECTORIZE_LOCAL_PARALLEL_SCALAR_EXP2 = "tl.vectorize_local_parallel_scalar_exp2"
+    """Permit vectorization of local-only ``T.Parallel`` loops containing
+    scalar FP32 ``exp2``. CUDA emits one scalar exponential per lane, so this
+    retains the historical policy only for differential testing. Default:
+    False."""
+
     TL_DISABLE_WGMMA = "tl.disable_wgmma"
     """Disable usage of Hopper WGMMA. Default: False"""
 

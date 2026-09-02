@@ -48,6 +48,33 @@ static constexpr const char *kVectorizeLocalParallel =
     "tl.vectorize_local_parallel";
 TVM_REGISTER_PASS_CONFIG_OPTION(kVectorizeLocalParallel, Bool);
 
+// Permit vectorizing local-only loops that contain scalar FP32 exp2. CUDA
+// emits one exp2f instruction per lane, so packing this operation only widens
+// the live range of its arithmetic inputs and outputs. Keep the historical
+// policy available for same-build differential testing.
+static constexpr const char *kVectorizeLocalParallelScalarExp2 =
+    "tl.vectorize_local_parallel_scalar_exp2";
+TVM_REGISTER_PASS_CONFIG_OPTION(kVectorizeLocalParallelScalarExp2, Bool);
+
+static bool ContainsScalarFP32Exp2(const Stmt &stmt) {
+  bool found = false;
+  PostOrderVisit(stmt, [&](const ObjectRef &obj) {
+    if (found) {
+      return;
+    }
+    const auto *call = obj.as<CallNode>();
+    if (call == nullptr || !call->dtype.is_float() ||
+        call->dtype.bits() != 32 || call->dtype.lanes() != 1) {
+      return;
+    }
+    if (auto op = call->op.as<Op>();
+        op.has_value() && op.value()->name == "tirx.exp2") {
+      found = true;
+    }
+  });
+  return found;
+}
+
 static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout,
                                    Map<Var, Var> &var_remap) {
   const auto *ptr_type =
@@ -1399,13 +1426,23 @@ private:
     auto pass_ctx = tvm::transform::PassContext::Current();
     bool vectorize_local_parallel =
         pass_ctx->GetConfig<Bool>(kVectorizeLocalParallel, Bool(true)).value();
+    bool vectorize_local_parallel_scalar_exp2 =
+        pass_ctx
+            ->GetConfig<Bool>(kVectorizeLocalParallelScalarExp2, Bool(false))
+            .value();
 
-    // Always consult the access-aware planner by default. It selects width 1
-    // for scalar or hazardous access patterns, while register-only elementwise
-    // loops can use packed operations such as fp32x2. False preserves the
-    // historical gate for JIT-time A/B from the same native build.
+    // Scalar FP32 exp2 has no packed CUDA instruction. Vectorizing a local-only
+    // loop around it keeps multiple lanes of surrounding arithmetic live while
+    // codegen still emits one exp2f per lane. Leave memory and cast loops on
+    // their established paths; the extra config restores the historical local
+    // behavior for same-build machine-code comparisons.
+    bool local_scalar_exp2 = TargetIsCuda(target_) && !has_non_local &&
+                             !has_cast_operations &&
+                             ContainsScalarFP32Exp2(for_node->body);
     bool should_vectorize =
-        vectorize_local_parallel || has_non_local || has_cast_operations;
+        has_non_local || has_cast_operations ||
+        (vectorize_local_parallel &&
+         (!local_scalar_exp2 || vectorize_local_parallel_scalar_exp2));
     // Lower the parallel loop using the common function
     Stmt lowered = LowerParallelLoop(
         for_node, loop_layout, CurrentThreadIndex(), analyzer_, layout_map_,
