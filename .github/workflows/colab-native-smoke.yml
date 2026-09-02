@@ -19,6 +19,7 @@ on:
         options:
           - all
           - fp32x2
+          - layout-policy
 
 permissions:
   contents: read
@@ -1234,6 +1235,33 @@ jobs:
           set -euo pipefail
           native-overlay-selftest/bin/python \
             benchmark/research/trace_layout_cost_features.py
+          (
+            cd native-overlay-evidence
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | LC_ALL=C sort -z \
+              | xargs -0 -r sha256sum \
+              > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Compile frozen layout-policy CUBIN matrix without a GPU
+        if: inputs.research_trace == 'layout-policy'
+        id: layout-policy-cubins
+        shell: bash
+        env:
+          TILELANG_SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          TILELANG_LAYOUT_POLICY_CUBIN_ARCHES: sm_75,sm_80,sm_90a,sm_100a,sm_120a
+          TILELANG_LAYOUT_POLICY_CUBIN_POLICIES: target-default,register-count,io-aware
+          TILELANG_LAYOUT_POLICY_CUBIN_WORKERS: "4"
+          TILELANG_LAYOUT_POLICY_CUBIN_RESULT: native-overlay-evidence/layout-policy-cubins.json
+          TILELANG_LAYOUT_POLICY_CUBIN_REPORT: native-overlay-evidence/layout-policy-cubins.md
+          TILELANG_LAYOUT_POLICY_CUBIN_RAW_DIR: native-overlay-evidence/layout-policy-cubins-raw
+          TILELANG_LAYOUT_POLICY_CUBIN_RAW_ARCHIVE: native-overlay-evidence/layout-policy-cubins-raw.zip
+        run: |
+          set -euo pipefail
+          native-overlay-selftest/bin/python \
+            benchmark/research/trace_layout_policy_cubins.py
+          rm -rf -- native-overlay-evidence/layout-policy-cubins-raw
           (
             cd native-overlay-evidence
             find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
