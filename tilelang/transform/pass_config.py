@@ -83,6 +83,12 @@ class PassConfigKey(str, Enum):
     """The PTXAS register usage level in [0, 10], which controls the
     aggressiveness of optimizations that affect register usage. Default: None"""
 
+    TL_ENABLE_AUTO_LAUNCH_BOUNDS = "tl.enable_auto_launch_bounds"
+    """Experimentally compile one additional CUDA launch-bound candidate for
+    single-architecture, high-register kernels. The candidate is selected only
+    when it lowers compiler-reported registers for every entry function without
+    spills, extra local memory, or a larger stack frame. Default: False."""
+
     TL_DEVICE_COMPILE_FLAGS = "tl.device_compile_flags"
     """Additional device compiler flags passed to nvcc/NVRTC.
 

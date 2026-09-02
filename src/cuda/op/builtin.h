@@ -38,6 +38,8 @@ static constexpr const char *kDisableWarpSpecialized =
 static constexpr const char *kDisableTMALower = "tl.disable_tma_lower";
 static constexpr const char *kPtxasRegisterUsageLevel =
     "tl.ptxas_register_usage_level";
+static constexpr const char *kEnableAutoLaunchBounds =
+    "tl.enable_auto_launch_bounds";
 static constexpr const char *kDisableVectorize256 = "tl.disable_vectorize_256";
 static constexpr const char *kEnableFP32x2Reduction =
     "tl.enable_fp32x2_reduction";

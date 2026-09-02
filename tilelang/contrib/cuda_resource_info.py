@@ -14,8 +14,10 @@ diagnostics. Warnings, errors, and unfamiliar ptxas output remain visible.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import re
 import threading
+from typing import Iterator
 
 from .kernel_resource_info import KernelResourceUsage
 
@@ -62,6 +64,33 @@ def record_usage(usage: dict[str, KernelResourceUsage]) -> None:
     items = getattr(_RECORDER, "items", None)
     for name, item in usage.items():
         _record(items, name, item)
+
+
+@contextmanager
+def isolated_recorder() -> Iterator[None]:
+    """Temporarily isolate nested CUDA compiler resource records.
+
+    The enclosing recorder is restored exactly on exit. Callers can use
+    ``pop_recorded`` inside the context to inspect multiple speculative
+    compilations, then merge only the selected result with ``record_usage``.
+    """
+
+    had_items = hasattr(_RECORDER, "items")
+    had_last = hasattr(_RECORDER, "last")
+    previous_items = getattr(_RECORDER, "items", None)
+    previous_last = getattr(_RECORDER, "last", None)
+    reset_recorder()
+    try:
+        yield
+    finally:
+        if had_items:
+            _RECORDER.items = previous_items
+        else:
+            _RECORDER.__dict__.pop("items", None)
+        if had_last:
+            _RECORDER.last = previous_last
+        else:
+            _RECORDER.__dict__.pop("last", None)
 
 
 def _record(items: dict[str, KernelResourceUsage] | None, name: str, usage: KernelResourceUsage) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 
 from tvm import tirx
@@ -8,13 +9,26 @@ from tilelang.backend.device_codegen import DeviceCodegen
 from tilelang.backend.host_codegen import STANDARD_HOST_CODEGENS
 from tilelang.backend.module import BackendModule, register_backend
 from tilelang.contrib import nvcc
-from tilelang.contrib.cuda_resource_info import pop_last_recorded, record_usage
+from tilelang.contrib.cuda_resource_info import (
+    isolated_recorder,
+    pop_last_recorded,
+    pop_recorded,
+    record_usage,
+    reset_recorder,
+)
+from tilelang.contrib.kernel_resource_info import KernelResourceUsage
 from tilelang.env import CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH, env
 from tilelang.transform import PassConfigKey
 
 from . import codegen, execution_backend, pipeline
 
 _CUDA_GLOBAL_KERNEL_PATTERN = re.compile(r'(?:extern\s+"C"\s+)?__global__\s+void\s+(?:__launch_bounds__\([^\)]*\)\s+)?(\w+)')
+_CUDA_DEFAULT_LAUNCH_BOUNDS_PATTERN = re.compile(
+    r"(__launch_bounds__\(\s*\d+\s*,\s*)1(\s*\))"
+)
+_AUTO_LAUNCH_BOUNDS_MIN_REGISTERS = 224
+
+logger = logging.getLogger(__name__)
 
 
 def _collect_external_cuda_kernel_names(source: str) -> list[str]:
@@ -57,6 +71,94 @@ def tilelang_callback_cuda_validate(device_mod):
             )
 
 
+def _rewrite_default_launch_bounds(code: str, min_blocks_per_sm: int) -> tuple[str, int]:
+    return _CUDA_DEFAULT_LAUNCH_BOUNDS_PATTERN.subn(
+        rf"\g<1>{min_blocks_per_sm}\g<2>", code
+    )
+
+
+def _auto_launch_bounds_candidate_is_safe(
+    baseline: dict[str, KernelResourceUsage],
+    candidate: dict[str, KernelResourceUsage],
+    baseline_binary: bytes | bytearray,
+    candidate_binary: bytes | bytearray,
+) -> bool:
+    if not baseline or baseline.keys() != candidate.keys():
+        return False
+    if max(item.n_regs for item in baseline.values()) < _AUTO_LAUNCH_BOUNDS_MIN_REGISTERS:
+        return False
+    if len(candidate_binary) > len(baseline_binary):
+        return False
+
+    reduced = False
+    for name, baseline_item in baseline.items():
+        candidate_item = candidate[name]
+        if candidate_item.n_regs > baseline_item.n_regs:
+            return False
+        reduced |= candidate_item.n_regs < baseline_item.n_regs
+        if candidate_item.spill_store_bytes or candidate_item.spill_load_bytes:
+            return False
+        if candidate_item.local_bytes > baseline_item.local_bytes:
+            return False
+        if candidate_item.stack_frame_bytes > baseline_item.stack_frame_bytes:
+            return False
+    return reduced
+
+
+def _compile_with_auto_launch_bounds(code, target, pass_config):
+    base_config = dict(pass_config)
+    base_config.pop(PassConfigKey.TL_ENABLE_AUTO_LAUNCH_BOUNDS, None)
+    selected_binary: bytes | bytearray
+    selected_usage: dict[str, KernelResourceUsage]
+
+    with isolated_recorder():
+        baseline_binary = tilelang_callback_cuda_compile(code, target, base_config)
+        baseline_usage = pop_recorded()
+        selected_binary = baseline_binary
+        selected_usage = baseline_usage
+
+        candidate_code, rewrite_count = _rewrite_default_launch_bounds(code, 2)
+        if (
+            rewrite_count
+            and baseline_usage
+            and max(item.n_regs for item in baseline_usage.values())
+            >= _AUTO_LAUNCH_BOUNDS_MIN_REGISTERS
+        ):
+            reset_recorder()
+            try:
+                candidate_binary = tilelang_callback_cuda_compile(
+                    candidate_code, target, base_config
+                )
+            except RuntimeError as error:
+                diagnostics = [
+                    line.strip()
+                    for line in str(error).splitlines()
+                    if "ptxas fatal" in line.lower()
+                ]
+                logger.info(
+                    "CUDA auto launch-bound candidate rejected: %s",
+                    diagnostics[-1] if diagnostics else type(error).__name__,
+                )
+            else:
+                candidate_usage = pop_recorded()
+                if _auto_launch_bounds_candidate_is_safe(
+                    baseline_usage,
+                    candidate_usage,
+                    baseline_binary,
+                    candidate_binary,
+                ):
+                    selected_binary = candidate_binary
+                    selected_usage = candidate_usage
+                    logger.info(
+                        "CUDA auto launch bounds selected min_blocks_per_sm=2 "
+                        "for %d kernel(s)",
+                        rewrite_count,
+                    )
+
+    record_usage(selected_usage)
+    return selected_binary
+
+
 def tilelang_callback_cuda_compile(code, target, pass_config=None):
     from tilelang.cache.cuda_binary_cache import CUDABinaryCache
 
@@ -70,6 +172,11 @@ def tilelang_callback_cuda_compile(code, target, pass_config=None):
     compile_format = "fatbin" if len(target_code_list) > 1 else "cubin"
 
     cfg = pass_config or {}
+    enable_auto_launch_bounds = bool(
+        cfg.get(PassConfigKey.TL_ENABLE_AUTO_LAUNCH_BOUNDS, False)
+    )
+    if enable_auto_launch_bounds and compile_format == "cubin":
+        return _compile_with_auto_launch_bounds(code, target, cfg)
     enable_fast_math = bool(cfg.get(PassConfigKey.TL_ENABLE_FAST_MATH, False))
     ptxas_usage_level = cfg.get(PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL, None)
     if ptxas_usage_level is not None:

@@ -75,6 +75,107 @@ def test_cuda_binary_cache_hit_skips_nvcc_compile(monkeypatch, tmp_path):
     assert len(cache_files) == 2
 
 
+def _record_fake_cuda_usage(registers: int, spill_bytes: int = 0) -> None:
+    filter_and_record(
+        "ptxas info : Compiling entry function 'kernel' for 'sm_90a'\n"
+        "ptxas info : Function properties for kernel\n"
+        f"0 bytes stack frame, {spill_bytes} bytes spill stores, "
+        f"{spill_bytes} bytes spill loads\n"
+        f"ptxas info : Used {registers} registers, 4096 bytes smem\n"
+    )
+
+
+def test_cuda_auto_launch_bounds_selects_spill_free_register_reduction(
+    monkeypatch, tmp_path
+):
+    _set_cache_dirs(monkeypatch, tmp_path)
+    from tilelang.cuda import backend as cuda_backend
+
+    monkeypatch.setattr(env, "TILELANG_KERNEL_CACHE_USE_LIB_STAMP", "0")
+    compile_sources = []
+
+    def fake_compile_cuda(code, target_format, arch, options=None, verbose=False):
+        compile_sources.append(code)
+        if "__launch_bounds__(128, 2)" in code:
+            _record_fake_cuda_usage(128)
+            return bytearray(b"opt")
+        _record_fake_cuda_usage(240)
+        return bytearray(b"baseline")
+
+    monkeypatch.setattr(cuda_backend.nvcc, "compile_cuda", fake_compile_cuda)
+    target = Target({"kind": "cuda", "arch": "sm_90a"})
+    source = 'extern "C" __global__ void __launch_bounds__(128, 1) kernel() {}'
+
+    reset_recorder()
+    result = cuda_backend.tilelang_callback_cuda_compile(
+        source,
+        target,
+        {tilelang.PassConfigKey.TL_ENABLE_AUTO_LAUNCH_BOUNDS: True},
+    )
+    usage = pop_recorded()
+
+    assert bytes(result) == b"opt"
+    assert len(compile_sources) == 2
+    assert usage["kernel"].n_regs == 128
+    assert usage["kernel"].n_spills == 0
+
+
+def test_cuda_auto_launch_bounds_rejects_spilling_candidate(monkeypatch, tmp_path):
+    _set_cache_dirs(monkeypatch, tmp_path)
+    from tilelang.cuda import backend as cuda_backend
+
+    monkeypatch.setattr(env, "TILELANG_KERNEL_CACHE_USE_LIB_STAMP", "0")
+
+    def fake_compile_cuda(code, target_format, arch, options=None, verbose=False):
+        if "__launch_bounds__(128, 2)" in code:
+            _record_fake_cuda_usage(128, spill_bytes=32)
+            return bytearray(b"opt")
+        _record_fake_cuda_usage(240)
+        return bytearray(b"baseline")
+
+    monkeypatch.setattr(cuda_backend.nvcc, "compile_cuda", fake_compile_cuda)
+    target = Target({"kind": "cuda", "arch": "sm_90a"})
+    source = 'extern "C" __global__ void __launch_bounds__(128, 1) kernel() {}'
+
+    reset_recorder()
+    result = cuda_backend.tilelang_callback_cuda_compile(
+        source,
+        target,
+        {tilelang.PassConfigKey.TL_ENABLE_AUTO_LAUNCH_BOUNDS: True},
+    )
+    usage = pop_recorded()
+
+    assert bytes(result) == b"baseline"
+    assert usage["kernel"].n_regs == 240
+    assert usage["kernel"].n_spills == 0
+
+
+def test_cuda_auto_launch_bounds_skips_low_register_kernel(monkeypatch, tmp_path):
+    _set_cache_dirs(monkeypatch, tmp_path)
+    from tilelang.cuda import backend as cuda_backend
+
+    monkeypatch.setattr(env, "TILELANG_KERNEL_CACHE_USE_LIB_STAMP", "0")
+    compile_sources = []
+
+    def fake_compile_cuda(code, target_format, arch, options=None, verbose=False):
+        compile_sources.append(code)
+        _record_fake_cuda_usage(96)
+        return bytearray(b"baseline")
+
+    monkeypatch.setattr(cuda_backend.nvcc, "compile_cuda", fake_compile_cuda)
+    target = Target({"kind": "cuda", "arch": "sm_90a"})
+    source = 'extern "C" __global__ void __launch_bounds__(128, 1) kernel() {}'
+
+    result = cuda_backend.tilelang_callback_cuda_compile(
+        source,
+        target,
+        {tilelang.PassConfigKey.TL_ENABLE_AUTO_LAUNCH_BOUNDS: True},
+    )
+
+    assert bytes(result) == b"baseline"
+    assert compile_sources == [source]
+
+
 def test_cuda_binary_cache_corrupted_entry_recompiles(monkeypatch, tmp_path):
     _set_cache_dirs(monkeypatch, tmp_path)
     from tilelang.cuda import backend as cuda_backend
