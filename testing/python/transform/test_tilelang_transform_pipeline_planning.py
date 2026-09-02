@@ -5,6 +5,7 @@ import tilelang.language as T
 from tvm.tirx.stmt_functor import post_order_visit
 
 auto_target = tvm.target.Target(determine_target("auto"))
+sm75_target = tvm.target.Target({"kind": "cuda", "arch": "sm_75"})
 sm80_target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
 sm90_target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
 sm100_target = tvm.target.Target({"kind": "cuda", "arch": "sm_100"})
@@ -689,6 +690,11 @@ def test_pipeline_planning_recognizes_predicated_zero_fill_parallel_copy():
     assert [int(v) for v in anno["software_pipeline_stage"]] == [0, 1]
     assert [int(v) for v in anno["software_pipeline_async_producers"]] == [1, 0]
     assert [int(v) for v in anno["software_pipeline_async_producer_groups"]] == [0, -1]
+
+    sm75_mod = _run_pipeline_planning(before, sm75_target)
+    sm75_annos = _collect_pipeline_loop_annotations(sm75_mod["main"])
+    assert sm75_annos, "Expected PipelinePlanning annotations"
+    assert "software_pipeline_async_producers" not in sm75_annos[0]
 
 
 def test_pipeline_planning_rejects_non_total_predicated_copies():

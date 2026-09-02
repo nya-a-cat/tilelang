@@ -1069,6 +1069,7 @@ public:
     pinfo.original_stmt_index = idx;
     pinfo.conditional_execution = MayBeConditionallyExecuted(block->body);
     pinfo.total_zero_fill_copy = enable_predicated_async_copy_ &&
+                                 TargetCudaHasAsyncCopy(target_) &&
                                  collector.GetGlobalCopyPattern() &&
                                  IsTotalZeroFillCopyStmt(block->body);
     bool pure_copy_stage =

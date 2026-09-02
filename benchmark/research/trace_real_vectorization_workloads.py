@@ -1369,6 +1369,15 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
                     and synchronous["cp_async_source_occurrences"] == 0
                     and planner["groups"]["async_copy"] == 0
                     and synchronous["groups"]["async_copy"] == 0
+                    and planner["source_sha256"] == synchronous["source_sha256"]
+                    and planner["kernel_launches"]
+                    == synchronous["kernel_launches"]
+                    and planner["instruction_count"]
+                    == synchronous["instruction_count"]
+                    and planner["opcodes"] == synchronous["opcodes"]
+                    and planner["groups"] == synchronous["groups"]
+                    and planner["resources"] == synchronous["resources"]
+                    and planner["cubin_bytes"] == synchronous["cubin_bytes"]
                 )
                 workload["predicated_async_copy_comparisons"].append(
                     {
