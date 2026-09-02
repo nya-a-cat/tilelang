@@ -114,8 +114,8 @@ class PassConfigKey(str, Enum):
 
     TL_LAYOUT_COST_MODEL = "tl.layout_cost_model"
     """The cost model that ranks free-mode layout attempts, by name:
-    "target-default" uses the single-lowering io-aware-regularized model on
-    CUDA and preserves register-count on other targets;
+    "target-default" uses the io-aware model on CUDA and preserves
+    register-count on other targets;
     "io-aware-regularized" adds a byte-equivalent fragment-register price to
     the IO score so small or register-heavy kernels retain compact layouts;
     "io-aware" scores estimated global-memory access cost (vector width /

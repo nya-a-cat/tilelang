@@ -3,7 +3,7 @@
 The layout cost trace proves that several policies choose different layouts,
 but its modeled scores cannot establish which choice produces leaner machine
 code.  This companion diagnostic lowers the same byte-identity-guarded 18
-PrimFuncs under three policies for explicit CUDA architectures.  Identical
+PrimFuncs under selected policies for explicit CUDA architectures.  Identical
 CUDA sources are compiled once per architecture and the result is shared by
 hash, keeping the free-CI matrix small while preserving exact comparisons.
 
@@ -51,6 +51,7 @@ POLICIES = tuple(
     ).split(",")
     if value.strip()
 )
+EXPECTED_DEFAULT_POLICY = os.environ.get("TILELANG_LAYOUT_POLICY_EXPECT_DEFAULT")
 ARCHES = tuple(
     value.strip()
     for value in os.environ.get(
@@ -378,6 +379,8 @@ def write_report(payload: dict[str, Any]) -> None:
         f"- Architectures: `{', '.join(payload['architectures'])}`",
         f"- Logical policy cases: `{payload['logical_case_count']}`",
         f"- Unique CUDA sources compiled: `{payload['unique_compile_count']}`",
+        f"- Expected CUDA default: `{payload['acceptance']['expected_default_policy']}`",
+        f"- Default/source/SASS identity gate: `{str(payload['acceptance']['source_and_machine_code_exact']).lower()}`",
         f"- Device execution: `{str(payload['gpu_execution']).lower()}`",
         "",
         "## Policy summary",
@@ -421,6 +424,26 @@ def main() -> int:
     compile_unique_matrix(unique)
     attach_compiled(lowered, unique)
     comparisons, aggregate = make_comparisons(lowered)
+    expected_default_comparisons = [
+        comparison
+        for comparison in comparisons
+        if comparison["candidate_policy"] == EXPECTED_DEFAULT_POLICY
+    ]
+    expected_default_exact = bool(expected_default_comparisons) and all(
+        not comparison["source_changed"]
+        and not comparison["sass_changed"]
+        and all(
+            comparison["candidate_minus_default"][field] == 0
+            for field in ("instructions", "registers", "spills", "cubin_bytes")
+        )
+        for comparison in expected_default_comparisons
+    )
+    acceptance = {
+        "expected_default_policy": EXPECTED_DEFAULT_POLICY,
+        "comparison_count": len(expected_default_comparisons),
+        "expected_comparison_count": len(EXPECTED_PRIMFUNC_SHA256) * len(ARCHES),
+        "source_and_machine_code_exact": expected_default_exact,
+    }
     payload = {
         "schema": "tilelang-layout-policy-cubin-trace-v1",
         "repository": REPOSITORY,
@@ -442,6 +465,7 @@ def main() -> int:
             "end-to-end speedup. A policy change still requires same-input runtime A/B on real GPUs."
         ),
         "aggregate": aggregate,
+        "acceptance": acceptance,
         "comparisons": comparisons,
         "cases": lowered,
     }
@@ -464,6 +488,11 @@ def main() -> int:
         ),
         flush=True,
     )
+    if EXPECTED_DEFAULT_POLICY and (
+        len(expected_default_comparisons) != acceptance["expected_comparison_count"]
+        or not expected_default_exact
+    ):
+        return 2
     return 0
 
 

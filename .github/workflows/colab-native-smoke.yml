@@ -1251,7 +1251,8 @@ jobs:
         env:
           TILELANG_SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
           TILELANG_LAYOUT_POLICY_CUBIN_ARCHES: sm_75,sm_80,sm_90a,sm_100a,sm_120a
-          TILELANG_LAYOUT_POLICY_CUBIN_POLICIES: target-default,register-count,io-aware
+          TILELANG_LAYOUT_POLICY_CUBIN_POLICIES: target-default,io-aware,io-aware-regularized,register-count
+          TILELANG_LAYOUT_POLICY_EXPECT_DEFAULT: io-aware
           TILELANG_LAYOUT_POLICY_CUBIN_WORKERS: "4"
           TILELANG_LAYOUT_POLICY_CUBIN_RESULT: native-overlay-evidence/layout-policy-cubins.json
           TILELANG_LAYOUT_POLICY_CUBIN_REPORT: native-overlay-evidence/layout-policy-cubins.md

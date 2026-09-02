@@ -311,7 +311,7 @@ def build_cases() -> list[TraceCase]:
 
 def expected_trace_model(arch: str, policy: str) -> str:
     if policy in {"target-default", BUILT_IN_DEFAULT_POLICY}:
-        return "register-count" if arch == CPU_TARGET else "io-aware-regularized"
+        return "register-count" if arch == CPU_TARGET else "io-aware"
     return policy
 
 

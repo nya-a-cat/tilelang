@@ -29,8 +29,8 @@ inline bool ReducerPlanVerboseEnabled() {
 
 /*!
  * \brief The cost model that ranks free-mode layout attempts. Valid values:
- *  "target-default" (CUDA uses register-regularized IO-aware scoring; other
- *  targets retain register-count), "register-count", "io-aware", and
+ *  "target-default" (CUDA uses IO-aware scoring; other targets retain
+ *  register-count), "register-count", "io-aware", and
  *  "io-aware-regularized".
  */
 inline std::string LayoutCostModelName() {

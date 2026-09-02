@@ -207,9 +207,9 @@ bool TryMultiplyPositive(int64_t lhs, int64_t rhs, int64_t *product) {
 
 // A 256 KiB byte-equivalent regularization price per fragment slot, calibrated
 // on the existing 18-case T4/consumer-Blackwell layout-divergence set. The
-// target-aware default applies it on CUDA; explicit register-count remains the
-// compatibility escape hatch, and non-CUDA targets retain register-count until
-// separately calibrated.
+// regularized policy remains available for explicit A/B and rollback; CUDA's
+// target default uses the unregularized IO score, and non-CUDA targets retain
+// register-count until separately calibrated.
 constexpr int64_t kRegularizedRegisterSlotPriceBytes = int64_t{1} << 18;
 
 /*! \brief Saturating non-negative `memory + price * registers` scalarization.
@@ -1256,9 +1256,8 @@ std::unique_ptr<LayoutCostModel>
 LayoutCostModel::Create(const std::string &name, Target target) {
   if (name == "target-default") {
     if (TargetIsCuda(target)) {
-      return std::make_unique<IOAwareCostModel>(
-          std::move(target), "io-aware-regularized",
-          kRegularizedRegisterSlotPriceBytes);
+      return std::make_unique<IOAwareCostModel>(std::move(target), "io-aware",
+                                                0);
     }
     return std::make_unique<RegisterCountCostModel>();
   }

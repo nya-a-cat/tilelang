@@ -110,17 +110,17 @@ def test_loop_tail_split(block_M, block_N, block_K, threads, vec_load_b, dtype):
         # tvm.ir.assert_structural_equal(mod, ref_mod)
 
 
-def test_regularized_io_aware_is_default_cuda_layout_cost_model():
+def test_io_aware_is_default_cuda_layout_cost_model():
     @T.prim_func
     def main(
-        S: T.Tensor((2,), T.float32),
-        Out: T.Tensor((2, 2560), T.float32),
+        S: T.Tensor((4,), T.float32),
+        Out: T.Tensor((4, 1024), T.float32),
     ):
-        with T.Kernel(1, threads=256):
-            s_frag = T.alloc_fragment((2,), T.float32)
-            for i in T.Parallel(2):
+        with T.Kernel(1, threads=128):
+            s_frag = T.alloc_fragment((4,), T.float32)
+            for i in T.Parallel(4):
                 s_frag[i] = S[i]
-            for i, j in T.Parallel(2, 2560):
+            for i, j in T.Parallel(4, 1024):
                 Out[i, j] = s_frag[i] * 2.0
 
     target = auto_target
@@ -147,9 +147,9 @@ def test_regularized_io_aware_is_default_cuda_layout_cost_model():
     )
 
     tvm.ir.assert_structural_equal(default, target_default)
-    tvm.ir.assert_structural_equal(default, io_aware_regularized)
+    tvm.ir.assert_structural_equal(default, io_aware)
     assert not tvm.ir.structural_equal(default, register_count)
-    tvm.ir.assert_structural_equal(io_aware_regularized, io_aware)
+    tvm.ir.assert_structural_equal(io_aware_regularized, register_count)
     tvm.ir.assert_structural_equal(register_count, traced_register_count)
     tvm.ir.assert_structural_equal(io_aware, traced_io_aware)
     tvm.ir.assert_structural_equal(io_aware_regularized, traced_io_aware_regularized)

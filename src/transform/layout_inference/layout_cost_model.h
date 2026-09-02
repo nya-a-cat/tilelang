@@ -12,13 +12,13 @@
  *    parallel loops with direct global accesses) and charges each one
  *    max(bandwidth bytes, issue-equivalent bytes) under the attempt's
  *    tentative layouts; registers remain the lexicographic tiebreak.
- *    Available through `tl.layout_cost_model="io-aware"` for opt-in use
- *    and A/B comparisons.
+ *    Selected by the target-aware default on CUDA and available explicitly
+ *    through `tl.layout_cost_model="io-aware"` for A/B comparisons.
  *  - IOAwareRegularizedCostModel: uses the same statement traffic model and
  *    adds a byte-equivalent price for each fragment register slot. This
  *    single-lowering scalarization is available as
- *    `tl.layout_cost_model="io-aware-regularized"` and is selected by the
- *    target-aware default on CUDA. Other targets keep RegisterCountCostModel.
+ *    `tl.layout_cost_model="io-aware-regularized"` for rollback and A/B.
+ *    Other targets keep RegisterCountCostModel as their target-aware default.
  *
  * Concrete models live in the .cc; callers go through Create().
  */
@@ -90,8 +90,8 @@ public:
 
   /*! \brief Instantiate the model selected by `tl.layout_cost_model`
    *  by name ("target-default", "io-aware", "io-aware-regularized", or
-   *  "register-count"). "target-default" resolves to io-aware-regularized on
-   *  CUDA and register-count elsewhere.
+   *  "register-count"). "target-default" resolves to io-aware on CUDA and
+   *  register-count elsewhere.
    *  unknown names are a hard error listing the valid values. `target`
    *  feeds the vectorizer's shared width-cap policy (MaxVectorLoadBits);
    *  the legacy model ignores it. */
