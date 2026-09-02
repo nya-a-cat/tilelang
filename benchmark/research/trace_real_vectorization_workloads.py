@@ -38,6 +38,7 @@ REPOSITORY = "nya-a-cat/tilelang"
 CONFIG_KEY = "tl.vectorize_local_parallel"
 INPLACE_CONFIG_KEY = "tl.storage_rewrite_detect_inplace"
 REGISTER_USAGE_CONFIG_KEY = "tl.ptxas_register_usage_level"
+AUTO_LAUNCH_BOUNDS_CONFIG_KEY = "tl.enable_auto_launch_bounds"
 DISABLE_REINTERPRET_CONFIG_KEY = "tl.disable_reinterpret_vectorization"
 DISABLE_INT4X2_UNPACK_CONFIG_KEY = "tl.disable_int4x2_unpack_peephole"
 MODES = tuple(
@@ -59,6 +60,7 @@ BASE_MODES = {
     "planner_inplace",
     "planner_reinterpret_legacy",
     "planner_int4x2_unpack_legacy",
+    "planner_auto_lb",
 }
 REGISTER_USAGE_MODE_RE = re.compile(r"planner_ru(?P<level>\d+)$")
 LAUNCH_BOUNDS_MODE_RE = re.compile(r"planner_lb(?P<blocks>\d+)$")
@@ -136,7 +138,8 @@ if (
     raise ValueError(
         "TILELANG_REAL_VECTOR_MODES must contain planner and legacy; optional modes are "
         "planner_inplace, planner_reinterpret_legacy, planner_int4x2_unpack_legacy, "
-        "planner_ru0 through planner_ru10, and planner_lb2 through planner_lb8"
+        "planner_auto_lb, planner_ru0 through planner_ru10, and planner_lb2 "
+        "through planner_lb8"
     )
 if MAX_WORKERS < 1:
     raise ValueError("TILELANG_REAL_VECTOR_COMPILE_WORKERS must be positive")
@@ -411,6 +414,7 @@ def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                 pass_configs[DISABLE_INT4X2_UNPACK_CONFIG_KEY] = (
                     mode == "planner_int4x2_unpack_legacy"
                 )
+                pass_configs[AUTO_LAUNCH_BOUNDS_CONFIG_KEY] = mode == "planner_auto_lb"
                 usage_level = register_usage_level(mode)
                 if usage_level is not None:
                     pass_configs[REGISTER_USAGE_CONFIG_KEY] = usage_level
@@ -941,6 +945,96 @@ def enrich_launch_bounds_scan(
     )
 
 
+def enrich_auto_launch_bounds(
+    workload_records: list[dict[str, Any]], aggregate: dict[str, Any]
+) -> None:
+    if "planner_auto_lb" not in MODES:
+        aggregate.update(
+            {
+                "auto_launch_bounds_comparisons": 0,
+                "auto_launch_bounds_candidate_selections": 0,
+                "auto_launch_bounds_baseline_selections": 0,
+                "auto_launch_bounds_instruction_nonregressed": 0,
+                "auto_launch_bounds_spill_free": 0,
+            }
+        )
+        return
+    if "planner_lb2" not in MODES:
+        raise RuntimeError("planner_auto_lb validation requires planner_lb2")
+
+    candidate_selections = 0
+    baseline_selections = 0
+    instruction_nonregressed = 0
+    spill_free = 0
+    comparisons = 0
+
+    def sum_resource(case: dict[str, Any], field: str) -> int:
+        return sum(int(resource[field]) for resource in case["resources"].values())
+
+    for workload in workload_records:
+        by_key = {(case["arch"], case["mode"]): case for case in workload["cases"]}
+        workload["auto_launch_bounds_comparisons"] = []
+        for arch in ARCHES:
+            planner = by_key[(arch, "planner")]
+            candidate = by_key[(arch, "planner_lb2")]
+            automatic = by_key[(arch, "planner_auto_lb")]
+            source_isolated = (
+                automatic["lowered_source_sha256"] == planner["lowered_source_sha256"]
+            )
+            if not source_isolated:
+                raise RuntimeError(
+                    f"automatic launch bounds changed TileLang lowering for "
+                    f"{workload['name']}/{arch}"
+                )
+
+            if automatic["cubin_sha256"] == planner["cubin_sha256"]:
+                selection = "planner"
+                baseline_selections += 1
+            elif automatic["cubin_sha256"] == candidate["cubin_sha256"]:
+                selection = "planner_lb2"
+                candidate_selections += 1
+            else:
+                raise RuntimeError(
+                    f"automatic launch-bound CUBIN matches neither reference for "
+                    f"{workload['name']}/{arch}"
+                )
+
+            spill_stores = sum_resource(automatic, "spill_store_bytes")
+            spill_loads = sum_resource(automatic, "spill_load_bytes")
+            nonregressed = (
+                automatic["instruction_count"] <= planner["instruction_count"]
+            )
+            zero_spill = spill_stores == 0 and spill_loads == 0
+            workload["auto_launch_bounds_comparisons"].append(
+                {
+                    "arch": arch,
+                    "selection": selection,
+                    "source_isolated": source_isolated,
+                    "instruction_delta": automatic["instruction_count"]
+                    - planner["instruction_count"],
+                    "spill_store_bytes": spill_stores,
+                    "spill_load_bytes": spill_loads,
+                }
+            )
+            instruction_nonregressed += int(nonregressed)
+            spill_free += int(zero_spill)
+            comparisons += 1
+
+    if instruction_nonregressed != comparisons or spill_free != comparisons:
+        raise RuntimeError(
+            "automatic launch-bound selector produced an instruction regression or spill"
+        )
+    aggregate.update(
+        {
+            "auto_launch_bounds_comparisons": comparisons,
+            "auto_launch_bounds_candidate_selections": candidate_selections,
+            "auto_launch_bounds_baseline_selections": baseline_selections,
+            "auto_launch_bounds_instruction_nonregressed": instruction_nonregressed,
+            "auto_launch_bounds_spill_free": spill_free,
+        }
+    )
+
+
 def write_report(payload: dict[str, Any]) -> None:
     lines = [
         "# Frozen real-workload vectorization trace",
@@ -1098,6 +1192,25 @@ def write_report(payload: dict[str, Any]) -> None:
                         f"{comparison['static_candidate']} |"
                     )
         lines.append("")
+    if "planner_auto_lb" in payload["modes"]:
+        lines.extend(
+            [
+                "## Automatic CUDA launch-bound selection",
+                "",
+                "| Workload | Arch | selected binary | instruction delta | spill stores/loads (bytes) |",
+                "|---|---:|---:|---:|---:|",
+            ]
+        )
+        for workload in payload["workloads"]:
+            for comparison in workload["auto_launch_bounds_comparisons"]:
+                lines.append(
+                    f"| `{workload['name']}` | `{comparison['arch']}` | "
+                    f"`{comparison['selection']}` | "
+                    f"{comparison['instruction_delta']} | "
+                    f"{comparison['spill_store_bytes']}/"
+                    f"{comparison['spill_load_bytes']} |"
+                )
+        lines.append("")
     if "planner_reinterpret_legacy" in payload["modes"]:
         lines.extend(
             [
@@ -1185,8 +1298,9 @@ def main() -> int:
     compile_all(compile_inputs)
     aggregate = enrich_comparisons(workload_records)
     enrich_launch_bounds_scan(workload_records, aggregate)
+    enrich_auto_launch_bounds(workload_records, aggregate)
     payload = {
-        "schema": "tilelang-real-vectorization-workloads-v2",
+        "schema": "tilelang-real-vectorization-workloads-v3",
         "repository": REPOSITORY,
         "source_sha": SOURCE_SHA,
         "python": platform.python_version(),
