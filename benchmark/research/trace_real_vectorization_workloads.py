@@ -3,9 +3,10 @@
 This diagnostic elaborates frozen configurations from real TileLang examples:
 DeepSeek mHC prefill, W4A8 dequantization GEMM, FP16 GEMM, split-K GEMM,
 RMSNorm, LayerNorm, FlashAttention, convolution, and elementwise addition.
-Each byte-identical PrimFunc is lowered with the requested compiler modes,
-compiled with TileLang's CUDA callback, and disassembled for explicit NVIDIA
-architectures.  It never initializes or executes a GPU.
+Each byte-identical PrimFunc is lowered with the requested transformation modes.
+Compilation-only candidates reuse the exact planner CUDA source bytes before
+being compiled with TileLang's CUDA callback and disassembled for explicit
+NVIDIA architectures.  The diagnostic never initializes or executes a GPU.
 """
 
 from __future__ import annotations
@@ -518,6 +519,33 @@ def launch_bounds_blocks(mode: str) -> int | None:
     return int(match.group("blocks")) if match is not None else None
 
 
+def lowering_source_mode(mode: str) -> str:
+    """Map compile-only experiments to their shared lowering source."""
+
+    if (
+        mode == "planner_auto_lb"
+        or register_usage_level(mode) is not None
+        or launch_bounds_blocks(mode) is not None
+    ):
+        return "planner"
+    return mode
+
+
+def pass_configs_for_mode(base_configs: dict[str, Any], mode: str) -> dict[str, Any]:
+    pass_configs = dict(base_configs)
+    pass_configs[CONFIG_KEY] = mode != "legacy"
+    pass_configs[INPLACE_CONFIG_KEY] = mode == "planner_inplace"
+    pass_configs[DISABLE_REINTERPRET_CONFIG_KEY] = mode == "planner_reinterpret_legacy"
+    pass_configs[DISABLE_INT4X2_UNPACK_CONFIG_KEY] = (
+        mode == "planner_int4x2_unpack_legacy"
+    )
+    pass_configs[AUTO_LAUNCH_BOUNDS_CONFIG_KEY] = mode == "planner_auto_lb"
+    usage_level = register_usage_level(mode)
+    if usage_level is not None:
+        pass_configs[REGISTER_USAGE_CONFIG_KEY] = usage_level
+    return pass_configs
+
+
 def rewrite_launch_bounds(source: str, blocks: int) -> tuple[str, int]:
     """Change only CUDA's min-blocks launch-bound argument.
 
@@ -591,32 +619,39 @@ def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
             "cases": [],
         }
         for arch in ARCHES:
+            lowered_sources: dict[str, dict[str, Any]] = {}
             for mode in MODES:
                 target = tvm.target.Target({"kind": "cuda", "arch": arch})
-                pass_configs = dict(workload["pass_configs"])
-                pass_configs[CONFIG_KEY] = mode != "legacy"
-                pass_configs[INPLACE_CONFIG_KEY] = mode == "planner_inplace"
-                pass_configs[DISABLE_REINTERPRET_CONFIG_KEY] = (
-                    mode == "planner_reinterpret_legacy"
-                )
-                pass_configs[DISABLE_INT4X2_UNPACK_CONFIG_KEY] = (
-                    mode == "planner_int4x2_unpack_legacy"
-                )
-                pass_configs[AUTO_LAUNCH_BOUNDS_CONFIG_KEY] = mode == "planner_auto_lb"
-                usage_level = register_usage_level(mode)
-                if usage_level is not None:
-                    pass_configs[REGISTER_USAGE_CONFIG_KEY] = usage_level
-                started = time.perf_counter()
-                with tvm.transform.PassContext(opt_level=3, config=pass_configs), target:
-                    artifact = tl.lower(
-                        prim_func,
-                        target=target,
-                        enable_device_compile=False,
+                source_mode = lowering_source_mode(mode)
+                if source_mode not in lowered_sources:
+                    lower_pass_configs = pass_configs_for_mode(
+                        workload["pass_configs"], source_mode
                     )
-                source = str(artifact.kernel_source or "")
-                if not source.strip():
-                    raise RuntimeError(f"empty CUDA source for {workload['name']}/{arch}/{mode}")
-                kernel_launches = extract_kernel_launch_metadata(artifact.device_mod)
+                    started = time.perf_counter()
+                    with tvm.transform.PassContext(
+                        opt_level=3, config=lower_pass_configs
+                    ), target:
+                        artifact = tl.lower(
+                            prim_func,
+                            target=target,
+                            enable_device_compile=False,
+                        )
+                    source = str(artifact.kernel_source or "")
+                    if not source.strip():
+                        raise RuntimeError(
+                            f"empty CUDA source for "
+                            f"{workload['name']}/{arch}/{source_mode}"
+                        )
+                    lowered_sources[source_mode] = {
+                        "source": source,
+                        "kernel_launches": extract_kernel_launch_metadata(
+                            artifact.device_mod
+                        ),
+                        "lower_seconds": time.perf_counter() - started,
+                    }
+                lowered = lowered_sources[source_mode]
+                source = lowered["source"]
+                kernel_launches = lowered["kernel_launches"]
                 lowered_source_sha256 = sha256_text(source)
                 launch_blocks = launch_bounds_blocks(mode)
                 launch_bounds_rewrites = 0
@@ -631,7 +666,9 @@ def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                 case = {
                     "arch": arch,
                     "mode": mode,
-                    "lower_seconds": time.perf_counter() - started,
+                    "lowering_source_mode": source_mode,
+                    "lowering_reused": mode != source_mode,
+                    "lower_seconds": lowered["lower_seconds"],
                     "source_sha256": sha256_text(source),
                     "lowered_source_sha256": lowered_source_sha256,
                     "source_bytes": len(source.encode()),
@@ -651,7 +688,9 @@ def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                         "mode": mode,
                         "source": source,
                         "source_path": source_path,
-                        "pass_configs": pass_configs,
+                        "pass_configs": pass_configs_for_mode(
+                            workload["pass_configs"], mode
+                        ),
                         "case": case,
                     }
                 )
@@ -1592,7 +1631,7 @@ def main() -> int:
     enrich_launch_bounds_scan(workload_records, aggregate)
     enrich_auto_launch_bounds(workload_records, aggregate)
     payload = {
-        "schema": "tilelang-real-vectorization-workloads-v4",
+        "schema": "tilelang-real-vectorization-workloads-v5",
         "repository": REPOSITORY,
         "source_sha": SOURCE_SHA,
         "python": platform.python_version(),
