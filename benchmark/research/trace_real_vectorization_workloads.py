@@ -51,6 +51,9 @@ AUTO_LAUNCH_BOUNDS_CONFIG_KEY = "tl.enable_auto_launch_bounds"
 DEVICE_COMPILE_FLAGS_CONFIG_KEY = "tl.device_compile_flags"
 DISABLE_REINTERPRET_CONFIG_KEY = "tl.disable_reinterpret_vectorization"
 DISABLE_INT4X2_UNPACK_CONFIG_KEY = "tl.disable_int4x2_unpack_peephole"
+VARLEN_BATCH = T.symbolic("batch")
+VARLEN_TOTAL_Q = T.symbolic("total_q")
+VARLEN_TOTAL_K = T.symbolic("total_k")
 MODES = tuple(
     mode.strip()
     for mode in os.environ.get(
@@ -345,9 +348,6 @@ def build_workloads(repo_root: Path) -> list[dict[str, Any]]:
         split_k=4,
     )
 
-    batch = T.symbolic("batch")
-    total_q = T.symbolic("total_q")
-    total_k = T.symbolic("total_k")
     heads = 64
     head_dimension = 512
     block_m = 64
@@ -355,17 +355,17 @@ def build_workloads(repo_root: Path) -> list[dict[str, Any]]:
 
     @T.prim_func
     def varlen_attention_guarded_stage(
-        Q: T.Tensor((total_q, heads, head_dimension), T.bfloat16),
-        K: T.Tensor((total_k, 1, head_dimension), T.bfloat16),
-        cu_q: T.Tensor((batch + 1,), T.int32),
-        cu_k: T.Tensor((batch + 1,), T.int32),
-        Out: T.Tensor((total_k, 1, head_dimension), T.float32),
+        Q: T.Tensor((VARLEN_TOTAL_Q, heads, head_dimension), T.bfloat16),
+        K: T.Tensor((VARLEN_TOTAL_K, 1, head_dimension), T.bfloat16),
+        cu_q: T.Tensor((VARLEN_BATCH + 1,), T.int32),
+        cu_k: T.Tensor((VARLEN_BATCH + 1,), T.int32),
+        Out: T.Tensor((VARLEN_TOTAL_K, 1, head_dimension), T.float32),
         max_seqlen_k: T.int32,
     ):
         with T.Kernel(
             heads,
             T.ceildiv(max_seqlen_k, block_m),
-            batch,
+            VARLEN_BATCH,
             threads=256,
         ) as (bx, by, bz):
             K_shared = T.alloc_shared(
