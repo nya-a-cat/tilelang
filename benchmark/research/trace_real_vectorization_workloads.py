@@ -1,11 +1,10 @@
 """Compile frozen real-workload vectorization variants without a GPU.
 
-This diagnostic elaborates the exact regression configurations behind the two
-largest public wins associated with register-only ``T.Parallel`` vectorization:
-DeepSeek mHC prefill's large fused kernel and the 4096^3 W4A8 dequantization
-GEMM.  Each byte-identical PrimFunc is lowered with the planner and legacy gate,
-compiled with TileLang's CUDA callback, and disassembled for explicit NVIDIA
-architectures.  It never initializes or executes a GPU.
+This diagnostic elaborates frozen configurations from real TileLang examples:
+DeepSeek mHC prefill, W4A8 dequantization GEMM, FP16 GEMM, RMSNorm, and
+FlashAttention.  Each byte-identical PrimFunc is lowered with the requested
+compiler modes, compiled with TileLang's CUDA callback, and disassembled for
+explicit NVIDIA architectures.  It never initializes or executes a GPU.
 """
 
 from __future__ import annotations
@@ -172,12 +171,22 @@ def load_module(name: str, path: Path) -> ModuleType:
 def build_workloads(repo_root: Path) -> list[dict[str, Any]]:
     mhc_path = repo_root / "examples/deepseek_mhc/example_mhc_pre.py"
     w4a8_path = repo_root / "examples/dequantize_gemm/example_dequant_gemm_w4a8.py"
-    for path in (mhc_path, w4a8_path):
+    gemm_path = repo_root / "examples/gemm/example_gemm.py"
+    rms_norm_path = repo_root / "examples/norm/rms_norm.py"
+    flash_attention_path = (
+        repo_root / "examples/flash_attention/example_mha_fwd_bshd.py"
+    )
+    for path in (mhc_path, w4a8_path, gemm_path, rms_norm_path, flash_attention_path):
         if not path.is_file():
             raise RuntimeError(f"frozen example entrypoint is missing: {path}")
 
     mhc = load_module("tilelang_trace_example_mhc_pre", mhc_path)
     w4a8 = load_module("tilelang_trace_example_dequant_gemm_w4a8", w4a8_path)
+    gemm = load_module("tilelang_trace_example_gemm", gemm_path)
+    rms_norm = load_module("tilelang_trace_example_rms_norm", rms_norm_path)
+    flash_attention = load_module(
+        "tilelang_trace_example_mha_fwd_bshd", flash_attention_path
+    )
 
     tokens = 2048
     hidden_size = 4096
@@ -220,6 +229,32 @@ def build_workloads(repo_root: Path) -> list[dict[str, Any]]:
         threads=128,
     )
 
+    gemm_jit = gemm.matmul
+    gemm_prim = gemm_jit.get_tir(
+        M=1024,
+        N=1024,
+        K=1024,
+        block_M=128,
+        block_N=128,
+        block_K=32,
+    )
+
+    rms_norm_jit = rms_norm.rms_norm
+    rms_norm_prim = rms_norm_jit.get_tir(M=8192, N=8192, blk_m=1)
+
+    flash_attention_jit = flash_attention.flashattn.jit_impl
+    flash_attention_prim = flash_attention_jit.get_tir(
+        8,
+        32,
+        4096,
+        128,
+        False,
+        block_M=128,
+        block_N=128,
+        num_stages=1,
+        threads=128,
+    )
+
     return [
         {
             "name": "deepseek_mhc_pre_big_fuse",
@@ -255,6 +290,57 @@ def build_workloads(repo_root: Path) -> list[dict[str, Any]]:
                 "block_M": 32,
                 "block_N": 32,
                 "block_K": 128,
+                "num_stages": 1,
+                "threads": 128,
+            },
+            "scope_note": "exact fixed configuration used by run_regression_perf",
+        },
+        {
+            "name": "gemm_fp16_1024",
+            "example_path": gemm_path,
+            "prim_func": gemm_prim,
+            "pass_configs": dict(gemm_jit.pass_configs or {}),
+            "configuration": {
+                "M": 1024,
+                "N": 1024,
+                "K": 1024,
+                "block_M": 128,
+                "block_N": 128,
+                "block_K": 32,
+                "dtype": "float16",
+                "accum_dtype": "float32",
+                "num_stages": 3,
+                "threads": 128,
+            },
+            "scope_note": "exact fixed configuration used by run_regression_perf",
+        },
+        {
+            "name": "rms_norm_fp32_8192",
+            "example_path": rms_norm_path,
+            "prim_func": rms_norm_prim,
+            "pass_configs": dict(rms_norm_jit.pass_configs or {}),
+            "configuration": {
+                "M": 8192,
+                "N": 8192,
+                "block_M": 1,
+                "dtype": "float32",
+                "threads": 128,
+            },
+            "scope_note": "exact fixed configuration used by the example main program",
+        },
+        {
+            "name": "flash_attention_fp16_b8_h32_s4096_d128",
+            "example_path": flash_attention_path,
+            "prim_func": flash_attention_prim,
+            "pass_configs": dict(flash_attention_jit.pass_configs or {}),
+            "configuration": {
+                "batch": 8,
+                "heads": 32,
+                "sequence_length": 4096,
+                "head_dimension": 128,
+                "is_causal": False,
+                "block_M": 128,
+                "block_N": 128,
                 "num_stages": 1,
                 "threads": 128,
             },
