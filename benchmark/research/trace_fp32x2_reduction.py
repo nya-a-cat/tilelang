@@ -199,7 +199,10 @@ def lower_cases() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         for arch in ARCHES:
             for mode in MODES:
                 target = tvm.target.Target({"kind": "cuda", "arch": arch})
-                pass_configs = {CONFIG_KEY: mode == "default"}
+                pass_configs = {
+                    CONFIG_KEY: mode == "default",
+                    "tl.enable_reducer_plan_verbose": True,
+                }
                 started = time.perf_counter()
                 with tvm.transform.PassContext(opt_level=3, config=pass_configs), target:
                     artifact = tl.lower(prim_func, target=target, enable_device_compile=False)

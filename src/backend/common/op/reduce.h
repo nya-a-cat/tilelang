@@ -7,6 +7,7 @@
 #define TVM_TL_BACKEND_COMMON_OP_REDUCE_H_
 
 #include "backend/common/target_utils.h"
+#include "config.h"
 #include "op/builtin.h"
 #include "op/reduce.h"
 #include "support/check.h"
@@ -921,77 +922,94 @@ template <typename Impl> struct ReduceLowerer {
       Buffer clear_batch_pack_buffer;
       {
         int vsize = Impl::GetPreferredVectorizedSize(op, lower_args.target);
-        if (vsize > 1 && !src_var_compressed.empty()) {
-          auto *ext = src_var_compressed.back()->dom->extent.as<IntImmNode>();
-          if (ext && ext->value >= vsize && ext->value % vsize == 0 &&
-              reduce::MakeCodegenReducer(op, vsize).has_value() &&
-              reduce::CanUsePackedRamp(src_indice_compressed.back(),
-                                       src_var_compressed.back()->var, vsize,
-                                       analyzer)) {
-            can_pack = true;
-            DataType vec_dtype = clear_buffer->dtype.with_lanes(vsize);
-            clear_buffer_packed =
-                decl_buffer(red_layout->OutputShape(), vec_dtype,
-                            clear_buffer->name + "_pack",
-                            GetPtrStorageScope(clear_buffer->data));
-            need_pack_buffer = true;
+        const bool has_inner_var = !src_var_compressed.empty();
+        const IntImmNode *ext =
+            has_inner_var
+                ? src_var_compressed.back()->dom->extent.as<IntImmNode>()
+                : nullptr;
+        const bool extent_eligible =
+            ext && ext->value >= vsize && ext->value % vsize == 0;
+        const bool reducer_eligible =
+            vsize > 1 && reduce::MakeCodegenReducer(op, vsize).has_value();
+        const bool ramp_eligible =
+            extent_eligible && reducer_eligible &&
+            reduce::CanUsePackedRamp(src_indice_compressed.back(),
+                                     src_var_compressed.back()->var, vsize,
+                                     analyzer);
+        if (tl_config::ReducerPlanVerboseEnabled()) {
+          LOG(INFO) << "[ReducePackedPlan] src=" << op.src->name
+                    << ", dst=" << op.dst->name << ", vsize=" << vsize
+                    << ", inner_extent="
+                    << (ext ? std::to_string(ext->value) : "none")
+                    << ", has_inner_var=" << has_inner_var
+                    << ", extent_eligible=" << extent_eligible
+                    << ", reducer_eligible=" << reducer_eligible
+                    << ", ramp_eligible=" << ramp_eligible
+                    << ", decision=" << (ramp_eligible ? "packed" : "scalar");
+        }
+        if (ramp_eligible) {
+          can_pack = true;
+          DataType vec_dtype = clear_buffer->dtype.with_lanes(vsize);
+          clear_buffer_packed =
+              decl_buffer(red_layout->OutputShape(), vec_dtype,
+                          clear_buffer->name + "_pack",
+                          GetPtrStorageScope(clear_buffer->data));
+          need_pack_buffer = true;
 
-            Array<Stmt> local_body;
+          Array<Stmt> local_body;
 
-            if (require_init ||
-                (need_duplicate && (op.type->IsMax() || op.type->IsMin() ||
-                                    op.type->IsAbsMax()))) {
-              local_body.push_back(BufferStore(clear_buffer_packed,
-                                               reduce::MakeInitValue(op, vsize),
-                                               red_indices));
-            }
-
-            const auto *ext_int =
-                as_const_int(src_var_compressed.back()->dom->extent);
-            int64_t inner_extent = *ext_int;
-            PrimExpr halved_extent = Integer(inner_extent / vsize);
-
-            IterVar inner_var = src_var_compressed.back();
-
-            PrimExpr ramp_base =
-                Substitute(src_indice_compressed.back(),
-                           {{inner_var->var, inner_var->var * Integer(2)}});
-            src_indice_compressed.Set(
-                src_indice_compressed.size() - 1,
-                Ramp(ramp_base, IntImm(DataType::Int(32), 1), vsize));
-
-            auto src_load = BufferLoad(src_buffer, src_indice_compressed);
-            auto *src_writer = src_load.CopyOnWrite();
-            src_writer->dtype = src_buffer->dtype.with_lanes(vsize);
-
-            Stmt reduce_local = BufferStore(
-                clear_buffer_packed,
-                reduce::MakeReduce(op, vsize,
-                                   BufferLoad(clear_buffer_packed, red_indices),
-                                   src_load),
-                red_indices);
-
-            reduce_local = For(inner_var->var, 0, halved_extent,
-                               ForKind::kUnrolled, reduce_local, std::nullopt);
-
-            for (int i = static_cast<int>(src_layout->OutputDim()) - 2; i >= 0;
-                 --i) {
-              reduce_local =
-                  For(src_var_compressed[i]->var, 0,
-                      src_var_compressed[i]->dom->extent, ForKind::kUnrolled,
-                      reduce_local, std::nullopt);
-            }
-            local_body.push_back(reduce_local);
-
-            auto acc_vec = BufferLoad(clear_buffer_packed, red_indices);
-            auto lane0 = Shuffle::ExtractElement(acc_vec, 0);
-            auto lane1 = Shuffle::ExtractElement(acc_vec, 1);
-            auto scalar_result = reduce::MakeReduce(op, 1, lane0, lane1);
-            local_body.push_back(
-                BufferStore(clear_buffer, scalar_result, red_indices));
-
-            stmts.push_back(SeqStmt(local_body));
+          if (require_init ||
+              (need_duplicate &&
+               (op.type->IsMax() || op.type->IsMin() || op.type->IsAbsMax()))) {
+            local_body.push_back(BufferStore(clear_buffer_packed,
+                                             reduce::MakeInitValue(op, vsize),
+                                             red_indices));
           }
+
+          const auto *ext_int =
+              as_const_int(src_var_compressed.back()->dom->extent);
+          int64_t inner_extent = *ext_int;
+          PrimExpr halved_extent = Integer(inner_extent / vsize);
+
+          IterVar inner_var = src_var_compressed.back();
+
+          PrimExpr ramp_base =
+              Substitute(src_indice_compressed.back(),
+                         {{inner_var->var, inner_var->var * Integer(2)}});
+          src_indice_compressed.Set(
+              src_indice_compressed.size() - 1,
+              Ramp(ramp_base, IntImm(DataType::Int(32), 1), vsize));
+
+          auto src_load = BufferLoad(src_buffer, src_indice_compressed);
+          auto *src_writer = src_load.CopyOnWrite();
+          src_writer->dtype = src_buffer->dtype.with_lanes(vsize);
+
+          Stmt reduce_local = BufferStore(
+              clear_buffer_packed,
+              reduce::MakeReduce(op, vsize,
+                                 BufferLoad(clear_buffer_packed, red_indices),
+                                 src_load),
+              red_indices);
+
+          reduce_local = For(inner_var->var, 0, halved_extent,
+                             ForKind::kUnrolled, reduce_local, std::nullopt);
+
+          for (int i = static_cast<int>(src_layout->OutputDim()) - 2; i >= 0;
+               --i) {
+            reduce_local = For(src_var_compressed[i]->var, 0,
+                               src_var_compressed[i]->dom->extent,
+                               ForKind::kUnrolled, reduce_local, std::nullopt);
+          }
+          local_body.push_back(reduce_local);
+
+          auto acc_vec = BufferLoad(clear_buffer_packed, red_indices);
+          auto lane0 = Shuffle::ExtractElement(acc_vec, 0);
+          auto lane1 = Shuffle::ExtractElement(acc_vec, 1);
+          auto scalar_result = reduce::MakeReduce(op, 1, lane0, lane1);
+          local_body.push_back(
+              BufferStore(clear_buffer, scalar_result, red_indices));
+
+          stmts.push_back(SeqStmt(local_body));
         }
       }
 
