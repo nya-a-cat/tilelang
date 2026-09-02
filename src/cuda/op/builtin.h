@@ -65,10 +65,6 @@ static constexpr const char *kDisableWarpAggregateRedux =
 /*! \brief Keep full-CTA shared-memory barriers for single-warp CUDA CTAs. */
 static constexpr const char *kDisableSingleWarpStorageSync =
     "tl.disable_single_warp_storage_sync";
-/*! \brief Keep predicated boundary staging on synchronous CUDA loads/stores. */
-static constexpr const char *kDisablePredicatedAsyncCopy =
-    "tl.disable_predicated_async_copy";
-
 // fast math related op
 // __exp(x) - fast exponential
 TVM_DLL const Op &__exp();

@@ -28,8 +28,6 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kCudaAllReduceStrategy, ffi::String);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableInt4x2UnpackPeephole, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableWarpAggregateRedux, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableSingleWarpStorageSync, Bool);
-TVM_REGISTER_PASS_CONFIG_OPTION(kDisablePredicatedAsyncCopy, Bool);
-
 DataType CuTensorMapType() { return DataType::UInt(8, 128); }
 
 TIR_DEFINE_TL_BUILTIN(__exp).set_num_inputs(1).set_attr<TCallEffectKind>(

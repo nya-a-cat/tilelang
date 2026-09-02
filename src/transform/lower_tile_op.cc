@@ -56,6 +56,13 @@ static constexpr const char *kVectorizeLocalParallelScalarExp2 =
     "tl.vectorize_local_parallel_scalar_exp2";
 TVM_REGISTER_PASS_CONFIG_OPTION(kVectorizeLocalParallelScalarExp2, Bool);
 
+// Preserve the pre-restoration synchronous lowering for predicated CUDA
+// boundary staging. Keep this A/B switch in the policy translation unit so it
+// does not invalidate unrelated CUDA operators during incremental builds.
+static constexpr const char *kDisablePredicatedAsyncCopy =
+    "tl.disable_predicated_async_copy";
+TVM_REGISTER_PASS_CONFIG_OPTION(kDisablePredicatedAsyncCopy, Bool);
+
 static bool ContainsScalarFP32Exp2(const Stmt &stmt) {
   bool found = false;
   PostOrderVisit(stmt, [&](const ObjectRef &obj) {
