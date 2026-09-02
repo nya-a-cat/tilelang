@@ -163,6 +163,42 @@ def test_parallel_simt_copy_respects_enable_async_copy_config():
     assert "cp_async_gs<" not in src, "Did not expect cp_async_gs when async copy is disabled"
 
 
+def test_predicated_parallel_stage_auto_lowers_to_cp_async_without_gpu():
+    """Guarded boundary staging uses cp.async while retaining a sync rollback."""
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((127,), T.float16),
+        B: T.Tensor((128,), T.float16),
+    ):
+        with T.Kernel(1, threads=128):
+            S = T.alloc_shared((128,), T.float16)
+            for i in T.Parallel(128):
+                if i < 127:
+                    S[i] = A[i]
+                else:
+                    S[i] = T.float16(0)
+            T.copy(S, B)
+
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
+    with tvm.transform.PassContext(opt_level=3):
+        async_source = tilelang.lower(
+            main, target=target, enable_device_compile=False
+        ).kernel_source
+    with tvm.transform.PassContext(
+        opt_level=3,
+        config={tilelang.PassConfigKey.TL_ENABLE_ASYNC_COPY: False},
+    ):
+        sync_source = tilelang.lower(
+            main, target=target, enable_device_compile=False
+        ).kernel_source
+
+    assert "cp_async_gs<" in async_source
+    assert "tl::cp_async_commit" in async_source
+    assert "tl::cp_async_wait<0>" in async_source
+    assert "cp_async_gs<" not in sync_source
+
+
 @tilelang.testing.requires_cuda
 @tilelang.testing.requires_cuda_compute_version_ge(8, 0)
 def test_async_copy_oob_lowers_to_predicated_cp_async_without_wait():

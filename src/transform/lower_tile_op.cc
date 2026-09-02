@@ -1454,13 +1454,19 @@ private:
     if (TargetCudaHasAsyncCopy(target_)) {
       bool auto_async_copy_enabled =
           pass_ctx->GetConfig<Bool>(kEnableAsyncCopy, Bool(true)).value();
-      bool should_inject_async_copy =
-          parallel_prefer_async ||
-          (auto_async_copy_enabled && parallel_async_without_async_commit_wait);
-      if (should_inject_async_copy) {
+      bool should_try_async_copy =
+          parallel_prefer_async || auto_async_copy_enabled;
+      if (should_try_async_copy) {
         auto inject_result = InjectPTXAsyncCopy(
             lowered, parallel_async_without_async_commit_wait);
-        lowered = inject_result.stmt;
+        bool should_accept_async_copy =
+            parallel_prefer_async ||
+            (auto_async_copy_enabled &&
+             (parallel_async_without_async_commit_wait ||
+              inject_result.injected_predicated_ptx_async_copy));
+        if (should_accept_async_copy) {
+          lowered = inject_result.stmt;
+        }
       }
     }
     // Stamp after PTX async-copy injection so injected nodes are covered too.

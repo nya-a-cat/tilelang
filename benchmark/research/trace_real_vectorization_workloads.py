@@ -2,7 +2,8 @@
 
 This diagnostic elaborates frozen configurations from real TileLang examples:
 DeepSeek mHC prefill, W4A8 dequantization GEMM, FP16 GEMM, split-K GEMM,
-RMSNorm, LayerNorm, FlashAttention, convolution, and elementwise addition.
+RMSNorm, LayerNorm, FlashAttention, convolution, elementwise addition, and a
+guarded varlen-attention backward staging reproduction.
 Each byte-identical PrimFunc is lowered with the requested transformation modes.
 Compilation-only candidates reuse the exact planner CUDA source bytes before
 being compiled with TileLang's CUDA callback and disassembled for explicit
@@ -43,6 +44,7 @@ from tilelang.cuda.backend import tilelang_callback_cuda_compile
 REPOSITORY = "nya-a-cat/tilelang"
 CONFIG_KEY = "tl.vectorize_local_parallel"
 SCALAR_EXP2_CONFIG_KEY = "tl.vectorize_local_parallel_scalar_exp2"
+ASYNC_COPY_CONFIG_KEY = "tl.enable_async_copy"
 INPLACE_CONFIG_KEY = "tl.storage_rewrite_detect_inplace"
 REGISTER_USAGE_CONFIG_KEY = "tl.ptxas_register_usage_level"
 AUTO_LAUNCH_BOUNDS_CONFIG_KEY = "tl.enable_auto_launch_bounds"
@@ -70,6 +72,7 @@ BASE_MODES = {
     "planner_int4x2_unpack_legacy",
     "planner_auto_lb",
     "planner_nvcc_extra_vectorization",
+    "planner_sync_predicated_copy",
     "planner_scalar_exp2_vectorized",
 }
 REGISTER_USAGE_MODE_RE = re.compile(r"planner_ru(?P<level>\d+)$")
@@ -149,8 +152,8 @@ if (
         "TILELANG_REAL_VECTOR_MODES must contain planner and legacy; optional modes are "
         "planner_inplace, planner_reinterpret_legacy, planner_int4x2_unpack_legacy, "
         "planner_auto_lb, planner_scalar_exp2_vectorized, planner_ru0 through "
-        "planner_ru10, planner_nvcc_extra_vectorization, and planner_lb2 "
-        "through planner_lb8"
+        "planner_ru10, planner_nvcc_extra_vectorization, "
+        "planner_sync_predicated_copy, and planner_lb2 through planner_lb8"
     )
 if MAX_WORKERS < 1:
     raise ValueError("TILELANG_REAL_VECTOR_COMPILE_WORKERS must be positive")
@@ -342,6 +345,81 @@ def build_workloads(repo_root: Path) -> list[dict[str, Any]]:
         split_k=4,
     )
 
+    batch = T.symbolic("batch")
+    total_q = T.symbolic("total_q")
+    total_k = T.symbolic("total_k")
+    heads = 64
+    head_dimension = 512
+    block_m = 64
+    block_n = 64
+
+    @T.prim_func
+    def varlen_attention_guarded_stage(
+        Q: T.Tensor((total_q, heads, head_dimension), T.bfloat16),
+        K: T.Tensor((total_k, 1, head_dimension), T.bfloat16),
+        cu_q: T.Tensor((batch + 1,), T.int32),
+        cu_k: T.Tensor((batch + 1,), T.int32),
+        Out: T.Tensor((total_k, 1, head_dimension), T.float32),
+        max_seqlen_k: T.int32,
+    ):
+        with T.Kernel(
+            heads,
+            T.ceildiv(max_seqlen_k, block_m),
+            batch,
+            threads=256,
+        ) as (bx, by, bz):
+            K_shared = T.alloc_shared(
+                (block_m, head_dimension), T.bfloat16
+            )
+            Q_shared = T.alloc_shared(
+                (block_n, head_dimension), T.bfloat16
+            )
+            scores_shared = T.alloc_shared((block_m, block_n), T.bfloat16)
+            scores_local = T.alloc_fragment((block_m, block_n), T.float32)
+            accum = T.alloc_fragment((block_m, head_dimension), T.float32)
+
+            q_start = cu_q[bz]
+            q_end = cu_q[bz + 1]
+            k_start = cu_k[bz]
+            k_end = cu_k[bz + 1]
+            q_length = q_end - q_start
+            k_length = k_end - k_start
+
+            for i, d in T.Parallel(block_m, head_dimension):
+                if by * block_m + i < k_length:
+                    K_shared[i, d] = K[k_start + by * block_m + i, 0, d]
+                else:
+                    K_shared[i, d] = T.bfloat16(0)
+
+            T.clear(accum)
+            for kb in T.Pipelined(
+                T.ceildiv(q_length, block_n), num_stages=1
+            ):
+                for i, d in T.Parallel(block_n, head_dimension):
+                    if kb * block_n + i < q_length:
+                        Q_shared[i, d] = Q[q_start + kb * block_n + i, bx, d]
+                    else:
+                        Q_shared[i, d] = T.bfloat16(0)
+                T.clear(scores_local)
+                T.gemm(
+                    K_shared,
+                    Q_shared,
+                    scores_local,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullRow,
+                )
+                T.copy(scores_local, scores_shared)
+                T.gemm(
+                    scores_shared,
+                    Q_shared,
+                    accum,
+                    policy=T.GemmWarpPolicy.FullRow,
+                )
+
+            for i, d in T.Parallel(block_m, head_dimension):
+                if by * block_m + i < k_length:
+                    Out[k_start + by * block_m + i, 0, d] = accum[i, d]
+
     return [
         {
             "name": "deepseek_mhc_pre_big_fuse",
@@ -507,6 +585,21 @@ def build_workloads(repo_root: Path) -> list[dict[str, Any]]:
             },
             "scope_note": "exact fixed configuration used by run_regression_perf",
         },
+        {
+            "name": "varlen_attention_guarded_stage_bwd_repro",
+            "example_path": Path(__file__).resolve(),
+            "prim_func": varlen_attention_guarded_stage,
+            "pass_configs": {},
+            "configuration": {
+                "heads": heads,
+                "head_dimension": head_dimension,
+                "block_M": block_m,
+                "block_N": block_n,
+                "num_stages": 1,
+                "threads": 256,
+            },
+            "scope_note": "public varlen-attention backward guarded-staging reproduction",
+        },
     ]
 
 
@@ -547,6 +640,8 @@ def pass_configs_for_mode(base_configs: dict[str, Any], mode: str) -> dict[str, 
         mode == "planner_int4x2_unpack_legacy"
     )
     pass_configs[AUTO_LAUNCH_BOUNDS_CONFIG_KEY] = mode == "planner_auto_lb"
+    if mode == "planner_sync_predicated_copy":
+        pass_configs[ASYNC_COPY_CONFIG_KEY] = False
     if mode == "planner_nvcc_extra_vectorization":
         compile_flags = pass_configs.get(DEVICE_COMPILE_FLAGS_CONFIG_KEY, [])
         if isinstance(compile_flags, str):
@@ -691,6 +786,9 @@ def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                     "packed_types": packed_types(source),
                     "packed_type_occurrences": len(PACKED_TYPE_RE.findall(source)),
                     "int4x2_unpack_occurrences": source.count("tl_unpack_int4x2("),
+                    "cp_async_source_occurrences": len(
+                        re.findall(r"\bcp_async_gs(?:_conditional)?<", source)
+                    ),
                     "launch_bounds_min_blocks": launch_blocks or 1,
                     "launch_bounds_rewrites": launch_bounds_rewrites,
                     "kernel_launches": kernel_launches,
@@ -738,6 +836,7 @@ def parse_sass(sass: str) -> dict[str, Any]:
             "global_store": count_prefixes("STG"),
             "local_load": count_prefixes("LDL"),
             "local_store": count_prefixes("STL"),
+            "async_copy": count_prefixes("LDGSTS"),
         },
         "opcodes": dict(opcodes.most_common()),
     }
@@ -863,6 +962,9 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
     nvcc_vectorization_instruction_nonregressed = 0
     nvcc_vectorization_spill_nonregressed = 0
     nvcc_vectorization_strict_improvements = 0
+    predicated_async_source_restored = 0
+    predicated_async_sass_restored = 0
+    predicated_async_expected_controls = 0
     for workload in workload_records:
         by_key = {(case["arch"], case["mode"]): case for case in workload["cases"]}
         workload["comparisons"] = []
@@ -1147,6 +1249,63 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
                 nvcc_vectorization_instruction_nonregressed += int(instruction_safe)
                 nvcc_vectorization_spill_nonregressed += int(spill_safe)
                 nvcc_vectorization_strict_improvements += int(strict)
+        if (
+            "planner_sync_predicated_copy" in MODES
+            and workload["name"]
+            == "varlen_attention_guarded_stage_bwd_repro"
+        ):
+            workload["predicated_async_copy_comparisons"] = []
+            for arch in ARCHES:
+                planner = by_key[(arch, "planner")]
+                synchronous = by_key[(arch, "planner_sync_predicated_copy")]
+                sm_version = int(re.match(r"sm_(\d+)", arch).group(1))
+                supports_cp_async = sm_version >= 80
+                source_restored = (
+                    planner["cp_async_source_occurrences"] > 0
+                    and synchronous["cp_async_source_occurrences"] == 0
+                )
+                sass_restored = (
+                    planner["groups"]["async_copy"] > 0
+                    and synchronous["groups"]["async_copy"] == 0
+                )
+                expected_control = (
+                    planner["cp_async_source_occurrences"] == 0
+                    and synchronous["cp_async_source_occurrences"] == 0
+                    and planner["groups"]["async_copy"] == 0
+                    and synchronous["groups"]["async_copy"] == 0
+                )
+                workload["predicated_async_copy_comparisons"].append(
+                    {
+                        "arch": arch,
+                        "supports_cp_async": supports_cp_async,
+                        "source_restored": source_restored,
+                        "sass_restored": sass_restored,
+                        "expected_control": expected_control,
+                        "planner_minus_synchronous": {
+                            "cp_async_source_occurrences": planner[
+                                "cp_async_source_occurrences"
+                            ]
+                            - synchronous["cp_async_source_occurrences"],
+                            "async_copy_instructions": planner["groups"][
+                                "async_copy"
+                            ]
+                            - synchronous["groups"]["async_copy"],
+                            "global_load_instructions": planner["groups"][
+                                "global_load"
+                            ]
+                            - synchronous["groups"]["global_load"],
+                            "shared_store_instructions": planner["groups"][
+                                "shared_store"
+                            ]
+                            - synchronous["groups"]["shared_store"],
+                            "instruction_count": planner["instruction_count"]
+                            - synchronous["instruction_count"],
+                        },
+                    }
+                )
+                predicated_async_source_restored += int(source_restored)
+                predicated_async_sass_restored += int(sass_restored)
+                predicated_async_expected_controls += int(expected_control)
     if source_changed == 0 or sass_changed == 0 or planner_packed_gain == 0:
         raise RuntimeError(
             "planner/legacy trace produced no material source, SASS, or packed-type difference"
@@ -1180,6 +1339,34 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
             raise RuntimeError(
                 "scalar-exp2 fallback failed source-change, machine-code "
                 "nonregression, or strict-improvement acceptance"
+            )
+    if "planner_sync_predicated_copy" in MODES:
+        candidate = next(
+            (
+                workload
+                for workload in workload_records
+                if workload["name"]
+                == "varlen_attention_guarded_stage_bwd_repro"
+            ),
+            None,
+        )
+        if candidate is None:
+            raise RuntimeError(
+                "predicated cp.async scan requires the guarded-stage workload"
+            )
+        expected_supported = sum(
+            int(int(re.match(r"sm_(\d+)", arch).group(1)) >= 80)
+            for arch in ARCHES
+        )
+        expected_controls = len(ARCHES) - expected_supported
+        if (
+            predicated_async_source_restored != expected_supported
+            or predicated_async_sass_restored != expected_supported
+            or predicated_async_expected_controls != expected_controls
+        ):
+            raise RuntimeError(
+                "predicated cp.async lowering failed source, SASS, or "
+                "unsupported-architecture control acceptance"
             )
     return {
         "comparisons": comparisons,
@@ -1232,6 +1419,12 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
         "nvcc_extra_vectorization_strict_improvements": (
             nvcc_vectorization_strict_improvements
         ),
+        "predicated_async_copy_comparisons": len(ARCHES)
+        if "planner_sync_predicated_copy" in MODES
+        else 0,
+        "predicated_async_source_restored": predicated_async_source_restored,
+        "predicated_async_sass_restored": predicated_async_sass_restored,
+        "predicated_async_expected_controls": predicated_async_expected_controls,
     }
 
 
@@ -1800,6 +1993,38 @@ def write_report(payload: dict[str, Any]) -> None:
                     f"{planner['sass_sha256'] != candidate['sass_sha256']} |"
                 )
         lines.append("")
+    if "planner_sync_predicated_copy" in payload["modes"]:
+        lines.extend(
+            [
+                "## Predicated global-to-shared cp.async restoration",
+                "",
+                "| Workload | Arch | source cp.async sync→auto | SASS LDGSTS sync→auto | LDG sync→auto | STS sync→auto | instructions sync→auto |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for workload in payload["workloads"]:
+            if "predicated_async_copy_comparisons" not in workload:
+                continue
+            by_key = {
+                (case["arch"], case["mode"]): case for case in workload["cases"]
+            }
+            for arch in payload["architectures"]:
+                planner = by_key[(arch, "planner")]
+                synchronous = by_key[(arch, "planner_sync_predicated_copy")]
+                lines.append(
+                    f"| `{workload['name']}` | `{arch}` | "
+                    f"{synchronous['cp_async_source_occurrences']}→"
+                    f"{planner['cp_async_source_occurrences']} | "
+                    f"{synchronous['groups']['async_copy']}→"
+                    f"{planner['groups']['async_copy']} | "
+                    f"{synchronous['groups']['global_load']}→"
+                    f"{planner['groups']['global_load']} | "
+                    f"{synchronous['groups']['shared_store']}→"
+                    f"{planner['groups']['shared_store']} | "
+                    f"{synchronous['instruction_count']}→"
+                    f"{planner['instruction_count']} |"
+                )
+        lines.append("")
     if "planner_int4x2_unpack_legacy" in payload["modes"]:
         lines.extend(
             [
@@ -1859,7 +2084,7 @@ def main() -> int:
     enrich_launch_bounds_scan(workload_records, aggregate)
     enrich_auto_launch_bounds(workload_records, aggregate)
     payload = {
-        "schema": "tilelang-real-vectorization-workloads-v6",
+        "schema": "tilelang-real-vectorization-workloads-v7",
         "repository": REPOSITORY,
         "source_sha": SOURCE_SHA,
         "python": platform.python_version(),
