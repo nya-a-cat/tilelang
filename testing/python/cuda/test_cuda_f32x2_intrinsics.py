@@ -161,6 +161,24 @@ def _make_auto_vec_reduce_kernel(reduce_func, *, nan_propagate=False, annotation
     return main
 
 
+def _make_auto_vec_wide_reduce_kernel(reduce_func, *, width=4096, threads=128):
+    """Build a wide row reduction whose inferred local index is digit-permuted."""
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((1, width), dtype=T.float32),
+        C: T.Tensor((1,), dtype=T.float32),
+    ):
+        with T.Kernel(1, threads=threads):
+            src = T.alloc_fragment((1, width), T.float32)
+            dst = T.alloc_fragment((1,), T.float32)
+            T.copy(A, src)
+            reduce_func(src, dst, dim=1)
+            T.copy(dst, C)
+
+    return main
+
+
 def _make_auto_vec_batched_reduce_kernel(reduce_func, *, rows=M, width=64, threads=256, annotations=None):
     """Build a reduction that shuffles packed values between threads."""
 
@@ -383,6 +401,19 @@ def test_codegen_auto_vec_reduce_f32_sm100(op_name, reduce_func, packed_ops):
 
 
 @tilelang.testing.requires_cuda
+def test_codegen_auto_vec_wide_reduce_f32_sm100():
+    func = _make_auto_vec_wide_reduce_kernel(T.reduce_sum)
+    packed = _lower_to_cuda_source(func, target=SM100_TARGET)
+    rollback = _lower_to_cuda_source(
+        func,
+        target=SM100_TARGET,
+        pass_configs={tilelang.PassConfigKey.TL_ENABLE_FP32X2_REDUCTION: False},
+    )
+    assert "tl::add2" in packed
+    assert "tl::add2" not in rollback
+
+
+@tilelang.testing.requires_cuda
 @pytest.mark.parametrize("op_name,reduce_func", [("sum", T.reduce_sum), ("abssum", T.reduce_abssum)])
 def test_codegen_auto_vec_reduce_f32_disable_fadd2(op_name, reduce_func):
     func = _make_auto_vec_reduce_kernel(reduce_func, annotations={"enable_fadd2": False})
@@ -539,6 +570,16 @@ def test_correctness_auto_vec_reduce_f32(op_name, reduce_func):
     result = kernel(a)
     reference = _torch_reduce(a, op_name)
     torch.testing.assert_close(result, reference, atol=1e-5, rtol=1e-5)
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(10)
+def test_correctness_auto_vec_wide_reduce_f32():
+    func = _make_auto_vec_wide_reduce_kernel(T.reduce_sum)
+    kernel = tilelang.compile(func, out_idx=[1], target="cuda")
+    a = torch.randn((1, 4096), device="cuda", dtype=torch.float32)
+    result = kernel(a)
+    torch.testing.assert_close(result, torch.sum(a, dim=1), atol=1e-4, rtol=1e-5)
 
 
 @tilelang.testing.requires_cuda

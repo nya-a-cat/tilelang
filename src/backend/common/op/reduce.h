@@ -423,46 +423,94 @@ inline std::optional<std::string> MakeCodegenReducer(const ReduceOpNode &op,
   return std::nullopt;
 }
 
-inline bool CanUsePackedRamp(const PrimExpr &index, const Var &var, int vsize,
-                             arith::Analyzer *analyzer,
-                             std::string *failure_reason = nullptr) {
+/*! \brief Map one packed-loop iteration to the first scalar iteration in its
+ * lane group.
+ *
+ * Compressed local indices may permute mixed-radix iterator digits. Adjacent
+ * source elements can then be separated by `lane_stride` scalar iterations.
+ * For each block of `lane_stride * vsize` iterations this bijection enumerates
+ * the first `lane_stride` entries; adding `lane * lane_stride` covers every
+ * original iteration exactly once.
+ */
+inline PrimExpr PackedRampBaseIteration(const Var &var, int vsize,
+                                        int64_t lane_stride) {
+  PrimExpr stride = make_const(var.dtype(), lane_stride);
+  PrimExpr group = make_const(var.dtype(), lane_stride * vsize);
+  return FloorMod(var, stride) + FloorDiv(var, stride) * group;
+}
+
+inline std::optional<int64_t>
+FindPackedRampStride(const PrimExpr &index, const Var &var, int64_t extent,
+                     int vsize, arith::Analyzer *analyzer,
+                     std::string *failure_reason = nullptr) {
   ICHECK_GT(vsize, 1);
+  ICHECK_GE(extent, vsize);
+  ICHECK_EQ(extent % vsize, 0);
 
-  PrimExpr vector_size = make_const(var.dtype(), vsize);
-  PrimExpr packed_var = var * vector_size;
-  PrimExpr ramp_base =
-      analyzer->Simplify(Substitute(index, {{var, packed_var}}));
-
-  PrimExpr index_mod = FloorMod(ramp_base, make_const(index.dtype(), vsize));
-  if (!analyzer->CanProveEqual(index_mod, make_zero(index.dtype()))) {
-    if (failure_reason != nullptr) {
-      std::ostringstream os;
-      os << "unaligned ramp base: index=" << index
-         << ", packed_base=" << ramp_base
-         << ", base_mod=" << analyzer->Simplify(index_mod);
-      *failure_reason = os.str();
+  int64_t max_stride = extent / vsize;
+  std::vector<int64_t> candidate_strides;
+  for (int64_t divisor = 1; divisor <= max_stride / divisor; ++divisor) {
+    if (max_stride % divisor == 0) {
+      candidate_strides.push_back(divisor);
+      if (divisor != max_stride / divisor) {
+        candidate_strides.push_back(max_stride / divisor);
+      }
     }
-    return false;
   }
+  std::sort(candidate_strides.begin(), candidate_strides.end());
 
-  for (int lane = 1; lane < vsize; ++lane) {
-    PrimExpr lane_value = make_const(var.dtype(), lane);
-    PrimExpr lane_index =
-        analyzer->Simplify(Substitute(index, {{var, packed_var + lane_value}}));
-    PrimExpr expected =
-        analyzer->Simplify(ramp_base + make_const(index.dtype(), lane));
-    if (!analyzer->CanProveEqual(lane_index, expected)) {
+  for (int64_t lane_stride : candidate_strides) {
+    PrimExpr packed_var = PackedRampBaseIteration(var, vsize, lane_stride);
+    PrimExpr ramp_base =
+        analyzer->Simplify(Substitute(index, {{var, packed_var}}));
+
+    PrimExpr index_mod = FloorMod(ramp_base, make_const(index.dtype(), vsize));
+    if (!analyzer->CanProveEqual(index_mod, make_zero(index.dtype()))) {
       if (failure_reason != nullptr) {
         std::ostringstream os;
-        os << "non-contiguous lane " << lane << ": index=" << index
-           << ", lane_index=" << lane_index << ", expected=" << expected;
+        os << "stride " << lane_stride
+           << " has unaligned ramp base: index=" << index
+           << ", packed_base=" << ramp_base
+           << ", base_mod=" << analyzer->Simplify(index_mod);
         *failure_reason = os.str();
       }
-      return false;
+      continue;
+    }
+
+    bool contiguous = true;
+    for (int lane = 1; lane < vsize; ++lane) {
+      PrimExpr lane_value = make_const(var.dtype(), lane * lane_stride);
+      PrimExpr lane_index = analyzer->Simplify(
+          Substitute(index, {{var, packed_var + lane_value}}));
+      PrimExpr expected =
+          analyzer->Simplify(ramp_base + make_const(index.dtype(), lane));
+      if (!analyzer->CanProveEqual(lane_index, expected)) {
+        if (failure_reason != nullptr) {
+          std::ostringstream os;
+          os << "stride " << lane_stride << " has non-contiguous lane " << lane
+             << ": index=" << index << ", lane_index=" << lane_index
+             << ", expected=" << expected;
+          *failure_reason = os.str();
+        }
+        contiguous = false;
+        break;
+      }
+    }
+    if (contiguous) {
+      if (failure_reason != nullptr) {
+        failure_reason->clear();
+      }
+      return lane_stride;
     }
   }
 
-  return true;
+  if (failure_reason != nullptr && failure_reason->empty()) {
+    std::ostringstream os;
+    os << "no legal lane stride for index=" << index << ", extent=" << extent
+       << ", vsize=" << vsize;
+    *failure_reason = os.str();
+  }
+  return std::nullopt;
 }
 
 struct ThreadReduceStep {
@@ -947,11 +995,13 @@ template <typename Impl> struct ReduceLowerer {
         const bool reducer_eligible =
             vsize > 1 && reduce::MakeCodegenReducer(op, vsize).has_value();
         std::string ramp_failure_reason;
-        const bool ramp_eligible =
-            extent_eligible && reducer_eligible &&
-            reduce::CanUsePackedRamp(src_indice_compressed.back(),
-                                     src_var_compressed.back()->var, vsize,
-                                     analyzer, &ramp_failure_reason);
+        std::optional<int64_t> packed_lane_stride;
+        if (extent_eligible && reducer_eligible) {
+          packed_lane_stride = reduce::FindPackedRampStride(
+              src_indice_compressed.back(), src_var_compressed.back()->var,
+              ext->value, vsize, analyzer, &ramp_failure_reason);
+        }
+        const bool ramp_eligible = packed_lane_stride.has_value();
         if (tl_config::ReducerPlanVerboseEnabled()) {
           LOG(INFO) << "[ReducePackedPlan] src=" << op.src->name
                     << ", dst=" << op.dst->name << ", vsize=" << vsize
@@ -960,7 +1010,10 @@ template <typename Impl> struct ReduceLowerer {
                     << ", has_inner_var=" << has_inner_var
                     << ", extent_eligible=" << extent_eligible
                     << ", reducer_eligible=" << reducer_eligible
-                    << ", ramp_eligible=" << ramp_eligible
+                    << ", ramp_eligible=" << ramp_eligible << ", lane_stride="
+                    << (packed_lane_stride.has_value()
+                            ? std::to_string(packed_lane_stride.value())
+                            : "none")
                     << ", decision=" << (ramp_eligible ? "packed" : "scalar")
                     << (ramp_failure_reason.empty()
                             ? ""
@@ -992,9 +1045,10 @@ template <typename Impl> struct ReduceLowerer {
 
           IterVar inner_var = src_var_compressed.back();
 
-          PrimExpr ramp_base =
-              Substitute(src_indice_compressed.back(),
-                         {{inner_var->var, inner_var->var * Integer(2)}});
+          PrimExpr packed_iteration = reduce::PackedRampBaseIteration(
+              inner_var->var, vsize, packed_lane_stride.value());
+          PrimExpr ramp_base = Substitute(src_indice_compressed.back(),
+                                          {{inner_var->var, packed_iteration}});
           src_indice_compressed.Set(
               src_indice_compressed.size() - 1,
               Ramp(ramp_base, IntImm(DataType::Int(32), 1), vsize));
