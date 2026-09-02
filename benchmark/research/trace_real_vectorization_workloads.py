@@ -62,6 +62,7 @@ BASE_MODES = {
     "planner_int4x2_unpack_legacy",
 }
 REGISTER_USAGE_MODE_RE = re.compile(r"planner_ru(?P<level>\d+)$")
+LAUNCH_BOUNDS_MODE_RE = re.compile(r"planner_lb(?P<blocks>\d+)$")
 DEFAULT_ARCHES = "sm_75,sm_80,sm_90a,sm_100a,sm_120a"
 RESULT_PATH = Path(
     os.environ.get(
@@ -109,7 +110,9 @@ if len(set(WORKLOAD_NAMES)) != len(WORKLOAD_NAMES):
 invalid_modes = [
     mode
     for mode in MODES
-    if mode not in BASE_MODES and REGISTER_USAGE_MODE_RE.fullmatch(mode) is None
+    if mode not in BASE_MODES
+    and REGISTER_USAGE_MODE_RE.fullmatch(mode) is None
+    and LAUNCH_BOUNDS_MODE_RE.fullmatch(mode) is None
 ]
 invalid_register_levels = [
     mode
@@ -117,17 +120,24 @@ invalid_register_levels = [
     if (match := REGISTER_USAGE_MODE_RE.fullmatch(mode)) is not None
     and not 0 <= int(match.group("level")) <= 10
 ]
+invalid_launch_bounds = [
+    mode
+    for mode in MODES
+    if (match := LAUNCH_BOUNDS_MODE_RE.fullmatch(mode)) is not None
+    and not 2 <= int(match.group("blocks")) <= 8
+]
 if (
     not MODES
     or len(set(MODES)) != len(MODES)
     or not {"planner", "legacy"} <= set(MODES)
     or invalid_modes
     or invalid_register_levels
+    or invalid_launch_bounds
 ):
     raise ValueError(
         "TILELANG_REAL_VECTOR_MODES must contain planner and legacy; optional modes are "
         "planner_inplace, planner_reinterpret_legacy, planner_int4x2_unpack_legacy, "
-        "and planner_ru0 through planner_ru10"
+        "planner_ru0 through planner_ru10, and planner_lb2 through planner_lb8"
     )
 if MAX_WORKERS < 1:
     raise ValueError("TILELANG_REAL_VECTOR_COMPILE_WORKERS must be positive")
@@ -262,6 +272,29 @@ def register_usage_level(mode: str) -> int | None:
     return int(match.group("level")) if match is not None else None
 
 
+def launch_bounds_blocks(mode: str) -> int | None:
+    match = LAUNCH_BOUNDS_MODE_RE.fullmatch(mode)
+    return int(match.group("blocks")) if match is not None else None
+
+
+def rewrite_launch_bounds(source: str, blocks: int) -> tuple[str, int]:
+    """Change only CUDA's min-blocks launch-bound argument.
+
+    The lowering pipeline is kept byte-identical across the scan.  Rewriting
+    generated source isolates ptxas register allocation from every TileLang IR
+    and schedule decision.
+    """
+
+    rewritten, count = re.subn(
+        r"(__launch_bounds__\(\s*\d+\s*,\s*)1(\s*\))",
+        rf"\g<1>{blocks}\g<2>",
+        source,
+    )
+    if count == 0:
+        raise RuntimeError("launch-bound scan found no CUDA min-blocks argument")
+    return rewritten, count
+
+
 def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     workload_records: list[dict[str, Any]] = []
     compile_inputs: list[dict[str, Any]] = []
@@ -305,6 +338,13 @@ def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                 source = str(artifact.kernel_source or "")
                 if not source.strip():
                     raise RuntimeError(f"empty CUDA source for {workload['name']}/{arch}/{mode}")
+                lowered_source_sha256 = sha256_text(source)
+                launch_blocks = launch_bounds_blocks(mode)
+                launch_bounds_rewrites = 0
+                if launch_blocks is not None:
+                    source, launch_bounds_rewrites = rewrite_launch_bounds(
+                        source, launch_blocks
+                    )
                 case_dir = RAW_DIR / workload["name"] / arch / mode
                 case_dir.mkdir(parents=True, exist_ok=True)
                 source_path = case_dir / "kernel.cu"
@@ -314,10 +354,13 @@ def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                     "mode": mode,
                     "lower_seconds": time.perf_counter() - started,
                     "source_sha256": sha256_text(source),
+                    "lowered_source_sha256": lowered_source_sha256,
                     "source_bytes": len(source.encode()),
                     "packed_types": packed_types(source),
                     "packed_type_occurrences": len(PACKED_TYPE_RE.findall(source)),
                     "int4x2_unpack_occurrences": source.count("tl_unpack_int4x2("),
+                    "launch_bounds_min_blocks": launch_blocks or 1,
+                    "launch_bounds_rewrites": launch_bounds_rewrites,
                     "source_path": source_path.relative_to(RAW_DIR).as_posix(),
                 }
                 record["cases"].append(case)
@@ -686,6 +729,97 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
+def enrich_launch_bounds_scan(
+    workload_records: list[dict[str, Any]], aggregate: dict[str, Any]
+) -> None:
+    launch_modes = [mode for mode in MODES if launch_bounds_blocks(mode) is not None]
+    if not launch_modes:
+        aggregate.update(
+            {
+                "launch_bounds_comparisons": 0,
+                "launch_bounds_register_reduced": 0,
+                "launch_bounds_instruction_nonregressed": 0,
+                "launch_bounds_spill_free": 0,
+                "launch_bounds_static_candidates": 0,
+            }
+        )
+        return
+
+    register_reduced = 0
+    instruction_nonregressed = 0
+    spill_free = 0
+    static_candidates = 0
+    comparisons = 0
+
+    def max_resource(case: dict[str, Any], field: str) -> int:
+        return max(
+            (int(resource[field]) for resource in case["resources"].values()),
+            default=0,
+        )
+
+    def sum_resource(case: dict[str, Any], field: str) -> int:
+        return sum(int(resource[field]) for resource in case["resources"].values())
+
+    for workload in workload_records:
+        by_key = {(case["arch"], case["mode"]): case for case in workload["cases"]}
+        workload["launch_bounds_comparisons"] = []
+        for arch in ARCHES:
+            planner = by_key[(arch, "planner")]
+            planner_regs = max_resource(planner, "n_regs")
+            for mode in launch_modes:
+                candidate = by_key[(arch, mode)]
+                candidate_regs = max_resource(candidate, "n_regs")
+                spill_stores = sum_resource(candidate, "spill_store_bytes")
+                spill_loads = sum_resource(candidate, "spill_load_bytes")
+                source_isolated = (
+                    candidate["lowered_source_sha256"]
+                    == planner["lowered_source_sha256"]
+                )
+                if not source_isolated:
+                    raise RuntimeError(
+                        f"launch-bound mode changed TileLang lowering for "
+                        f"{workload['name']}/{arch}/{mode}"
+                    )
+                reduced = candidate_regs < planner_regs
+                nonregressed = (
+                    candidate["instruction_count"] <= planner["instruction_count"]
+                )
+                zero_spill = spill_stores == 0 and spill_loads == 0
+                viable = reduced and nonregressed and zero_spill
+                comparison = {
+                    "arch": arch,
+                    "mode": mode,
+                    "min_blocks_per_sm": launch_bounds_blocks(mode),
+                    "source_isolated": source_isolated,
+                    "static_candidate": viable,
+                    "candidate_minus_planner": {
+                        "cubin_bytes": candidate["cubin_bytes"]
+                        - planner["cubin_bytes"],
+                        "instruction_count": candidate["instruction_count"]
+                        - planner["instruction_count"],
+                        "max_registers": candidate_regs - planner_regs,
+                        "spill_store_bytes": spill_stores,
+                        "spill_load_bytes": spill_loads,
+                    },
+                }
+                workload["launch_bounds_comparisons"].append(comparison)
+                register_reduced += int(reduced)
+                instruction_nonregressed += int(nonregressed)
+                spill_free += int(zero_spill)
+                static_candidates += int(viable)
+                comparisons += 1
+
+    aggregate.update(
+        {
+            "launch_bounds_comparisons": comparisons,
+            "launch_bounds_register_reduced": register_reduced,
+            "launch_bounds_instruction_nonregressed": instruction_nonregressed,
+            "launch_bounds_spill_free": spill_free,
+            "launch_bounds_static_candidates": static_candidates,
+        }
+    )
+
+
 def write_report(payload: dict[str, Any]) -> None:
     lines = [
         "# Frozen real-workload vectorization trace",
@@ -786,6 +920,55 @@ def write_report(payload: dict[str, Any]) -> None:
                         f"{planner_regs}→{candidate_regs} | {spill_stores}/{spill_loads} |"
                     )
         lines.append("")
+    launch_modes = [
+        mode for mode in payload["modes"] if launch_bounds_blocks(mode) is not None
+    ]
+    if launch_modes:
+        lines.extend(
+            [
+                "## CUDA launch-bound scan",
+                "",
+                "| Workload | Arch | min blocks/SM | instructions planner→candidate | registers planner→candidate | spill stores/loads (bytes) | static candidate |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for workload in payload["workloads"]:
+            by_key = {
+                (case["arch"], case["mode"]): case for case in workload["cases"]
+            }
+            for arch in payload["architectures"]:
+                planner = by_key[(arch, "planner")]
+                planner_regs = max(
+                    (
+                        int(resource["n_regs"])
+                        for resource in planner["resources"].values()
+                    ),
+                    default=0,
+                )
+                comparisons = {
+                    comparison["mode"]: comparison
+                    for comparison in workload["launch_bounds_comparisons"]
+                    if comparison["arch"] == arch
+                }
+                for mode in launch_modes:
+                    candidate = by_key[(arch, mode)]
+                    candidate_regs = max(
+                        (
+                            int(resource["n_regs"])
+                            for resource in candidate["resources"].values()
+                        ),
+                        default=0,
+                    )
+                    delta = comparisons[mode]["candidate_minus_planner"]
+                    lines.append(
+                        f"| `{workload['name']}` | `{arch}` | "
+                        f"{launch_bounds_blocks(mode)} | "
+                        f"{planner['instruction_count']}→{candidate['instruction_count']} | "
+                        f"{planner_regs}→{candidate_regs} | "
+                        f"{delta['spill_store_bytes']}/{delta['spill_load_bytes']} | "
+                        f"{comparisons[mode]['static_candidate']} |"
+                    )
+        lines.append("")
     if "planner_reinterpret_legacy" in payload["modes"]:
         lines.extend(
             [
@@ -872,6 +1055,7 @@ def main() -> int:
     workload_records, compile_inputs = lower_sources(workloads)
     compile_all(compile_inputs)
     aggregate = enrich_comparisons(workload_records)
+    enrich_launch_bounds_scan(workload_records, aggregate)
     payload = {
         "schema": "tilelang-real-vectorization-workloads-v1",
         "repository": REPOSITORY,
