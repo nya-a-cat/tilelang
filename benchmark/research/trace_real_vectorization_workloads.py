@@ -551,7 +551,25 @@ def compile_all(compile_inputs: list[dict[str, Any]]) -> None:
         }
         for future in concurrent.futures.as_completed(future_to_item):
             item = future_to_item[future]
-            compiled = future.result()
+            try:
+                compiled = future.result()
+            except RuntimeError as error:
+                if launch_bounds_blocks(item["mode"]) is None:
+                    raise
+                error_text = str(error).strip() or type(error).__name__
+                diagnostics = [
+                    line.strip()
+                    for line in error_text.splitlines()
+                    if "ptxas " in line.lower()
+                ]
+                item["case"]["compile_error"] = (
+                    "\n".join(diagnostics[-8:]) or error_text.splitlines()[-1]
+                )
+                print(
+                    f"rejected {item['workload']}/{item['arch']}/{item['mode']}: "
+                    f"{item['case']['compile_error']}"
+                )
+                continue
             item["case"].update(compiled)
             print(
                 f"compiled {item['workload']}/{item['arch']}/{item['mode']}: "
@@ -827,6 +845,7 @@ def enrich_launch_bounds_scan(
                 "launch_bounds_instruction_nonregressed": 0,
                 "launch_bounds_spill_free": 0,
                 "launch_bounds_static_candidates": 0,
+                "launch_bounds_compile_failures": 0,
             }
         )
         return
@@ -835,6 +854,7 @@ def enrich_launch_bounds_scan(
     instruction_nonregressed = 0
     spill_free = 0
     static_candidates = 0
+    compile_failures = 0
     comparisons = 0
 
     def max_resource(case: dict[str, Any], field: str) -> int:
@@ -854,9 +874,6 @@ def enrich_launch_bounds_scan(
             planner_regs = max_resource(planner, "n_regs")
             for mode in launch_modes:
                 candidate = by_key[(arch, mode)]
-                candidate_regs = max_resource(candidate, "n_regs")
-                spill_stores = sum_resource(candidate, "spill_store_bytes")
-                spill_loads = sum_resource(candidate, "spill_load_bytes")
                 source_isolated = (
                     candidate["lowered_source_sha256"]
                     == planner["lowered_source_sha256"]
@@ -866,6 +883,23 @@ def enrich_launch_bounds_scan(
                         f"launch-bound mode changed TileLang lowering for "
                         f"{workload['name']}/{arch}/{mode}"
                     )
+                if compile_error := candidate.get("compile_error"):
+                    workload["launch_bounds_comparisons"].append(
+                        {
+                            "arch": arch,
+                            "mode": mode,
+                            "min_blocks_per_sm": launch_bounds_blocks(mode),
+                            "source_isolated": source_isolated,
+                            "static_candidate": False,
+                            "compile_error": compile_error,
+                        }
+                    )
+                    compile_failures += 1
+                    comparisons += 1
+                    continue
+                candidate_regs = max_resource(candidate, "n_regs")
+                spill_stores = sum_resource(candidate, "spill_store_bytes")
+                spill_loads = sum_resource(candidate, "spill_load_bytes")
                 reduced = candidate_regs < planner_regs
                 nonregressed = (
                     candidate["instruction_count"] <= planner["instruction_count"]
@@ -902,6 +936,7 @@ def enrich_launch_bounds_scan(
             "launch_bounds_instruction_nonregressed": instruction_nonregressed,
             "launch_bounds_spill_free": spill_free,
             "launch_bounds_static_candidates": static_candidates,
+            "launch_bounds_compile_failures": compile_failures,
         }
     )
 
@@ -1038,6 +1073,14 @@ def write_report(payload: dict[str, Any]) -> None:
                 }
                 for mode in launch_modes:
                     candidate = by_key[(arch, mode)]
+                    comparison = comparisons[mode]
+                    if compile_error := comparison.get("compile_error"):
+                        lines.append(
+                            f"| `{workload['name']}` | `{arch}` | "
+                            f"{launch_bounds_blocks(mode)} | compile failed | "
+                            f"compile failed | n/a | False |"
+                        )
+                        continue
                     candidate_regs = max(
                         (
                             int(resource["n_regs"])
@@ -1045,14 +1088,14 @@ def write_report(payload: dict[str, Any]) -> None:
                         ),
                         default=0,
                     )
-                    delta = comparisons[mode]["candidate_minus_planner"]
+                    delta = comparison["candidate_minus_planner"]
                     lines.append(
                         f"| `{workload['name']}` | `{arch}` | "
                         f"{launch_bounds_blocks(mode)} | "
                         f"{planner['instruction_count']}→{candidate['instruction_count']} | "
                         f"{planner_regs}→{candidate_regs} | "
                         f"{delta['spill_store_bytes']}/{delta['spill_load_bytes']} | "
-                        f"{comparisons[mode]['static_candidate']} |"
+                        f"{comparison['static_candidate']} |"
                     )
         lines.append("")
     if "planner_reinterpret_legacy" in payload["modes"]:
@@ -1143,7 +1186,7 @@ def main() -> int:
     aggregate = enrich_comparisons(workload_records)
     enrich_launch_bounds_scan(workload_records, aggregate)
     payload = {
-        "schema": "tilelang-real-vectorization-workloads-v1",
+        "schema": "tilelang-real-vectorization-workloads-v2",
         "repository": REPOSITORY,
         "source_sha": SOURCE_SHA,
         "python": platform.python_version(),
