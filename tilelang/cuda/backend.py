@@ -28,6 +28,21 @@ _CUDA_DEFAULT_LAUNCH_BOUNDS_PATTERN = re.compile(
     r"(__launch_bounds__\(\s*\d+\s*,\s*)1(\s*\))"
 )
 _AUTO_LAUNCH_BOUNDS_MIN_REGISTERS = 224
+# CUDA Programming Guide tables 30-31: resident threads and shared memory per
+# SM. The selector only needs targets with an explicit architectural contract;
+# unknown targets retain the established high-register fallback below.
+_CUDA_OCCUPANCY_LIMITS = {
+    75: (1024, 64 * 1024),
+    80: (2048, 164 * 1024),
+    86: (1536, 100 * 1024),
+    87: (2048, 164 * 1024),
+    89: (1536, 100 * 1024),
+    90: (2048, 228 * 1024),
+    100: (2048, 228 * 1024),
+    120: (1536, 128 * 1024),
+}
+_CUDA_REGISTERS_PER_SM = 64 * 1024
+_CUDA_SHARED_MEMORY_RESERVATION_PER_BLOCK = 1024
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +93,87 @@ def _rewrite_default_launch_bounds(code: str, min_blocks_per_sm: int) -> tuple[s
     )
 
 
+def _collect_cuda_launch_resources(device_mod) -> dict[str, dict[str, int]]:
+    if device_mod is None:
+        return {}
+
+    launches: dict[str, dict[str, int]] = {}
+    for global_var, base_func in device_mod.functions.items():
+        attrs = base_func.attrs
+        if not attrs:
+            continue
+        symbol = (
+            str(attrs["global_symbol"])
+            if "global_symbol" in attrs
+            else global_var.name_hint
+        )
+        threads_per_block = 1
+        if "thread_extent" not in attrs:
+            continue
+        try:
+            for tag, extent in attrs["thread_extent"].items():
+                if str(tag).startswith("threadIdx."):
+                    threads_per_block *= int(extent)
+            dynamic_shared_memory_bytes = int(
+                attrs["dyn_shared_memory_buf"]
+                if "dyn_shared_memory_buf" in attrs
+                else 0
+            )
+        except (TypeError, ValueError):
+            continue
+        launches[symbol] = {
+            "threads_per_block": threads_per_block,
+            "dynamic_shared_memory_bytes": dynamic_shared_memory_bytes,
+        }
+    return launches
+
+
+def _should_try_auto_launch_bounds(
+    baseline: dict[str, KernelResourceUsage],
+    target,
+    launch_resources: dict[str, dict[str, int]],
+) -> bool:
+    if not baseline:
+        return False
+    if not launch_resources:
+        return max(item.n_regs for item in baseline.values()) >= (
+            _AUTO_LAUNCH_BOUNDS_MIN_REGISTERS
+        )
+
+    target_arch, _ = nvcc.get_target_arch_and_code(target)
+    match = re.match(r"(?P<sm>\d+)", str(target_arch))
+    limits = _CUDA_OCCUPANCY_LIMITS.get(int(match.group("sm"))) if match else None
+    if limits is None:
+        return max(item.n_regs for item in baseline.values()) >= (
+            _AUTO_LAUNCH_BOUNDS_MIN_REGISTERS
+        )
+
+    max_threads_per_sm, shared_memory_per_sm = limits
+    for name, usage in baseline.items():
+        launch = launch_resources.get(name)
+        if launch is None:
+            continue
+        threads_per_block = launch["threads_per_block"]
+        block_shared_memory = (
+            usage.shared_bytes
+            + launch["dynamic_shared_memory_bytes"]
+            + _CUDA_SHARED_MEMORY_RESERVATION_PER_BLOCK
+        )
+        two_blocks_fit_nonregister_resources = (
+            2 * threads_per_block <= max_threads_per_sm
+            and 2 * block_shared_memory <= shared_memory_per_sm
+        )
+        baseline_registers_limit_to_one_block = (
+            usage.n_regs * threads_per_block > _CUDA_REGISTERS_PER_SM // 2
+        )
+        if two_blocks_fit_nonregister_resources and (
+            usage.n_regs >= _AUTO_LAUNCH_BOUNDS_MIN_REGISTERS
+            or baseline_registers_limit_to_one_block
+        ):
+            return True
+    return False
+
+
 def _auto_launch_bounds_candidate_is_safe(
     baseline: dict[str, KernelResourceUsage],
     candidate: dict[str, KernelResourceUsage],
@@ -85,8 +181,6 @@ def _auto_launch_bounds_candidate_is_safe(
     candidate_binary: bytes | bytearray,
 ) -> bool:
     if not baseline or baseline.keys() != candidate.keys():
-        return False
-    if max(item.n_regs for item in baseline.values()) < _AUTO_LAUNCH_BOUNDS_MIN_REGISTERS:
         return False
     if len(candidate_binary) > len(baseline_binary):
         return False
@@ -106,7 +200,7 @@ def _auto_launch_bounds_candidate_is_safe(
     return reduced
 
 
-def _compile_with_auto_launch_bounds(code, target, pass_config):
+def _compile_with_auto_launch_bounds(code, target, pass_config, device_mod=None):
     base_config = dict(pass_config)
     base_config.pop(PassConfigKey.TL_ENABLE_AUTO_LAUNCH_BOUNDS, None)
     selected_binary: bytes | bytearray
@@ -120,11 +214,9 @@ def _compile_with_auto_launch_bounds(code, target, pass_config):
         selected_usage = baseline_usage
 
         candidate_code, rewrite_count = _rewrite_default_launch_bounds(code, 2)
-        if (
-            rewrite_count
-            and baseline_usage
-            and max(item.n_regs for item in baseline_usage.values())
-            >= _AUTO_LAUNCH_BOUNDS_MIN_REGISTERS
+        launch_resources = _collect_cuda_launch_resources(device_mod)
+        if rewrite_count and _should_try_auto_launch_bounds(
+            baseline_usage, target, launch_resources
         ):
             reset_recorder()
             try:
@@ -163,7 +255,7 @@ def _compile_with_auto_launch_bounds(code, target, pass_config):
     return selected_binary
 
 
-def tilelang_callback_cuda_compile(code, target, pass_config=None):
+def tilelang_callback_cuda_compile(code, target, pass_config=None, device_mod=None):
     from tilelang.cache.cuda_binary_cache import CUDABinaryCache
 
     target_arch, target_code = nvcc.get_target_arch_and_code(target)
@@ -180,7 +272,7 @@ def tilelang_callback_cuda_compile(code, target, pass_config=None):
         cfg.get(PassConfigKey.TL_ENABLE_AUTO_LAUNCH_BOUNDS, False)
     )
     if enable_auto_launch_bounds and compile_format == "cubin":
-        return _compile_with_auto_launch_bounds(code, target, cfg)
+        return _compile_with_auto_launch_bounds(code, target, cfg, device_mod)
     enable_fast_math = bool(cfg.get(PassConfigKey.TL_ENABLE_FAST_MATH, False))
     ptxas_usage_level = cfg.get(PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL, None)
     if ptxas_usage_level is not None:

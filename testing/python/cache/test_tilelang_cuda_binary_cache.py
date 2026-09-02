@@ -184,6 +184,92 @@ def test_cuda_auto_launch_bounds_skips_low_register_kernel(monkeypatch, tmp_path
     assert pop_auto_launch_bounds_selection() == 1
 
 
+def test_cuda_auto_launch_bounds_uses_launch_resources_for_register_limited_kernel(
+    monkeypatch, tmp_path
+):
+    _set_cache_dirs(monkeypatch, tmp_path)
+    from tilelang.cuda import backend as cuda_backend
+
+    monkeypatch.setattr(env, "TILELANG_KERNEL_CACHE_USE_LIB_STAMP", "0")
+    monkeypatch.setattr(
+        cuda_backend,
+        "_collect_cuda_launch_resources",
+        lambda _device_mod: {
+            "kernel": {
+                "threads_per_block": 384,
+                "dynamic_shared_memory_bytes": 36 * 1024,
+            }
+        },
+    )
+    compile_sources = []
+
+    def fake_compile_cuda(code, target_format, arch, options=None, verbose=False):
+        compile_sources.append(code)
+        if "__launch_bounds__(384, 2)" in code:
+            _record_fake_cuda_usage(80)
+            return bytearray(b"opt")
+        _record_fake_cuda_usage(168)
+        return bytearray(b"baseline")
+
+    monkeypatch.setattr(cuda_backend.nvcc, "compile_cuda", fake_compile_cuda)
+    target = Target({"kind": "cuda", "arch": "sm_90a"})
+    source = 'extern "C" __global__ void __launch_bounds__(384, 1) kernel() {}'
+
+    reset_recorder()
+    result = cuda_backend.tilelang_callback_cuda_compile(
+        source,
+        target,
+        {tilelang.PassConfigKey.TL_ENABLE_AUTO_LAUNCH_BOUNDS: True},
+        object(),
+    )
+    usage = pop_recorded()
+
+    assert bytes(result) == b"opt"
+    assert len(compile_sources) == 2
+    assert usage["kernel"].n_regs == 80
+    assert pop_auto_launch_bounds_selection() == 2
+
+
+def test_cuda_auto_launch_bounds_skips_when_shared_memory_prevents_two_blocks(
+    monkeypatch, tmp_path
+):
+    _set_cache_dirs(monkeypatch, tmp_path)
+    from tilelang.cuda import backend as cuda_backend
+
+    monkeypatch.setattr(env, "TILELANG_KERNEL_CACHE_USE_LIB_STAMP", "0")
+    monkeypatch.setattr(
+        cuda_backend,
+        "_collect_cuda_launch_resources",
+        lambda _device_mod: {
+            "kernel": {
+                "threads_per_block": 384,
+                "dynamic_shared_memory_bytes": 36 * 1024,
+            }
+        },
+    )
+    compile_sources = []
+
+    def fake_compile_cuda(code, target_format, arch, options=None, verbose=False):
+        compile_sources.append(code)
+        _record_fake_cuda_usage(168)
+        return bytearray(b"baseline")
+
+    monkeypatch.setattr(cuda_backend.nvcc, "compile_cuda", fake_compile_cuda)
+    target = Target({"kind": "cuda", "arch": "sm_75"})
+    source = 'extern "C" __global__ void __launch_bounds__(384, 1) kernel() {}'
+
+    result = cuda_backend.tilelang_callback_cuda_compile(
+        source,
+        target,
+        {tilelang.PassConfigKey.TL_ENABLE_AUTO_LAUNCH_BOUNDS: True},
+        object(),
+    )
+
+    assert bytes(result) == b"baseline"
+    assert compile_sources == [source]
+    assert pop_auto_launch_bounds_selection() == 1
+
+
 def test_cuda_binary_cache_corrupted_entry_recompiles(monkeypatch, tmp_path):
     _set_cache_dirs(monkeypatch, tmp_path)
     from tilelang.cuda import backend as cuda_backend

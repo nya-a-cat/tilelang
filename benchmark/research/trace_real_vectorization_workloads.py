@@ -644,6 +644,7 @@ def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                         )
                     lowered_sources[source_mode] = {
                         "source": source,
+                        "device_mod": artifact.device_mod,
                         "kernel_launches": extract_kernel_launch_metadata(
                             artifact.device_mod
                         ),
@@ -688,6 +689,7 @@ def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                         "mode": mode,
                         "source": source,
                         "source_path": source_path,
+                        "device_mod": lowered["device_mod"],
                         "pass_configs": pass_configs_for_mode(
                             workload["pass_configs"], mode
                         ),
@@ -735,6 +737,7 @@ def compile_case(item: dict[str, Any], nvdisasm: str) -> dict[str, Any]:
             item["source"],
             target,
             item["pass_configs"],
+            item["device_mod"],
         )
     )
     auto_launch_bounds_selection = pop_auto_launch_bounds_selection()

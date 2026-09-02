@@ -124,10 +124,10 @@ Module BuildTileLangCUDA(IRModule mod, Target target) {
   std::string fmt = "ptx";
   std::string ptx;
   if (const auto f = Function::GetGlobal("tilelang_callback_cuda_compile")) {
-    // Fetch current pass context config and pass into the compile callback
+    // Pass current config and launch-resource attrs into the compile callback.
     tvm::transform::PassContext pass_ctx =
         tvm::transform::PassContext::Current();
-    ptx = (*f)(code, target, pass_ctx->config).cast<std::string>();
+    ptx = (*f)(code, target, pass_ctx->config, mod).cast<std::string>();
     if (ptx[0] != '/')
       fmt = "cubin";
   } else {
