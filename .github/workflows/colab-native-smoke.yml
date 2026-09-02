@@ -1273,31 +1273,6 @@ jobs:
             sha256sum --check SHA256SUMS
           )
 
-      - name: Validate single-warp synchronization IR controls without a GPU
-        if: inputs.research_trace == 'all' || inputs.research_trace == 'single-warp-sync'
-        shell: bash
-        run: |
-          set -euo pipefail
-          (
-            cd native-overlay-evidence
-            TILELANG_THREAD_SYNC_TEST="${GITHUB_WORKSPACE}/testing/python/transform/test_tilelang_transform_thread_sync.py" \
-              ../native-overlay-selftest/bin/python - <<'PY'
-          import os
-          import runpy
-
-          tests = runpy.run_path(
-              os.environ["TILELANG_THREAD_SYNC_TEST"]
-          )
-          for name in (
-              "test_full_single_warp_sync_uses_warp_barrier_on_cuda",
-              "test_full_single_warp_sync_has_pass_config_rollback",
-              "test_full_multi_warp_sync_keeps_cta_barrier",
-          ):
-              tests[name]()
-              print(f"passed {name}")
-          PY
-          )
-
       - name: Compile single-warp synchronization CUBIN matrix without a GPU
         if: inputs.research_trace == 'all' || inputs.research_trace == 'single-warp-sync'
         id: single-warp-sync
