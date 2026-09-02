@@ -60,6 +60,9 @@ static constexpr const char *kDisableInt4x2UnpackPeephole =
 // AllReduce. Intended for same-build CUBIN/runtime A/B validation.
 static constexpr const char *kDisableWarpAggregateRedux =
     "tl.disable_warp_aggregate_redux";
+/*! \brief Keep full-CTA shared-memory barriers for single-warp CUDA CTAs. */
+static constexpr const char *kDisableSingleWarpStorageSync =
+    "tl.disable_single_warp_storage_sync";
 
 // fast math related op
 // __exp(x) - fast exponential

@@ -246,7 +246,9 @@ def compile_all(inputs: list[dict[str, Any]]) -> None:
 def build_comparisons(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     by_key = {(item["name"], item["arch"], item["mode"]): item for item in records}
     comparisons = []
-    machine_code_swaps = 0
+    machine_code_narrowings = 0
+    machine_code_eliminations = 0
+    explicit_warp_barriers = 0
     spill_free = 0
     for spec in CASES:
         for arch in ARCHES:
@@ -258,18 +260,32 @@ def build_comparisons(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any
                 int(resource["spill_store_bytes"]) + int(resource["spill_load_bytes"])
                 for resource in default_resources + rollback_resources
             )
-            machine_swap = (
-                default["groups"]["warp_barrier"] == rollback["groups"]["warp_barrier"] + 1
-                and default["groups"]["cta_barrier"] + 1 == rollback["groups"]["cta_barrier"]
+            machine_narrowing = (
+                default["groups"]["cta_barrier"] + 1 == rollback["groups"]["cta_barrier"]
+                and default["groups"]["warp_barrier"]
+                in (
+                    rollback["groups"]["warp_barrier"],
+                    rollback["groups"]["warp_barrier"] + 1,
+                )
             )
-            machine_code_swaps += int(machine_swap)
+            machine_elimination = (
+                default["groups"]["warp_barrier"] == rollback["groups"]["warp_barrier"]
+            )
+            explicit_warp_barrier = (
+                default["groups"]["warp_barrier"] == rollback["groups"]["warp_barrier"] + 1
+            )
+            machine_code_narrowings += int(machine_narrowing)
+            machine_code_eliminations += int(machine_elimination)
+            explicit_warp_barriers += int(explicit_warp_barrier)
             spill_free += int(spills == 0)
             comparisons.append(
                 {
                     "name": spec["name"],
                     "dtype": spec["dtype"],
                     "arch": arch,
-                    "machine_code_swap": machine_swap,
+                    "machine_code_narrowing": machine_narrowing,
+                    "machine_code_elimination": machine_elimination,
+                    "explicit_warp_barrier": explicit_warp_barrier,
                     "spill_bytes": spills,
                     "default": default,
                     "rollback": rollback,
@@ -287,11 +303,15 @@ def build_comparisons(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any
     total = len(CASES) * len(ARCHES)
     summary = {
         "comparisons": total,
-        "machine_code_barrier_swaps": machine_code_swaps,
+        "machine_code_barrier_narrowings": machine_code_narrowings,
+        "machine_code_barrier_eliminations": machine_code_eliminations,
+        "explicit_warp_barriers": explicit_warp_barriers,
         "spill_free_comparisons": spill_free,
     }
-    if machine_code_swaps != total:
-        raise RuntimeError(f"expected {total} machine-code barrier swaps, got {machine_code_swaps}")
+    if machine_code_narrowings != total:
+        raise RuntimeError(
+            f"expected {total} machine-code barrier narrowings, got {machine_code_narrowings}"
+        )
     if spill_free != total:
         raise RuntimeError(f"expected {total} spill-free comparisons, got {spill_free}")
     return comparisons, summary
@@ -304,7 +324,9 @@ def write_report(payload: dict[str, Any]) -> None:
         f"- Source: `{payload['repository']}@{payload['source_sha']}`",
         f"- Targets: `{', '.join(payload['arches'])}`",
         f"- Comparisons: {payload['summary']['comparisons']}",
-        f"- CTA-to-warp machine-code swaps: {payload['summary']['machine_code_barrier_swaps']}",
+        f"- Machine-code CTA barrier narrowings: {payload['summary']['machine_code_barrier_narrowings']}",
+        f"- Machine-code barrier eliminations: {payload['summary']['machine_code_barrier_eliminations']}",
+        f"- Explicit warp barriers retained by ptxas: {payload['summary']['explicit_warp_barriers']}",
         f"- Spill-free comparisons: {payload['summary']['spill_free_comparisons']}",
         "",
         "| Case | Arch | SASS barrier rollback to default | Instructions rollback to default | Spill bytes |",

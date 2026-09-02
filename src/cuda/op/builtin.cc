@@ -26,6 +26,7 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kEnableLowerLDGSTGPredicated, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kCudaAllReduceStrategy, ffi::String);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableInt4x2UnpackPeephole, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableWarpAggregateRedux, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kDisableSingleWarpStorageSync, Bool);
 
 DataType CuTensorMapType() { return DataType::UInt(8, 128); }
 
