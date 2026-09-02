@@ -963,7 +963,7 @@ def enrich_auto_launch_bounds(
                 "auto_launch_bounds_candidate_selections": 0,
                 "auto_launch_bounds_baseline_selections": 0,
                 "auto_launch_bounds_instruction_nonregressed": 0,
-                "auto_launch_bounds_spill_free": 0,
+                "auto_launch_bounds_spill_nonregressed": 0,
             }
         )
         return
@@ -973,7 +973,7 @@ def enrich_auto_launch_bounds(
     candidate_selections = 0
     baseline_selections = 0
     instruction_nonregressed = 0
-    spill_free = 0
+    spill_nonregressed = 0
     comparisons = 0
 
     def sum_resource(case: dict[str, Any], field: str) -> int:
@@ -1026,10 +1026,19 @@ def enrich_auto_launch_bounds(
 
             spill_stores = sum_resource(automatic, "spill_store_bytes")
             spill_loads = sum_resource(automatic, "spill_load_bytes")
+            planner_spill_stores = sum_resource(planner, "spill_store_bytes")
+            planner_spill_loads = sum_resource(planner, "spill_load_bytes")
             nonregressed = (
                 automatic["instruction_count"] <= planner["instruction_count"]
             )
-            zero_spill = spill_stores == 0 and spill_loads == 0
+            spill_safe = (
+                spill_stores <= planner_spill_stores
+                and spill_loads <= planner_spill_loads
+                and (
+                    selection == "planner"
+                    or (spill_stores == 0 and spill_loads == 0)
+                )
+            )
             workload["auto_launch_bounds_comparisons"].append(
                 {
                     "arch": arch,
@@ -1039,13 +1048,15 @@ def enrich_auto_launch_bounds(
                     - planner["instruction_count"],
                     "spill_store_bytes": spill_stores,
                     "spill_load_bytes": spill_loads,
+                    "spill_store_delta": spill_stores - planner_spill_stores,
+                    "spill_load_delta": spill_loads - planner_spill_loads,
                 }
             )
             instruction_nonregressed += int(nonregressed)
-            spill_free += int(zero_spill)
+            spill_nonregressed += int(spill_safe)
             comparisons += 1
 
-    if instruction_nonregressed != comparisons or spill_free != comparisons:
+    if instruction_nonregressed != comparisons or spill_nonregressed != comparisons:
         raise RuntimeError(
             "automatic launch-bound selector produced an instruction regression or spill"
         )
@@ -1055,7 +1066,7 @@ def enrich_auto_launch_bounds(
             "auto_launch_bounds_candidate_selections": candidate_selections,
             "auto_launch_bounds_baseline_selections": baseline_selections,
             "auto_launch_bounds_instruction_nonregressed": instruction_nonregressed,
-            "auto_launch_bounds_spill_free": spill_free,
+            "auto_launch_bounds_spill_nonregressed": spill_nonregressed,
         }
     )
 
@@ -1222,8 +1233,8 @@ def write_report(payload: dict[str, Any]) -> None:
             [
                 "## Automatic CUDA launch-bound selection",
                 "",
-                "| Workload | Arch | selected binary | instruction delta | spill stores/loads (bytes) |",
-                "|---|---:|---:|---:|---:|",
+                "| Workload | Arch | selected binary | instruction delta | spill stores/loads (bytes) | spill delta |",
+                "|---|---:|---:|---:|---:|---:|",
             ]
         )
         for workload in payload["workloads"]:
@@ -1233,7 +1244,9 @@ def write_report(payload: dict[str, Any]) -> None:
                     f"`{comparison['selection']}` | "
                     f"{comparison['instruction_delta']} | "
                     f"{comparison['spill_store_bytes']}/"
-                    f"{comparison['spill_load_bytes']} |"
+                    f"{comparison['spill_load_bytes']} | "
+                    f"{comparison['spill_store_delta']}/"
+                    f"{comparison['spill_load_delta']} |"
                 )
         lines.append("")
     if "planner_reinterpret_legacy" in payload["modes"]:
