@@ -21,6 +21,7 @@ import pytest
 import torch
 
 SM100_TARGET = {"kind": "cuda", "arch": "sm_100"}
+SM120_TARGET = {"kind": "cuda", "arch": "sm_120"}
 SM80_TARGET = {"kind": "cuda", "arch": "sm_80"}
 
 M = 128  # number of threads / element-pairs
@@ -411,6 +412,13 @@ def test_codegen_auto_vec_wide_reduce_f32_sm100():
     )
     assert "tl::add2" in packed
     assert "tl::add2" not in rollback
+
+
+@tilelang.testing.requires_cuda
+def test_codegen_auto_vec_wide_reduce_f32_sm120_stays_scalar():
+    func = _make_auto_vec_wide_reduce_kernel(T.reduce_sum)
+    src = _lower_to_cuda_source(func, target=SM120_TARGET)
+    assert "tl::add2" not in src
 
 
 @tilelang.testing.requires_cuda

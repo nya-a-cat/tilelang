@@ -1001,6 +1001,14 @@ template <typename Impl> struct ReduceLowerer {
               src_indice_compressed.back(), src_var_compressed.back()->var,
               ext->value, vsize, analyzer, &ramp_failure_reason);
         }
+        bool is_fp32 = op.dst->dtype.is_float() && op.dst->dtype.bits() == 32;
+        if (packed_lane_stride.has_value() && packed_lane_stride.value() > 1 &&
+            is_fp32 && TargetIsSM120(lower_args.target)) {
+          packed_lane_stride.reset();
+          ramp_failure_reason =
+              "strided packed FP32 reduction is disabled on SM120 because its "
+              "FP32x2 lowering regresses static instructions";
+        }
         const bool ramp_eligible = packed_lane_stride.has_value();
         if (tl_config::ReducerPlanVerboseEnabled()) {
           LOG(INFO) << "[ReducePackedPlan] src=" << op.src->name

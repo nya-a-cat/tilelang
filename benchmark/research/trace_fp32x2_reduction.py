@@ -393,6 +393,19 @@ def build_comparisons(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any
                 ):
                     raise RuntimeError(f"spill detected in {spec['name']}/{arch}/{mode_case['mode']}")
             comparisons.append(comparison)
+    if instruction_regressions:
+        raise RuntimeError(f"FP32x2 reduction introduced {instruction_regressions} instruction regressions")
+    required_wide_gains = {"rmsnorm_w4096_t128", "softmax_w4096_t128"}
+    observed_wide_gains = {
+        item["name"]
+        for item in comparisons
+        if item["arch"] == "sm_100a"
+        and item["eligible"]
+        and item["default_minus_rollback"]["instructions"] < 0
+    }
+    missing_wide_gains = sorted(required_wide_gains - observed_wide_gains)
+    if missing_wide_gains:
+        raise RuntimeError(f"missing strict SM100 wide-reduction gains: {missing_wide_gains}")
     acceptance = {
         "eligible_comparisons": eligible_comparisons,
         "strict_instruction_reductions": strict_instruction_reductions,
@@ -402,7 +415,7 @@ def build_comparisons(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any
         "register_regressions": register_regressions,
         "controls_exact": True,
         "zero_spill": True,
-        "candidate_gate": "observational",
+        "candidate_gate": "no-instruction-regression-and-wide-sm100-gain",
     }
     return comparisons, acceptance
 
