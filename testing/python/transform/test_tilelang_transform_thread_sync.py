@@ -21,6 +21,42 @@ def run_passes_script(func: tvm.tirx.PrimFunc) -> str:
     return str(run_passes(func).script())
 
 
+def _shared_exchange(threads=32):
+    @T.prim_func(private=True)
+    def func():
+        shared = T.alloc_buffer((threads,), dtype="float32", scope="shared")
+        result = T.alloc_buffer((1,), dtype="float32", scope="local")
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", threads)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tz = T.launch_thread("threadIdx.z", 1)
+        shared[tx] = T.Cast("float32", tx)
+        result[0] = shared[threads - 1 - tx]
+
+    return func
+
+
+def test_full_single_warp_sync_uses_warp_barrier_on_cuda():
+    script = str(run_passes(_shared_exchange()).script())
+    assert "T.sync_warp()" in script, f"Expected a warp sync:\n{script}"
+    assert 'T.tvm_storage_sync("shared")' not in script
+
+
+def test_full_single_warp_sync_has_pass_config_rollback():
+    with tvm.transform.PassContext(
+        config={"tl.disable_single_warp_storage_sync": True}
+    ):
+        script = str(run_passes(_shared_exchange()).script())
+    assert 'T.tvm_storage_sync("shared")' in script
+    assert "T.sync_warp()" not in script
+
+
+def test_full_multi_warp_sync_keeps_cta_barrier():
+    script = str(run_passes(_shared_exchange(64)).script())
+    assert 'T.tvm_storage_sync("shared")' in script
+    assert "T.sync_warp()" not in script
+
+
 @tilelang.testing.requires_cuda
 def test_no_sync_between_atomic_adds_to_shared():
     """Atomic WAW (and RMW) should not trigger thread-level sync insertion.

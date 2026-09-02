@@ -279,6 +279,12 @@ class PassConfigKey(str, Enum):
     optimization in cases where manual synchronization is preferred or when
     synchronization is not needed. Default: False"""
 
+    TL_DISABLE_SINGLE_WARP_STORAGE_SYNC = "tl.disable_single_warp_storage_sync"
+    """Keep compiler-inserted full-CTA shared-memory barriers when a CUDA CTA
+    contains exactly one warp. By default, those barriers are narrowed to a
+    warp synchronization with equivalent single-warp memory-ordering semantics.
+    Default: False"""
+
     TL_FORCE_LET_INLINE = "tl.force_let_inline"
     """Force TileLang to inline let bindings during simplification. Default: False"""
 

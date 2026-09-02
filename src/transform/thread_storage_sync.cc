@@ -25,10 +25,12 @@
 #include "arith/ir_mutator_with_analyzer.h"
 #include "common/attr.h"
 #include "cuda/op/builtin.h"
+#include "cuda/target_utils.h"
 #include "runtime/thread_storage_scope.h"
 #include "support/check.h"
 #include "tir/transforms/ir_utils.h"
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <tvm/arith/analyzer.h>
 #include <tvm/arith/int_set.h>
@@ -239,15 +241,19 @@ private:
 
 class ThreadPartialSyncRewriter : public IRMutatorWithAnalyzer {
 public:
-  static Stmt Rewrite(Stmt stmt, int warp_size = 32) {
+  static Stmt Rewrite(Stmt stmt, int warp_size = 32,
+                      bool enable_single_warp_sync = false) {
     arith::Analyzer analyzer;
-    ThreadPartialSyncRewriter rewriter(&analyzer, warp_size);
+    ThreadPartialSyncRewriter rewriter(&analyzer, warp_size,
+                                       enable_single_warp_sync);
     return rewriter(std::move(stmt));
   }
 
 private:
-  explicit ThreadPartialSyncRewriter(arith::Analyzer *analyzer, int warp_size)
-      : IRMutatorWithAnalyzer(analyzer), warp_size_(warp_size) {}
+  explicit ThreadPartialSyncRewriter(arith::Analyzer *analyzer, int warp_size,
+                                     bool enable_single_warp_sync)
+      : IRMutatorWithAnalyzer(analyzer), warp_size_(warp_size),
+        enable_single_warp_sync_(enable_single_warp_sync) {}
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const CallNode *call = nullptr;
@@ -280,6 +286,9 @@ private:
     if (IsFullThreadExtent(tx_, bound_tx) &&
         IsFullThreadExtent(ty_, bound_ty) &&
         IsFullThreadExtent(tz_, bound_tz)) {
+      if (enable_single_warp_sync_ && FullCTAThreadCount() == warp_size_) {
+        return Evaluate(Call(DataType::Void(), sync_warp(), {}));
+      }
       return Evaluate(IRMutatorWithAnalyzer::VisitExpr_(op));
     }
 
@@ -399,6 +408,22 @@ private:
     return min == bound->min_value && max == bound->max_value;
   }
 
+  int64_t FullCTAThreadCount() const {
+    int64_t thread_count = 1;
+    for (const IterVar &iv : {tx_, ty_, tz_}) {
+      if (!iv->dom.defined()) {
+        return -1;
+      }
+      const int64_t *extent = as_const_int(iv->dom->extent);
+      if (extent == nullptr || *extent <= 0 ||
+          thread_count > std::numeric_limits<int64_t>::max() / *extent) {
+        return -1;
+      }
+      thread_count *= *extent;
+    }
+    return thread_count;
+  }
+
   // Member variables
   IterVar tx_ =
       IterVar(Range::FromMinExtent(0, 1), Var("tx"), IterVarType::kDataPar);
@@ -406,9 +431,10 @@ private:
       IterVar(Range::FromMinExtent(0, 1), Var("ty"), IterVarType::kDataPar);
   IterVar tz_ =
       IterVar(Range::FromMinExtent(0, 1), Var("tz"), IterVarType::kDataPar);
+  int warp_size_;
+  bool enable_single_warp_sync_{false};
   std::unordered_map<ThreadBoundKey, size_t> barrier_id_map_;
   std::unordered_map<ThreadBoundKey, size_t> thread_count_map_;
-  int warp_size_;
 };
 
 struct ConditionThreadProperty {
@@ -2033,7 +2059,8 @@ private:
   }
 };
 
-PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
+PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope,
+                            bool enable_single_warp_sync) {
   StorageScope sync_scope = StorageScope::Create(storage_scope);
   if (sync_scope.rank == StorageRank::kGlobal) {
     return func;
@@ -2058,7 +2085,8 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
   planner(stmt);
   stmt =
       ThreadSyncInserter(sync_scope, planner.syncs_inserted_)(std::move(stmt));
-  n->body = ThreadPartialSyncRewriter::Rewrite(std::move(stmt), warp_size);
+  n->body = ThreadPartialSyncRewriter::Rewrite(std::move(stmt), warp_size,
+                                               enable_single_warp_sync);
   return func;
 }
 
@@ -2076,7 +2104,18 @@ tvm::transform::Pass ThreadSync(const String &storage_scope) {
     if (disable_syncthreads) {
       return f;
     }
-    return tl::TileLangThreadSync(std::move(f), storage_scope);
+    bool disable_single_warp_sync =
+        ctx->GetConfig(kDisableSingleWarpStorageSync, Bool(false))
+            .value()
+            ->value;
+    bool enable_single_warp_sync = false;
+    if (!disable_single_warp_sync) {
+      auto target = f->GetAttr<Target>(tvm::attr::kTarget);
+      enable_single_warp_sync =
+          target.defined() && TargetIsCuda(target.value());
+    }
+    return tl::TileLangThreadSync(std::move(f), storage_scope,
+                                  enable_single_warp_sync);
     ;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.ThreadSync", {});

@@ -131,6 +131,9 @@ static constexpr const char *kDisableBufferInitCheck =
     "tl.disable_buffer_init_check";
 static constexpr const char *kDisableThreadStorageSync =
     "tl.disable_thread_storage_sync";
+/*! \brief Keep full-CTA shared-memory barriers for single-warp CUDA CTAs. */
+static constexpr const char *kDisableSingleWarpStorageSync =
+    "tl.disable_single_warp_storage_sync";
 static constexpr const char *kForceLetInline = "tl.force_let_inline";
 static constexpr const char *kDisableOutOfBoundWarning =
     "tl.disable_out_of_bound_warning";

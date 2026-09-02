@@ -20,6 +20,7 @@ on:
           - all
           - fp32x2
           - layout-policy
+          - single-warp-sync
 
 permissions:
   contents: read
@@ -1263,6 +1264,32 @@ jobs:
           native-overlay-selftest/bin/python \
             benchmark/research/trace_layout_policy_cubins.py
           rm -rf -- native-overlay-evidence/layout-policy-cubins-raw
+          (
+            cd native-overlay-evidence
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | LC_ALL=C sort -z \
+              | xargs -0 -r sha256sum \
+              > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Compile single-warp synchronization CUBIN matrix without a GPU
+        if: inputs.research_trace == 'single-warp-sync'
+        id: single-warp-sync
+        shell: bash
+        env:
+          TILELANG_SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          TILELANG_SINGLE_WARP_SYNC_ARCHES: sm_75,sm_80,sm_90a,sm_100a,sm_120a
+          TILELANG_SINGLE_WARP_SYNC_WORKERS: "4"
+          TILELANG_SINGLE_WARP_SYNC_RESULT: native-overlay-evidence/single-warp-sync.json
+          TILELANG_SINGLE_WARP_SYNC_REPORT: native-overlay-evidence/single-warp-sync.md
+          TILELANG_SINGLE_WARP_SYNC_RAW_DIR: native-overlay-evidence/single-warp-sync-raw
+          TILELANG_SINGLE_WARP_SYNC_RAW_ARCHIVE: native-overlay-evidence/single-warp-sync-raw.zip
+        run: |
+          set -euo pipefail
+          native-overlay-selftest/bin/python \
+            benchmark/research/trace_single_warp_storage_sync.py
+          rm -rf -- native-overlay-evidence/single-warp-sync-raw
           (
             cd native-overlay-evidence
             find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
