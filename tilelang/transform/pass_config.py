@@ -201,10 +201,11 @@ class PassConfigKey(str, Enum):
     - plain user-written global->shared copy stores (e.g. in `T.Parallel`) to
       `ptx_cp_async + commit + wait`
 
-    Automatic cp.async lowering covers copies inside a software-pipelined loop
-    annotated with `num_stages > 0` and predicated global-to-shared staging
-    copies that zero-fill boundary tiles. Other copies outside pipelined loops
-    prefer synchronous lowering.
+    Automatic cp.async lowering covers eligible copies inside a
+    software-pipelined loop annotated with `num_stages > 0`. Predicated stages
+    are accepted only when a pure global load and an explicit zero fallback
+    write the same shared-memory location on every path. Other conditional and
+    outside-pipeline copies prefer synchronous lowering.
     You can request local cp.async injection on a specific parallel loop via
     `T.Parallel(..., prefer_async=True)`.
 
@@ -216,9 +217,9 @@ class PassConfigKey(str, Enum):
     """
 
     TL_DISABLE_PREDICATED_ASYNC_COPY = "tl.disable_predicated_async_copy"
-    """Keep automatically detected predicated CUDA global-to-shared boundary
-    staging on synchronous loads and stores. Software-pipeline-managed copies
-    and explicit ``prefer_async=True`` loops retain their established async
+    """Keep total zero-fill CUDA pipeline producers on their historical
+    synchronous classification. Other software-pipeline-managed copies and
+    explicit ``prefer_async=True`` loops retain their established async
     behavior. This is a same-build differential-testing escape hatch.
     Default: False"""
 

@@ -3,6 +3,7 @@
 #include <map>
 #include <numeric>
 #include <tvm/arith/analyzer.h>
+#include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ir/cast.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/s_tir/stmt.h>
@@ -32,6 +33,12 @@ namespace tl {
 
 using namespace tirx;
 using namespace ffi;
+
+// Preserve the historical synchronous classification for same-build A/B
+// validation of predicated zero-fill pipeline producers.
+static constexpr const char *kDisablePredicatedAsyncCopy =
+    "tl.disable_predicated_async_copy";
+TVM_REGISTER_PASS_CONFIG_OPTION(kDisablePredicatedAsyncCopy, Bool);
 
 class BufferRegionCollector : public StmtExprVisitor {
 public:
@@ -432,6 +439,7 @@ struct PipelineStageInfo {
   bool copy_stage = false;
   bool tma_copy = false; // true if this copy stage uses TMA (not cp.async)
   bool conditional_execution = false;
+  bool total_zero_fill_copy = false;
   bool producer_for_copy = false;
   int last_use_stmt_index =
       -1; // Initialized to -1, indicating no consumers found yet
@@ -447,9 +455,10 @@ public:
 class PipelineStageAnalyzer {
 public:
   PipelineStageAnalyzer(Map<Var, Buffer> buffer_data_to_buffer, Target target,
-                        bool use_async_copy)
+                        bool use_async_copy, bool enable_predicated_async_copy)
       : buffer_data_to_buffer_(std::move(buffer_data_to_buffer)),
-        target_(std::move(target)), use_async_copy_(use_async_copy) {}
+        target_(std::move(target)), use_async_copy_(use_async_copy),
+        enable_predicated_async_copy_(enable_predicated_async_copy) {}
 
   class ScalarUseDefCollector : public StmtExprVisitor {
   public:
@@ -494,13 +503,88 @@ public:
   }
 
   bool IsAsyncProducerCandidate(const PipelineStageInfo &pinfo) const {
-    if (pinfo.conditional_execution) {
+    if (pinfo.conditional_execution && !pinfo.total_zero_fill_copy) {
       return false;
     }
     if (pinfo.IsTmaCopy()) {
       return false;
     }
     return pinfo.IsCopyStage();
+  }
+
+  static bool IsZeroValue(const PrimExpr &expr) {
+    if (const auto *broadcast = expr.as<BroadcastNode>()) {
+      return IsZeroValue(broadcast->value);
+    }
+    if (const auto *float_imm = expr.as<FloatImmNode>()) {
+      return float_imm->value == 0.0;
+    }
+    if (const auto *int_imm = expr.as<IntImmNode>()) {
+      return int_imm->value == 0;
+    }
+    return false;
+  }
+
+  static const BufferLoadNode *MatchGlobalLoad(const PrimExpr &expr) {
+    if (const auto *load = expr.as<BufferLoadNode>()) {
+      return IsGlobalBuffer(load->buffer) ? load : nullptr;
+    }
+    return nullptr;
+  }
+
+  static const BufferStoreNode *MatchSingleBufferStore(const Stmt &stmt) {
+    if (const auto *store = stmt.as<BufferStoreNode>()) {
+      return store;
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      return seq->seq.size() == 1 ? MatchSingleBufferStore(seq->seq[0])
+                                  : nullptr;
+    }
+    return nullptr;
+  }
+
+  static bool ArePureExprs(const Array<PrimExpr> &exprs) {
+    return std::all_of(exprs.begin(), exprs.end(), [](const PrimExpr &expr) {
+      return SideEffect(expr) <= CallEffectKind::kPure;
+    });
+  }
+
+  bool IsTotalZeroFillCopyStmt(const Stmt &stmt,
+                               bool inside_parallel = false) const {
+    if (const auto *loop = stmt.as<ForNode>()) {
+      if (loop->kind != ForKind::kParallel ||
+          SideEffect(loop->min) > CallEffectKind::kPure ||
+          SideEffect(loop->extent) > CallEffectKind::kPure) {
+        return false;
+      }
+      return IsTotalZeroFillCopyStmt(loop->body, true);
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      return seq->seq.size() == 1
+                 ? IsTotalZeroFillCopyStmt(seq->seq[0], inside_parallel)
+                 : false;
+    }
+    const auto *conditional = stmt.as<IfThenElseNode>();
+    if (!inside_parallel || conditional == nullptr ||
+        !conditional->else_case.defined() ||
+        SideEffect(conditional->condition) > CallEffectKind::kPure) {
+      return false;
+    }
+    const BufferStoreNode *copy =
+        MatchSingleBufferStore(conditional->then_case);
+    const BufferStoreNode *zero_fill =
+        MatchSingleBufferStore(conditional->else_case.value());
+    if (copy == nullptr || zero_fill == nullptr ||
+        !copy->buffer.same_as(zero_fill->buffer) ||
+        !IsSharedBuffer(copy->buffer) ||
+        !StructuralEqual()(copy->indices, zero_fill->indices) ||
+        !ArePureExprs(copy->indices) || !ArePureExprs(zero_fill->indices) ||
+        copy->predicate.defined() || zero_fill->predicate.defined()) {
+      return false;
+    }
+    const BufferLoadNode *load = MatchGlobalLoad(copy->value);
+    return load != nullptr && ArePureExprs(load->indices) &&
+           !load->predicate.defined() && IsZeroValue(zero_fill->value);
   }
 
   bool IsPureCopyStmt(const Stmt &stmt) const {
@@ -984,9 +1068,12 @@ public:
     pinfo.scalar_uses = std::move(scalar_uses);
     pinfo.original_stmt_index = idx;
     pinfo.conditional_execution = MayBeConditionallyExecuted(block->body);
+    pinfo.total_zero_fill_copy = enable_predicated_async_copy_ &&
+                                 collector.GetGlobalCopyPattern() &&
+                                 IsTotalZeroFillCopyStmt(block->body);
     bool pure_copy_stage =
         collector.GetGlobalCopyPattern() && IsPureCopyStmt(block->body);
-    pinfo.copy_stage = pure_copy_stage;
+    pinfo.copy_stage = pure_copy_stage || pinfo.total_zero_fill_copy;
     pinfo.tma_copy = pure_copy_stage && !pinfo.conditional_execution &&
                      collector.GetTmaCopyPattern();
     ClassifyCopyLikeStage(block->body, &pinfo);
@@ -997,12 +1084,14 @@ private:
   Map<Var, Buffer> buffer_data_to_buffer_;
   Target target_;
   bool use_async_copy_{};
+  bool enable_predicated_async_copy_{};
 };
 
 class PipelinePlanner : public StmtExprMutator {
 public:
-  static Stmt Substitute(const PrimFunc &f, bool use_async_copy = true) {
-    PipelinePlanner substituter(use_async_copy);
+  static Stmt Substitute(const PrimFunc &f, bool use_async_copy = true,
+                         bool enable_predicated_async_copy = true) {
+    PipelinePlanner substituter(use_async_copy, enable_predicated_async_copy);
     for (const auto &[_, buffer] : f->buffer_map) {
       substituter.buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
@@ -1015,11 +1104,14 @@ public:
 
 private:
   PipelinePlanner() = default;
-  PipelinePlanner(bool use_async_copy) : use_async_copy_(use_async_copy) {}
+  PipelinePlanner(bool use_async_copy, bool enable_predicated_async_copy)
+      : use_async_copy_(use_async_copy),
+        enable_predicated_async_copy_(enable_predicated_async_copy) {}
 
   PipelineStageAnalyzer MakeStageAnalyzer() const {
     return PipelineStageAnalyzer(buffer_data_to_buffer_, target_,
-                                 use_async_copy_);
+                                 use_async_copy_,
+                                 enable_predicated_async_copy_);
   }
 
   void AnalyzeCopyLastUse(
@@ -1351,6 +1443,7 @@ private:
   Map<Var, Buffer> buffer_data_to_buffer_;
   Target target_;
   bool use_async_copy_{};
+  bool enable_predicated_async_copy_{};
 };
 
 tvm::transform::Pass PipelinePlanning() {
@@ -1358,8 +1451,11 @@ tvm::transform::Pass PipelinePlanning() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
     bool use_async_copy =
         ctx->GetConfig<Bool>("tirx.use_async_copy", Bool(true)).value();
+    bool enable_predicated_async_copy =
+        !ctx->GetConfig<Bool>(kDisablePredicatedAsyncCopy, Bool(false)).value();
     PrimFuncNode *fptr = f.CopyOnWrite();
-    fptr->body = PipelinePlanner::Substitute(f, use_async_copy);
+    fptr->body = PipelinePlanner::Substitute(f, use_async_copy,
+                                             enable_predicated_async_copy);
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.PipelinePlanning", {});

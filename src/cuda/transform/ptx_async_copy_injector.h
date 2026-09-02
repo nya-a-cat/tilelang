@@ -8,7 +8,6 @@ namespace tl {
 struct PTXAsyncCopyInjectResult {
   tvm::tirx::Stmt stmt;
   bool injected_ptx_async_copy{false};
-  bool injected_predicated_ptx_async_copy{false};
 };
 
 /*! \brief Inject PTX cp.async lowering patterns into a statement.

@@ -666,6 +666,107 @@ def test_pipeline_planning_recognizes_parallel_bufferstore_copy_stages():
     assert async_groups == [0, 0, -1]
 
 
+def test_pipeline_planning_recognizes_predicated_zero_fill_parallel_copy():
+    @T.prim_func
+    def before(
+        A: T.Tensor((130,), T.float16),
+        B: T.Tensor((2,), T.float16),
+    ):
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((128,), T.float16)
+            for ko in T.Pipelined(2, num_stages=1):
+                for i in T.Parallel(128):
+                    if ko * 128 + i < 130:
+                        A_shared[i] = A[ko * 128 + i]
+                    else:
+                        A_shared[i] = T.float16(0)
+                B[ko] = A_shared[0]
+
+    mod = _run_pipeline_planning(before, sm80_target)
+    annos = _collect_pipeline_loop_annotations(mod["main"])
+    assert annos, "Expected PipelinePlanning annotations"
+    anno = annos[0]
+    assert [int(v) for v in anno["software_pipeline_stage"]] == [0, 1]
+    assert [int(v) for v in anno["software_pipeline_async_producers"]] == [1, 0]
+    assert [int(v) for v in anno["software_pipeline_async_producer_groups"]] == [0, -1]
+
+
+def test_pipeline_planning_rejects_non_total_predicated_copies():
+    @T.prim_func
+    def nonzero_fallback(
+        A: T.Tensor((130,), T.float16),
+        B: T.Tensor((2,), T.float16),
+    ):
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((128,), T.float16)
+            for ko in T.Pipelined(2, num_stages=1):
+                for i in T.Parallel(128):
+                    if ko * 128 + i < 130:
+                        A_shared[i] = A[ko * 128 + i]
+                    else:
+                        A_shared[i] = T.float16(1)
+                B[ko] = A_shared[0]
+
+    @T.prim_func
+    def partial_copy(
+        A: T.Tensor((130,), T.float16),
+        B: T.Tensor((2,), T.float16),
+    ):
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((128,), T.float16)
+            for ko in T.Pipelined(2, num_stages=1):
+                for i in T.Parallel(128):
+                    if ko * 128 + i < 130:
+                        A_shared[i] = A[ko * 128 + i]
+                B[ko] = A_shared[0]
+
+    for func in (nonzero_fallback, partial_copy):
+        mod = _run_pipeline_planning(func, sm80_target)
+        annos = _collect_pipeline_loop_annotations(mod["main"])
+        assert annos, "Expected PipelinePlanning annotations"
+        assert "software_pipeline_async_producers" not in annos[0]
+
+
+def test_pipeline_planning_rejects_state_dependent_predicated_copy():
+    @T.prim_func
+    def state_dependent_guard(
+        A: T.Tensor((256,), T.float16),
+        Mask: T.Tensor((256,), T.int32),
+        B: T.Tensor((2,), T.float16),
+    ):
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((128,), T.float16)
+            for ko in T.Pipelined(2, num_stages=1):
+                for i in T.Parallel(128):
+                    if Mask[ko * 128 + i] != 0:
+                        A_shared[i] = A[ko * 128 + i]
+                    else:
+                        A_shared[i] = T.float16(0)
+                B[ko] = A_shared[0]
+
+    @T.prim_func
+    def state_dependent_index(
+        A: T.Tensor((256,), T.float16),
+        Indices: T.Tensor((256,), T.int32),
+        B: T.Tensor((2,), T.float16),
+    ):
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((128,), T.float16)
+            for ko in T.Pipelined(2, num_stages=1):
+                for i in T.Parallel(128):
+                    if ko * 128 + i < 256:
+                        A_shared[i] = A[Indices[ko * 128 + i]]
+                    else:
+                        A_shared[i] = T.float16(0)
+                B[ko] = A_shared[0]
+
+    for func in (state_dependent_guard, state_dependent_index):
+        mod = _run_pipeline_planning(func, sm80_target)
+        annos = _collect_pipeline_loop_annotations(mod["main"])
+        assert annos, "Expected PipelinePlanning annotations"
+        assert "software_pipeline_async_producers" not in annos[0]
+
+
 def test_pipeline_planning_marks_async_producers_per_statement():
     @T.prim_func
     def before(A: T.Tensor((1024, 32), T.float32), B: T.Tensor((32, 1024), T.float32), C: T.Tensor((1024, 1024), T.float32)):

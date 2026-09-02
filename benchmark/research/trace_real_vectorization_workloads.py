@@ -607,6 +607,101 @@ def packed_types(source: str) -> dict[str, int]:
     return dict(sorted(Counter(PACKED_TYPE_RE.findall(source)).items()))
 
 
+def validate_predicated_async_negative_controls() -> list[dict[str, Any]]:
+    @T.prim_func
+    def nonzero_fallback(
+        A: T.Tensor((256,), T.float16),
+        B: T.Tensor((2,), T.float16),
+    ):
+        with T.Kernel(1, threads=128):
+            S = T.alloc_shared((128,), T.float16)
+            for tile in T.Pipelined(2, num_stages=1):
+                for i in T.Parallel(128):
+                    if tile * 128 + i < 130:
+                        S[i] = A[tile * 128 + i]
+                    else:
+                        S[i] = T.float16(1)
+                B[tile] = S[0]
+
+    @T.prim_func
+    def partial_copy(
+        A: T.Tensor((256,), T.float16),
+        B: T.Tensor((2,), T.float16),
+    ):
+        with T.Kernel(1, threads=128):
+            S = T.alloc_shared((128,), T.float16)
+            for tile in T.Pipelined(2, num_stages=1):
+                for i in T.Parallel(128):
+                    if tile * 128 + i < 130:
+                        S[i] = A[tile * 128 + i]
+                B[tile] = S[0]
+
+    @T.prim_func
+    def state_dependent_guard(
+        A: T.Tensor((256,), T.float16),
+        Mask: T.Tensor((256,), T.int32),
+        B: T.Tensor((2,), T.float16),
+    ):
+        with T.Kernel(1, threads=128):
+            S = T.alloc_shared((128,), T.float16)
+            for tile in T.Pipelined(2, num_stages=1):
+                for i in T.Parallel(128):
+                    if Mask[tile * 128 + i] != 0:
+                        S[i] = A[tile * 128 + i]
+                    else:
+                        S[i] = T.float16(0)
+                B[tile] = S[0]
+
+    @T.prim_func
+    def state_dependent_index(
+        A: T.Tensor((256,), T.float16),
+        Indices: T.Tensor((256,), T.int32),
+        B: T.Tensor((2,), T.float16),
+    ):
+        with T.Kernel(1, threads=128):
+            S = T.alloc_shared((128,), T.float16)
+            for tile in T.Pipelined(2, num_stages=1):
+                for i in T.Parallel(128):
+                    if tile * 128 + i < 256:
+                        S[i] = A[Indices[tile * 128 + i]]
+                    else:
+                        S[i] = T.float16(0)
+                B[tile] = S[0]
+
+    controls = {
+        "nonzero_fallback": nonzero_fallback,
+        "partial_copy": partial_copy,
+        "state_dependent_guard": state_dependent_guard,
+        "state_dependent_index": state_dependent_index,
+    }
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_80"})
+    output_dir = RAW_DIR / "predicated_async_negative_controls"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    for name, func in controls.items():
+        source = tilelang.lower(
+            func, target=target, enable_device_compile=False
+        ).kernel_source
+        occurrences = len(
+            re.findall(r"\bcp_async_gs(?:_conditional)?<", source)
+        )
+        if occurrences != 0:
+            raise RuntimeError(
+                f"predicated async negative control {name} emitted "
+                f"{occurrences} cp.async call sites"
+            )
+        (output_dir / f"{name}.cu").write_text(source, encoding="utf-8")
+        records.append(
+            {
+                "name": name,
+                "arch": "sm_80",
+                "cp_async_source_occurrences": occurrences,
+                "source_sha256": sha256_text(source),
+            }
+        )
+    return records
+
+
 def register_usage_level(mode: str) -> int | None:
     match = REGISTER_USAGE_MODE_RE.fullmatch(mode)
     return int(match.group("level")) if match is not None else None
@@ -2080,6 +2175,11 @@ def main() -> int:
     started = time.perf_counter()
     repo_root = Path.cwd().resolve()
     RAW_DIR.mkdir(parents=True, exist_ok=False)
+    predicated_async_negative_controls = (
+        validate_predicated_async_negative_controls()
+        if "planner_sync_predicated_copy" in MODES
+        else []
+    )
     workloads = build_workloads(repo_root)
     if WORKLOAD_NAMES:
         by_name = {workload["name"]: workload for workload in workloads}
@@ -2093,7 +2193,7 @@ def main() -> int:
     enrich_launch_bounds_scan(workload_records, aggregate)
     enrich_auto_launch_bounds(workload_records, aggregate)
     payload = {
-        "schema": "tilelang-real-vectorization-workloads-v7",
+        "schema": "tilelang-real-vectorization-workloads-v8",
         "repository": REPOSITORY,
         "source_sha": SOURCE_SHA,
         "python": platform.python_version(),
@@ -2104,6 +2204,7 @@ def main() -> int:
         "device_compile": True,
         "gpu_execution": False,
         "compile_workers": MAX_WORKERS,
+        "predicated_async_negative_controls": predicated_async_negative_controls,
         "aggregate": aggregate,
         "workloads": workload_records,
         "duration_seconds": time.perf_counter() - started,

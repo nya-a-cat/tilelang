@@ -34,9 +34,6 @@ public:
       : async_without_async_commit_wait_(async_without_async_commit_wait) {}
 
   bool InjectedPTXAsyncCopy() const { return injected_ptx_async_copy_; }
-  bool InjectedPredicatedPTXAsyncCopy() const {
-    return injected_predicated_ptx_async_copy_;
-  }
 
   Stmt Finalize(Stmt body) {
     if (!pending_sync_copies_ || UseExplicitAsyncSemantics()) {
@@ -222,9 +219,7 @@ public:
 
     pending_sync_copies_ = pending_before;
     uncommitted_sync_copies_ = uncommitted_before;
-    ++conditional_depth_;
     Stmt then_case = this->VisitStmt(op->then_case);
-    --conditional_depth_;
     bool pending_then = pending_sync_copies_;
     bool uncommitted_then = uncommitted_sync_copies_;
 
@@ -234,9 +229,7 @@ public:
     if (op->else_case.defined()) {
       pending_sync_copies_ = pending_before;
       uncommitted_sync_copies_ = uncommitted_before;
-      ++conditional_depth_;
       else_case = this->VisitStmt(op->else_case.value());
-      --conditional_depth_;
       pending_else = pending_sync_copies_;
       uncommitted_else = uncommitted_sync_copies_;
     }
@@ -265,9 +258,6 @@ public:
                        predicate.defined() ? predicate.value() : PrimExpr());
       if (injected.defined()) {
         injected_ptx_async_copy_ = true;
-        injected_predicated_ptx_async_copy_ =
-            injected_predicated_ptx_async_copy_ || predicate.defined() ||
-            conditional_depth_ > 0;
         if (!UseExplicitAsyncSemantics()) {
           pending_sync_copies_ = true;
           uncommitted_sync_copies_ = true;
@@ -683,18 +673,15 @@ private:
   std::vector<ActiveVectorizedLoop> active_vectorized_loops_;
   arith::Analyzer analyzer_;
   bool injected_ptx_async_copy_{false};
-  bool injected_predicated_ptx_async_copy_{false};
   bool pending_sync_copies_{false};
   bool uncommitted_sync_copies_{false};
-  int conditional_depth_{0};
 };
 
 PTXAsyncCopyInjectResult
 InjectPTXAsyncCopy(const Stmt &body, bool async_without_async_commit_wait) {
   PTXAsyncCopyInjector injector(async_without_async_commit_wait);
   Stmt injected = injector(body);
-  return {injector.Finalize(injected), injector.InjectedPTXAsyncCopy(),
-          injector.InjectedPredicatedPTXAsyncCopy()};
+  return {injector.Finalize(injected), injector.InjectedPTXAsyncCopy()};
 }
 
 } // namespace tl
