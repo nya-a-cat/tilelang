@@ -22,6 +22,7 @@ on:
           - layout-policy
           - launch-bounds
           - local-scalar-exp2
+          - nvcc-extra-vectorization
           - single-warp-sync
 
 permissions:
@@ -1398,13 +1399,13 @@ jobs:
           )
 
       - name: Compile frozen real vectorization workloads without a GPU
-        if: inputs.research_trace == 'all' || inputs.research_trace == 'launch-bounds' || inputs.research_trace == 'local-scalar-exp2'
+        if: inputs.research_trace == 'all' || inputs.research_trace == 'launch-bounds' || inputs.research_trace == 'local-scalar-exp2' || inputs.research_trace == 'nvcc-extra-vectorization'
         id: real-vectorization-workloads
         shell: bash
         env:
           TILELANG_SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
           TILELANG_REAL_VECTOR_ARCHES: sm_75,sm_80,sm_90a,sm_100a,sm_120a
-          TILELANG_REAL_VECTOR_MODES: ${{ inputs.research_trace == 'launch-bounds' && 'planner,legacy,planner_auto_lb,planner_lb2,planner_lb3,planner_lb4' || inputs.research_trace == 'local-scalar-exp2' && 'planner,legacy,planner_scalar_exp2_vectorized' || 'planner,legacy,planner_scalar_exp2_vectorized,planner_reinterpret_legacy,planner_int4x2_unpack_legacy' }}
+          TILELANG_REAL_VECTOR_MODES: ${{ inputs.research_trace == 'launch-bounds' && 'planner,legacy,planner_auto_lb,planner_lb2,planner_lb3,planner_lb4' || inputs.research_trace == 'local-scalar-exp2' && 'planner,legacy,planner_scalar_exp2_vectorized' || inputs.research_trace == 'nvcc-extra-vectorization' && 'planner,legacy,planner_nvcc_extra_vectorization' || 'planner,legacy,planner_scalar_exp2_vectorized,planner_reinterpret_legacy,planner_int4x2_unpack_legacy' }}
           TILELANG_REAL_VECTOR_WORKLOADS: ${{ inputs.research_trace == 'local-scalar-exp2' && 'flash_attention_fp16_b8_h32_s4096_d128' || '' }}
           TILELANG_REAL_VECTOR_COMPILE_WORKERS: "4"
           TILELANG_REAL_VECTOR_RESULT: native-overlay-evidence/real-vectorization-workloads.json

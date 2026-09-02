@@ -46,6 +46,7 @@ SCALAR_EXP2_CONFIG_KEY = "tl.vectorize_local_parallel_scalar_exp2"
 INPLACE_CONFIG_KEY = "tl.storage_rewrite_detect_inplace"
 REGISTER_USAGE_CONFIG_KEY = "tl.ptxas_register_usage_level"
 AUTO_LAUNCH_BOUNDS_CONFIG_KEY = "tl.enable_auto_launch_bounds"
+DEVICE_COMPILE_FLAGS_CONFIG_KEY = "tl.device_compile_flags"
 DISABLE_REINTERPRET_CONFIG_KEY = "tl.disable_reinterpret_vectorization"
 DISABLE_INT4X2_UNPACK_CONFIG_KEY = "tl.disable_int4x2_unpack_peephole"
 MODES = tuple(
@@ -68,6 +69,7 @@ BASE_MODES = {
     "planner_reinterpret_legacy",
     "planner_int4x2_unpack_legacy",
     "planner_auto_lb",
+    "planner_nvcc_extra_vectorization",
     "planner_scalar_exp2_vectorized",
 }
 REGISTER_USAGE_MODE_RE = re.compile(r"planner_ru(?P<level>\d+)$")
@@ -147,7 +149,7 @@ if (
         "TILELANG_REAL_VECTOR_MODES must contain planner and legacy; optional modes are "
         "planner_inplace, planner_reinterpret_legacy, planner_int4x2_unpack_legacy, "
         "planner_auto_lb, planner_scalar_exp2_vectorized, planner_ru0 through "
-        "planner_ru10, and planner_lb2 "
+        "planner_ru10, planner_nvcc_extra_vectorization, and planner_lb2 "
         "through planner_lb8"
     )
 if MAX_WORKERS < 1:
@@ -527,6 +529,7 @@ def lowering_source_mode(mode: str) -> str:
 
     if (
         mode == "planner_auto_lb"
+        or mode == "planner_nvcc_extra_vectorization"
         or register_usage_level(mode) is not None
         or launch_bounds_blocks(mode) is not None
     ):
@@ -544,6 +547,14 @@ def pass_configs_for_mode(base_configs: dict[str, Any], mode: str) -> dict[str, 
         mode == "planner_int4x2_unpack_legacy"
     )
     pass_configs[AUTO_LAUNCH_BOUNDS_CONFIG_KEY] = mode == "planner_auto_lb"
+    if mode == "planner_nvcc_extra_vectorization":
+        compile_flags = pass_configs.get(DEVICE_COMPILE_FLAGS_CONFIG_KEY, [])
+        if isinstance(compile_flags, str):
+            compile_flags = [compile_flags]
+        else:
+            compile_flags = list(compile_flags)
+        compile_flags.append("--extra-device-vectorization")
+        pass_configs[DEVICE_COMPILE_FLAGS_CONFIG_KEY] = compile_flags
     usage_level = register_usage_level(mode)
     if usage_level is not None:
         pass_configs[REGISTER_USAGE_CONFIG_KEY] = usage_level
@@ -848,6 +859,10 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
     scalar_exp2_cubin_nonregressed = 0
     scalar_exp2_spill_nonregressed = 0
     scalar_exp2_strict_improvements = 0
+    nvcc_vectorization_sass_changed = 0
+    nvcc_vectorization_instruction_nonregressed = 0
+    nvcc_vectorization_spill_nonregressed = 0
+    nvcc_vectorization_strict_improvements = 0
     for workload in workload_records:
         by_key = {(case["arch"], case["mode"]): case for case in workload["cases"]}
         workload["comparisons"] = []
@@ -1078,6 +1093,60 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
                 scalar_exp2_cubin_nonregressed += int(cubin_safe)
                 scalar_exp2_spill_nonregressed += int(spill_safe)
                 scalar_exp2_strict_improvements += int(strict)
+        if "planner_nvcc_extra_vectorization" in MODES:
+            workload["nvcc_extra_vectorization_comparisons"] = []
+            for arch in ARCHES:
+                planner = by_key[(arch, "planner")]
+                candidate = by_key[(arch, "planner_nvcc_extra_vectorization")]
+                planner_spills = sum(
+                    int(item["spill_store_bytes"]) + int(item["spill_load_bytes"])
+                    for item in planner["resources"].values()
+                )
+                candidate_spills = sum(
+                    int(item["spill_store_bytes"]) + int(item["spill_load_bytes"])
+                    for item in candidate["resources"].values()
+                )
+                if candidate["source_sha256"] != planner["source_sha256"]:
+                    raise RuntimeError(
+                        f"NVCC vectorization mode changed CUDA source for "
+                        f"{workload['name']}/{arch}"
+                    )
+                if candidate["kernel_launches"] != planner["kernel_launches"]:
+                    raise RuntimeError(
+                        f"NVCC vectorization mode changed launch metadata for "
+                        f"{workload['name']}/{arch}"
+                    )
+                instruction_safe = (
+                    candidate["instruction_count"] <= planner["instruction_count"]
+                )
+                spill_safe = candidate_spills <= planner_spills
+                strict = (
+                    candidate["instruction_count"] < planner["instruction_count"]
+                    or candidate["cubin_bytes"] < planner["cubin_bytes"]
+                    or candidate_spills < planner_spills
+                )
+                comparison = {
+                    "arch": arch,
+                    "source_isolated": True,
+                    "launch_metadata_isolated": True,
+                    "sass_changed": candidate["sass_sha256"]
+                    != planner["sass_sha256"],
+                    "candidate_minus_planner": {
+                        "cubin_bytes": candidate["cubin_bytes"]
+                        - planner["cubin_bytes"],
+                        "instruction_count": candidate["instruction_count"]
+                        - planner["instruction_count"],
+                        "spill_bytes": candidate_spills - planner_spills,
+                    },
+                    "instruction_nonregressed": instruction_safe,
+                    "spill_nonregressed": spill_safe,
+                    "strict_improvement": strict,
+                }
+                workload["nvcc_extra_vectorization_comparisons"].append(comparison)
+                nvcc_vectorization_sass_changed += int(comparison["sass_changed"])
+                nvcc_vectorization_instruction_nonregressed += int(instruction_safe)
+                nvcc_vectorization_spill_nonregressed += int(spill_safe)
+                nvcc_vectorization_strict_improvements += int(strict)
     if source_changed == 0 or sass_changed == 0 or planner_packed_gain == 0:
         raise RuntimeError(
             "planner/legacy trace produced no material source, SASS, or packed-type difference"
@@ -1150,6 +1219,19 @@ def enrich_comparisons(workload_records: list[dict[str, Any]]) -> dict[str, Any]
         "scalar_exp2_cubin_nonregressed": scalar_exp2_cubin_nonregressed,
         "scalar_exp2_spill_nonregressed": scalar_exp2_spill_nonregressed,
         "scalar_exp2_strict_improvements": scalar_exp2_strict_improvements,
+        "nvcc_extra_vectorization_comparisons": len(ARCHES) * len(workload_records)
+        if "planner_nvcc_extra_vectorization" in MODES
+        else 0,
+        "nvcc_extra_vectorization_sass_changed": nvcc_vectorization_sass_changed,
+        "nvcc_extra_vectorization_instruction_nonregressed": (
+            nvcc_vectorization_instruction_nonregressed
+        ),
+        "nvcc_extra_vectorization_spill_nonregressed": (
+            nvcc_vectorization_spill_nonregressed
+        ),
+        "nvcc_extra_vectorization_strict_improvements": (
+            nvcc_vectorization_strict_improvements
+        ),
     }
 
 
@@ -1686,6 +1768,38 @@ def write_report(payload: dict[str, Any]) -> None:
                     f"{spill_bytes(vectorized)}→{spill_bytes(planner)} |"
                 )
         lines.append("")
+    if "planner_nvcc_extra_vectorization" in payload["modes"]:
+        lines.extend(
+            [
+                "## NVCC extra device vectorization scan",
+                "",
+                "| Workload | Arch | instructions planner→candidate | CUBIN bytes planner→candidate | spill bytes planner→candidate | SASS changed |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for workload in payload["workloads"]:
+            by_key = {
+                (case["arch"], case["mode"]): case for case in workload["cases"]
+            }
+            for arch in payload["architectures"]:
+                planner = by_key[(arch, "planner")]
+                candidate = by_key[(arch, "planner_nvcc_extra_vectorization")]
+
+                def spill_bytes(case: dict[str, Any]) -> int:
+                    return sum(
+                        int(item["spill_store_bytes"])
+                        + int(item["spill_load_bytes"])
+                        for item in case["resources"].values()
+                    )
+
+                lines.append(
+                    f"| `{workload['name']}` | `{arch}` | "
+                    f"{planner['instruction_count']}→{candidate['instruction_count']} | "
+                    f"{planner['cubin_bytes']}→{candidate['cubin_bytes']} | "
+                    f"{spill_bytes(planner)}→{spill_bytes(candidate)} | "
+                    f"{planner['sass_sha256'] != candidate['sass_sha256']} |"
+                )
+        lines.append("")
     if "planner_int4x2_unpack_legacy" in payload["modes"]:
         lines.extend(
             [
@@ -1745,7 +1859,7 @@ def main() -> int:
     enrich_launch_bounds_scan(workload_records, aggregate)
     enrich_auto_launch_bounds(workload_records, aggregate)
     payload = {
-        "schema": "tilelang-real-vectorization-workloads-v5",
+        "schema": "tilelang-real-vectorization-workloads-v6",
         "repository": REPOSITORY,
         "source_sha": SOURCE_SHA,
         "python": platform.python_version(),
