@@ -1,10 +1,11 @@
 """Compile frozen real-workload vectorization variants without a GPU.
 
 This diagnostic elaborates frozen configurations from real TileLang examples:
-DeepSeek mHC prefill, W4A8 dequantization GEMM, FP16 GEMM, RMSNorm, and
-FlashAttention.  Each byte-identical PrimFunc is lowered with the requested
-compiler modes, compiled with TileLang's CUDA callback, and disassembled for
-explicit NVIDIA architectures.  It never initializes or executes a GPU.
+DeepSeek mHC prefill, W4A8 dequantization GEMM, FP16 GEMM, split-K GEMM,
+RMSNorm, LayerNorm, FlashAttention, convolution, and elementwise addition.
+Each byte-identical PrimFunc is lowered with the requested compiler modes,
+compiled with TileLang's CUDA callback, and disassembled for explicit NVIDIA
+architectures.  It never initializes or executes a GPU.
 """
 
 from __future__ import annotations
@@ -180,10 +181,24 @@ def build_workloads(repo_root: Path) -> list[dict[str, Any]]:
     w4a8_path = repo_root / "examples/dequantize_gemm/example_dequant_gemm_w4a8.py"
     gemm_path = repo_root / "examples/gemm/example_gemm.py"
     rms_norm_path = repo_root / "examples/norm/rms_norm.py"
+    layer_norm_path = repo_root / "examples/norm/layernorm.py"
     flash_attention_path = (
         repo_root / "examples/flash_attention/example_mha_fwd_bshd.py"
     )
-    for path in (mhc_path, w4a8_path, gemm_path, rms_norm_path, flash_attention_path):
+    convolution_path = repo_root / "examples/convolution/example_convolution.py"
+    elementwise_path = repo_root / "examples/elementwise/example_elementwise_add.py"
+    splitk_path = repo_root / "examples/gemm_splitk/example_tilelang_gemm_splitk.py"
+    for path in (
+        mhc_path,
+        w4a8_path,
+        gemm_path,
+        rms_norm_path,
+        layer_norm_path,
+        flash_attention_path,
+        convolution_path,
+        elementwise_path,
+        splitk_path,
+    ):
         if not path.is_file():
             raise RuntimeError(f"frozen example entrypoint is missing: {path}")
 
@@ -191,9 +206,17 @@ def build_workloads(repo_root: Path) -> list[dict[str, Any]]:
     w4a8 = load_module("tilelang_trace_example_dequant_gemm_w4a8", w4a8_path)
     gemm = load_module("tilelang_trace_example_gemm", gemm_path)
     rms_norm = load_module("tilelang_trace_example_rms_norm", rms_norm_path)
+    layer_norm = load_module("tilelang_trace_example_layer_norm", layer_norm_path)
     flash_attention = load_module(
         "tilelang_trace_example_mha_fwd_bshd", flash_attention_path
     )
+    convolution = load_module(
+        "tilelang_trace_example_convolution", convolution_path
+    )
+    elementwise = load_module(
+        "tilelang_trace_example_elementwise", elementwise_path
+    )
+    splitk = load_module("tilelang_trace_example_splitk", splitk_path)
 
     tokens = 2048
     hidden_size = 4096
@@ -249,6 +272,17 @@ def build_workloads(repo_root: Path) -> list[dict[str, Any]]:
     rms_norm_jit = rms_norm.rms_norm
     rms_norm_prim = rms_norm_jit.get_tir(M=8192, N=8192, blk_m=1)
 
+    layer_norm_jit = layer_norm._layernorm_fwd
+    layer_norm_prim = layer_norm_jit.get_tir(
+        N=4096,
+        D=8192,
+        eps=1e-5,
+        blk_m=1,
+        threads=256,
+        in_dtype="bfloat16",
+        out_dtype="bfloat16",
+    )
+
     flash_attention_jit = flash_attention.flashattn.jit_impl
     flash_attention_prim = flash_attention_jit.get_tir(
         8,
@@ -260,6 +294,46 @@ def build_workloads(repo_root: Path) -> list[dict[str, Any]]:
         block_N=128,
         num_stages=1,
         threads=128,
+    )
+
+    convolution_jit = convolution.convolution
+    convolution_prim = convolution_jit.get_tir(
+        N=128,
+        C=128,
+        H=64,
+        W=64,
+        F=128,
+        K=3,
+        S=1,
+        D=1,
+        P=1,
+        block_M=64,
+        block_N=128,
+        block_K=32,
+        num_stages=3,
+        threads=256,
+    )
+
+    elementwise_jit = elementwise.elementwise_add
+    elementwise_prim = elementwise_jit.get_tir(
+        M=4096,
+        N=4096,
+        block_M=32,
+        block_N=32,
+        in_dtype="float32",
+        out_dtype="float32",
+        threads=128,
+    )
+
+    splitk_jit = splitk.matmul
+    splitk_prim = splitk_jit.get_tir(
+        M=4096,
+        N=4096,
+        K=4096,
+        block_M=128,
+        block_N=128,
+        block_K=32,
+        split_k=4,
     )
 
     return [
@@ -336,6 +410,22 @@ def build_workloads(repo_root: Path) -> list[dict[str, Any]]:
             "scope_note": "exact fixed configuration used by the example main program",
         },
         {
+            "name": "layer_norm_bf16_4096x8192",
+            "example_path": layer_norm_path,
+            "prim_func": layer_norm_prim,
+            "pass_configs": dict(layer_norm_jit.pass_configs or {}),
+            "configuration": {
+                "N": 4096,
+                "D": 8192,
+                "eps": 1e-5,
+                "block_M": 1,
+                "threads": 256,
+                "in_dtype": "bfloat16",
+                "out_dtype": "bfloat16",
+            },
+            "scope_note": "exact forward configuration used by the example main program",
+        },
+        {
             "name": "flash_attention_fp16_b8_h32_s4096_d128",
             "example_path": flash_attention_path,
             "prim_func": flash_attention_prim,
@@ -350,6 +440,64 @@ def build_workloads(repo_root: Path) -> list[dict[str, Any]]:
                 "block_N": 128,
                 "num_stages": 1,
                 "threads": 128,
+            },
+            "scope_note": "exact fixed configuration used by run_regression_perf",
+        },
+        {
+            "name": "convolution_fp16_n128_c128_h64_w64_f128_k3",
+            "example_path": convolution_path,
+            "prim_func": convolution_prim,
+            "pass_configs": dict(convolution_jit.pass_configs or {}),
+            "configuration": {
+                "N": 128,
+                "C": 128,
+                "H": 64,
+                "W": 64,
+                "F": 128,
+                "K": 3,
+                "stride": 1,
+                "dilation": 1,
+                "padding": 1,
+                "block_M": 64,
+                "block_N": 128,
+                "block_K": 32,
+                "num_stages": 3,
+                "threads": 256,
+            },
+            "scope_note": "exact fixed configuration used by run_regression_perf",
+        },
+        {
+            "name": "elementwise_add_fp32_4096x4096",
+            "example_path": elementwise_path,
+            "prim_func": elementwise_prim,
+            "pass_configs": dict(elementwise_jit.pass_configs or {}),
+            "configuration": {
+                "M": 4096,
+                "N": 4096,
+                "block_M": 32,
+                "block_N": 32,
+                "threads": 128,
+                "in_dtype": "float32",
+                "out_dtype": "float32",
+            },
+            "scope_note": "exact fixed configuration used by run_regression_perf",
+        },
+        {
+            "name": "splitk_gemm_fp16_4096_split4",
+            "example_path": splitk_path,
+            "prim_func": splitk_prim,
+            "pass_configs": dict(splitk_jit.pass_configs or {}),
+            "configuration": {
+                "M": 4096,
+                "N": 4096,
+                "K": 4096,
+                "block_M": 128,
+                "block_N": 128,
+                "block_K": 32,
+                "split_k": 4,
+                "threads": 128,
+                "in_dtype": "float16",
+                "accum_dtype": "float32",
             },
             "scope_note": "exact fixed configuration used by run_regression_perf",
         },
@@ -386,6 +534,42 @@ def rewrite_launch_bounds(source: str, blocks: int) -> tuple[str, int]:
     if count == 0:
         raise RuntimeError("launch-bound scan found no CUDA min-blocks argument")
     return rewritten, count
+
+
+def extract_kernel_launch_metadata(device_mod: tvm.IRModule) -> dict[str, dict[str, Any]]:
+    """Record occupancy-relevant launch metadata retained on device PrimFuncs."""
+
+    launches: dict[str, dict[str, Any]] = {}
+    for global_var, func in device_mod.functions.items():
+        attrs = func.attrs
+        symbol = str(attrs["global_symbol"]) if "global_symbol" in attrs else global_var.name_hint
+        thread_extents: dict[str, int | str] = {}
+        threads_per_block = 1
+        if "thread_extent" in attrs:
+            for tag, extent in attrs["thread_extent"].items():
+                tag_name = str(tag)
+                try:
+                    extent_value: int | str = int(extent)
+                except (TypeError, ValueError):
+                    extent_value = str(extent)
+                thread_extents[tag_name] = extent_value
+                if tag_name.startswith("threadIdx.") and isinstance(extent_value, int):
+                    threads_per_block *= extent_value
+
+        dynamic_shared_memory_bytes: int | str = 0
+        if "dyn_shared_memory_buf" in attrs:
+            dynamic_shared_memory = attrs["dyn_shared_memory_buf"]
+            try:
+                dynamic_shared_memory_bytes = int(dynamic_shared_memory)
+            except (TypeError, ValueError):
+                dynamic_shared_memory_bytes = str(dynamic_shared_memory)
+
+        launches[symbol] = {
+            "threads_per_block": threads_per_block,
+            "thread_extents": dict(sorted(thread_extents.items())),
+            "dynamic_shared_memory_bytes": dynamic_shared_memory_bytes,
+        }
+    return dict(sorted(launches.items()))
 
 
 def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -432,6 +616,7 @@ def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                 source = str(artifact.kernel_source or "")
                 if not source.strip():
                     raise RuntimeError(f"empty CUDA source for {workload['name']}/{arch}/{mode}")
+                kernel_launches = extract_kernel_launch_metadata(artifact.device_mod)
                 lowered_source_sha256 = sha256_text(source)
                 launch_blocks = launch_bounds_blocks(mode)
                 launch_bounds_rewrites = 0
@@ -455,6 +640,7 @@ def lower_sources(workloads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                     "int4x2_unpack_occurrences": source.count("tl_unpack_int4x2("),
                     "launch_bounds_min_blocks": launch_blocks or 1,
                     "launch_bounds_rewrites": launch_bounds_rewrites,
+                    "kernel_launches": kernel_launches,
                     "source_path": source_path.relative_to(RAW_DIR).as_posix(),
                 }
                 record["cases"].append(case)
@@ -890,9 +1076,17 @@ def enrich_launch_bounds_scan(
                     candidate["lowered_source_sha256"]
                     == planner["lowered_source_sha256"]
                 )
+                launch_metadata_isolated = (
+                    candidate["kernel_launches"] == planner["kernel_launches"]
+                )
                 if not source_isolated:
                     raise RuntimeError(
                         f"launch-bound mode changed TileLang lowering for "
+                        f"{workload['name']}/{arch}/{mode}"
+                    )
+                if not launch_metadata_isolated:
+                    raise RuntimeError(
+                        f"launch-bound mode changed kernel launch metadata for "
                         f"{workload['name']}/{arch}/{mode}"
                     )
                 if compile_error := candidate.get("compile_error"):
@@ -902,6 +1096,7 @@ def enrich_launch_bounds_scan(
                             "mode": mode,
                             "min_blocks_per_sm": launch_bounds_blocks(mode),
                             "source_isolated": source_isolated,
+                            "launch_metadata_isolated": launch_metadata_isolated,
                             "static_candidate": False,
                             "compile_error": compile_error,
                         }
@@ -912,18 +1107,47 @@ def enrich_launch_bounds_scan(
                 candidate_regs = max_resource(candidate, "n_regs")
                 spill_stores = sum_resource(candidate, "spill_store_bytes")
                 spill_loads = sum_resource(candidate, "spill_load_bytes")
-                reduced = candidate_regs < planner_regs
+                same_entries = candidate["resources"].keys() == planner["resources"].keys()
+                reduced = same_entries and any(
+                    int(candidate["resources"][name]["n_regs"])
+                    < int(planner["resources"][name]["n_regs"])
+                    for name in planner["resources"]
+                )
+                registers_nonregressed = same_entries and all(
+                    int(candidate["resources"][name]["n_regs"])
+                    <= int(planner["resources"][name]["n_regs"])
+                    for name in planner["resources"]
+                )
+                local_memory_nonregressed = same_entries and all(
+                    int(candidate["resources"][name][field])
+                    <= int(planner["resources"][name][field])
+                    for name in planner["resources"]
+                    for field in ("local_bytes", "stack_frame_bytes")
+                )
                 nonregressed = (
                     candidate["instruction_count"] <= planner["instruction_count"]
                 )
                 zero_spill = spill_stores == 0 and spill_loads == 0
-                viable = reduced and nonregressed and zero_spill
+                cubin_nonregressed = candidate["cubin_bytes"] <= planner["cubin_bytes"]
+                viable = (
+                    reduced
+                    and registers_nonregressed
+                    and local_memory_nonregressed
+                    and nonregressed
+                    and zero_spill
+                    and cubin_nonregressed
+                )
                 comparison = {
                     "arch": arch,
                     "mode": mode,
                     "min_blocks_per_sm": launch_bounds_blocks(mode),
                     "source_isolated": source_isolated,
+                    "launch_metadata_isolated": launch_metadata_isolated,
                     "static_candidate": viable,
+                    "same_resource_entries": same_entries,
+                    "registers_nonregressed": registers_nonregressed,
+                    "local_memory_nonregressed": local_memory_nonregressed,
+                    "cubin_nonregressed": cubin_nonregressed,
                     "candidate_minus_planner": {
                         "cubin_bytes": candidate["cubin_bytes"]
                         - planner["cubin_bytes"],
@@ -998,9 +1222,17 @@ def enrich_auto_launch_bounds(
             source_isolated = (
                 automatic["lowered_source_sha256"] == planner["lowered_source_sha256"]
             )
+            launch_metadata_isolated = (
+                automatic["kernel_launches"] == planner["kernel_launches"]
+            )
             if not source_isolated:
                 raise RuntimeError(
                     f"automatic launch bounds changed TileLang lowering for "
+                    f"{workload['name']}/{arch}"
+                )
+            if not launch_metadata_isolated:
+                raise RuntimeError(
+                    f"automatic launch bounds changed kernel launch metadata for "
                     f"{workload['name']}/{arch}"
                 )
 
@@ -1044,6 +1276,7 @@ def enrich_auto_launch_bounds(
                     "arch": arch,
                     "selection": selection,
                     "source_isolated": source_isolated,
+                    "launch_metadata_isolated": launch_metadata_isolated,
                     "instruction_delta": automatic["instruction_count"]
                     - planner["instruction_count"],
                     "spill_store_bytes": spill_stores,
@@ -1175,6 +1408,27 @@ def write_report(payload: dict[str, Any]) -> None:
         mode for mode in payload["modes"] if launch_bounds_blocks(mode) is not None
     ]
     if launch_modes:
+        lines.extend(
+            [
+                "## Kernel launch resource context",
+                "",
+                "| Workload | Arch | kernel | threads/block | dynamic shared bytes |",
+                "|---|---:|---:|---:|---:|",
+            ]
+        )
+        for workload in payload["workloads"]:
+            by_key = {
+                (case["arch"], case["mode"]): case for case in workload["cases"]
+            }
+            for arch in payload["architectures"]:
+                planner = by_key[(arch, "planner")]
+                for kernel_name, launch in planner["kernel_launches"].items():
+                    lines.append(
+                        f"| `{workload['name']}` | `{arch}` | `{kernel_name}` | "
+                        f"{launch['threads_per_block']} | "
+                        f"{launch['dynamic_shared_memory_bytes']} |"
+                    )
+        lines.append("")
         lines.extend(
             [
                 "## CUDA launch-bound scan",
@@ -1338,7 +1592,7 @@ def main() -> int:
     enrich_launch_bounds_scan(workload_records, aggregate)
     enrich_auto_launch_bounds(workload_records, aggregate)
     payload = {
-        "schema": "tilelang-real-vectorization-workloads-v3",
+        "schema": "tilelang-real-vectorization-workloads-v4",
         "repository": REPOSITORY,
         "source_sha": SOURCE_SHA,
         "python": platform.python_version(),
