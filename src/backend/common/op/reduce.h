@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -423,7 +424,8 @@ inline std::optional<std::string> MakeCodegenReducer(const ReduceOpNode &op,
 }
 
 inline bool CanUsePackedRamp(const PrimExpr &index, const Var &var, int vsize,
-                             arith::Analyzer *analyzer) {
+                             arith::Analyzer *analyzer,
+                             std::string *failure_reason = nullptr) {
   ICHECK_GT(vsize, 1);
 
   PrimExpr vector_size = make_const(var.dtype(), vsize);
@@ -433,6 +435,13 @@ inline bool CanUsePackedRamp(const PrimExpr &index, const Var &var, int vsize,
 
   PrimExpr index_mod = FloorMod(ramp_base, make_const(index.dtype(), vsize));
   if (!analyzer->CanProveEqual(index_mod, make_zero(index.dtype()))) {
+    if (failure_reason != nullptr) {
+      std::ostringstream os;
+      os << "unaligned ramp base: index=" << index
+         << ", packed_base=" << ramp_base
+         << ", base_mod=" << analyzer->Simplify(index_mod);
+      *failure_reason = os.str();
+    }
     return false;
   }
 
@@ -443,6 +452,12 @@ inline bool CanUsePackedRamp(const PrimExpr &index, const Var &var, int vsize,
     PrimExpr expected =
         analyzer->Simplify(ramp_base + make_const(index.dtype(), lane));
     if (!analyzer->CanProveEqual(lane_index, expected)) {
+      if (failure_reason != nullptr) {
+        std::ostringstream os;
+        os << "non-contiguous lane " << lane << ": index=" << index
+           << ", lane_index=" << lane_index << ", expected=" << expected;
+        *failure_reason = os.str();
+      }
       return false;
     }
   }
@@ -931,11 +946,12 @@ template <typename Impl> struct ReduceLowerer {
             ext && ext->value >= vsize && ext->value % vsize == 0;
         const bool reducer_eligible =
             vsize > 1 && reduce::MakeCodegenReducer(op, vsize).has_value();
+        std::string ramp_failure_reason;
         const bool ramp_eligible =
             extent_eligible && reducer_eligible &&
             reduce::CanUsePackedRamp(src_indice_compressed.back(),
                                      src_var_compressed.back()->var, vsize,
-                                     analyzer);
+                                     analyzer, &ramp_failure_reason);
         if (tl_config::ReducerPlanVerboseEnabled()) {
           LOG(INFO) << "[ReducePackedPlan] src=" << op.src->name
                     << ", dst=" << op.dst->name << ", vsize=" << vsize
@@ -945,7 +961,10 @@ template <typename Impl> struct ReduceLowerer {
                     << ", extent_eligible=" << extent_eligible
                     << ", reducer_eligible=" << reducer_eligible
                     << ", ramp_eligible=" << ramp_eligible
-                    << ", decision=" << (ramp_eligible ? "packed" : "scalar");
+                    << ", decision=" << (ramp_eligible ? "packed" : "scalar")
+                    << (ramp_failure_reason.empty()
+                            ? ""
+                            : ", ramp_failure=" + ramp_failure_reason);
         }
         if (ramp_eligible) {
           can_pack = true;
