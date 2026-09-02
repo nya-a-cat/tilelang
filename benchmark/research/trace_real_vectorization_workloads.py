@@ -679,7 +679,7 @@ def validate_predicated_async_negative_controls() -> list[dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     records = []
     for name, func in controls.items():
-        source = tilelang.lower(
+        source = tl.lower(
             func, target=target, enable_device_compile=False
         ).kernel_source
         occurrences = len(
