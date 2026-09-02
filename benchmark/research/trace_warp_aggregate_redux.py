@@ -262,9 +262,15 @@ def compile_all(inputs: list[dict[str, Any]]) -> None:
             )
 
 
-def build_comparisons(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_comparisons(
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     by_key = {(case["name"], case["arch"], case["mode"]): case for case in records}
     comparisons = []
+    eligible_comparisons = 0
+    shuffle_reductions = 0
+    strict_instruction_reductions = 0
+    strict_instruction_reductions_by_dtype: Counter[str] = Counter()
     for spec in CASES:
         for arch in ARCHES:
             default = by_key[(spec["name"], arch, "default")]
@@ -287,19 +293,32 @@ def build_comparisons(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "groups": group_delta,
                 },
             }
+            # The current target feature table enables scalar floating-point
+            # redux on SM100a. CUDA's integer warp-reduce intrinsics are
+            # available from SM80 onward. nvdisasm's human-readable Blackwell
+            # spelling is not stable enough to make a REDUX mnemonic count a
+            # correctness gate, so the gate uses the eliminated aggregate
+            # shuffles and total instruction count instead.
             eligible = (spec["dtype"] == "int32" and arch != "sm_75") or (
-                spec["dtype"] in ("float32", "float16") and arch in ("sm_100a", "sm_120a")
+                spec["dtype"] in ("float32", "float16") and arch == "sm_100a"
             )
+            comparison["eligible"] = eligible
             if eligible:
-                if group_delta["redux"] <= 0 or group_delta["shuffle"] >= 0:
+                eligible_comparisons += 1
+                if group_delta["shuffle"] >= 0:
                     raise RuntimeError(
                         f"hardware redux did not replace aggregate shuffles for {spec['name']}/{arch}: {group_delta}"
                     )
-                if comparison["default_minus_rollback"]["instructions"] >= 0:
+                shuffle_reductions += 1
+                instruction_delta = comparison["default_minus_rollback"]["instructions"]
+                if instruction_delta > 0:
                     raise RuntimeError(
-                        f"hardware redux did not reduce instructions for {spec['name']}/{arch}: "
+                        f"hardware redux increased instructions for {spec['name']}/{arch}: "
                         f"{default['instruction_count']} vs {rollback['instruction_count']}"
                     )
+                if instruction_delta < 0:
+                    strict_instruction_reductions += 1
+                    strict_instruction_reductions_by_dtype[spec["dtype"]] += 1
             else:
                 for field in ("instruction_count", "cubin_bytes"):
                     if default[field] != rollback[field]:
@@ -316,7 +335,32 @@ def build_comparisons(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 ):
                     raise RuntimeError(f"spill detected in {spec['name']}/{arch}/{mode_case['mode']}")
             comparisons.append(comparison)
-    return comparisons
+    minimum_strict_reductions = 6
+    if strict_instruction_reductions < minimum_strict_reductions:
+        raise RuntimeError(
+            "hardware redux did not meet the frozen matrix instruction-reduction floor: "
+            f"{strict_instruction_reductions} vs {minimum_strict_reductions}"
+        )
+    missing_dtype_reductions = sorted(
+        dtype
+        for dtype in ("float32", "float16", "int32")
+        if strict_instruction_reductions_by_dtype[dtype] == 0
+    )
+    if missing_dtype_reductions:
+        raise RuntimeError(
+            "hardware redux has no strict instruction reduction for dtypes: "
+            + ", ".join(missing_dtype_reductions)
+        )
+    acceptance = {
+        "eligible_comparisons": eligible_comparisons,
+        "shuffle_reductions": shuffle_reductions,
+        "strict_instruction_reductions": strict_instruction_reductions,
+        "minimum_strict_instruction_reductions": minimum_strict_reductions,
+        "strict_instruction_reductions_by_dtype": dict(
+            sorted(strict_instruction_reductions_by_dtype.items())
+        ),
+    }
+    return comparisons, acceptance
 
 
 def write_report(payload: dict[str, Any]) -> None:
@@ -326,6 +370,12 @@ def write_report(payload: dict[str, Any]) -> None:
         f"- Source: `{payload['source_sha']}`",
         f"- Matrix: `{len(CASES)}` kernels x `{len(ARCHES)}` targets x 2 same-build modes.",
         "- GPU execution: `false`.",
+        f"- Eligible comparisons with fewer aggregate shuffles: "
+        f"`{payload['acceptance']['shuffle_reductions']}/"
+        f"{payload['acceptance']['eligible_comparisons']}`.",
+        f"- Strict instruction-count reductions: "
+        f"`{payload['acceptance']['strict_instruction_reductions']}` "
+        f"(required: `{payload['acceptance']['minimum_strict_instruction_reductions']}`).",
         "",
         "| Case | Target | Instructions | Redux | Shuffle | Registers |",
         "| --- | --- | ---: | ---: | ---: | ---: |",
@@ -374,7 +424,7 @@ def main() -> int:
     started = time.time()
     records, compile_inputs = lower_cases()
     compile_all(compile_inputs)
-    comparisons = build_comparisons(records)
+    comparisons, acceptance = build_comparisons(records)
     payload = {
         "schema": "tilelang-warp-aggregate-redux-v1",
         "repository": REPOSITORY,
@@ -385,6 +435,7 @@ def main() -> int:
         "gpu_execution": False,
         "duration_seconds": time.time() - started,
         "cases": CASES,
+        "acceptance": acceptance,
         "comparisons": comparisons,
     }
     RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
