@@ -11,6 +11,14 @@ on:
         description: Exact commit with a published Colab base wheel
         required: true
         type: string
+      research_trace:
+        description: Static research trace suite to execute
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - fp32x2
 
 permissions:
   contents: read
@@ -1214,6 +1222,7 @@ jobs:
           )
 
       - name: Trace layout cost features without a GPU
+        if: inputs.research_trace == 'all'
         id: layout-cost-trace
         shell: bash
         env:
@@ -1235,6 +1244,7 @@ jobs:
           )
 
       - name: Trace CUDA AllReduce strategies without a GPU
+        if: inputs.research_trace == 'all'
         id: allreduce-strategy-trace
         shell: bash
         env:
@@ -1254,6 +1264,7 @@ jobs:
           )
 
       - name: Trace local T.Parallel vectorization without a GPU
+        if: inputs.research_trace == 'all'
         id: parallel-vectorization-trace
         shell: bash
         env:
@@ -1277,6 +1288,7 @@ jobs:
           )
 
       - name: Compile warp-aggregate redux matrix without a GPU
+        if: inputs.research_trace == 'all'
         id: warp-aggregate-redux
         shell: bash
         env:
@@ -1301,7 +1313,34 @@ jobs:
             sha256sum --check SHA256SUMS
           )
 
+      - name: Compile FP32x2 reduction matrix without a GPU
+        if: inputs.research_trace == 'all' || inputs.research_trace == 'fp32x2'
+        id: fp32x2-reduction
+        shell: bash
+        env:
+          TILELANG_SOURCE_SHA: ${{ steps.refs.outputs.source_sha }}
+          TILELANG_FP32X2_REDUCTION_ARCHES: sm_80,sm_90a,sm_100a,sm_120a
+          TILELANG_FP32X2_REDUCTION_WORKERS: "4"
+          TILELANG_FP32X2_REDUCTION_RESULT: native-overlay-evidence/fp32x2-reduction.json
+          TILELANG_FP32X2_REDUCTION_REPORT: native-overlay-evidence/fp32x2-reduction.md
+          TILELANG_FP32X2_REDUCTION_RAW_DIR: native-overlay-evidence/fp32x2-reduction-raw
+          TILELANG_FP32X2_REDUCTION_RAW_ARCHIVE: native-overlay-evidence/fp32x2-reduction-raw.zip
+        run: |
+          set -euo pipefail
+          native-overlay-selftest/bin/python \
+            benchmark/research/trace_fp32x2_reduction.py
+          rm -rf -- native-overlay-evidence/fp32x2-reduction-raw
+          (
+            cd native-overlay-evidence
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | LC_ALL=C sort -z \
+              | xargs -0 -r sha256sum \
+              > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
       - name: Compile frozen real vectorization workloads without a GPU
+        if: inputs.research_trace == 'all'
         id: real-vectorization-workloads
         shell: bash
         env:
