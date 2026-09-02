@@ -242,8 +242,8 @@ template <int all_threads> struct NamedBarrier {
 //                     after publishing the aggregates; callers must order any
 //                     preceding reuse of the workspace.
 //   warp_aggregate_redux - use a hardware warp reduction for the compact
-//                     second level when the reduction is idempotent and the
-//                     target ISA implements its exact scalar semantics.
+//                     second level when the target ISA implements its exact
+//                     scalar semantics.
 template <class Reducer, int threads, int scale, int thread_offset = 0,
           class Barrier = SyncThreadsBarrier, int batch_size = 1,
           int workspace_stride = 0, bool hierarchical = false,
@@ -298,6 +298,7 @@ private:
                          batch_size, workspace_stride, false>;
 
   template <typename T> static TL_DEVICE T reduce_warp_aggregates(T x) {
+    constexpr int kWarps = threads / 32;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) &&                       \
     (defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM100_F))
     constexpr bool kReduxF32Type = std::is_same_v<T, float> ||
@@ -320,8 +321,16 @@ private:
     if constexpr (warp_aggregate_redux && kReduxIntType && kReduxIntOp) {
       return warp_reduce(x, Reducer());
     }
+    constexpr bool kReduxFullWarpIntOp =
+        std::is_same_v<Reducer, SumOp> || std::is_same_v<Reducer, BitXorOp>;
+    if constexpr (warp_aggregate_redux && kReduxIntType &&
+                  kReduxFullWarpIntOp && kWarps == 32) {
+      // With 32 source warps, every lane holds one unique aggregate. Smaller
+      // groups need a partial-mask reduction plus a broadcast, whose control
+      // overhead is not profitable in the generated machine code.
+      return warp_reduce(x, Reducer());
+    }
 #endif
-    constexpr int kWarps = threads / 32;
 #pragma unroll
     for (int offset = kWarps / 2; offset > 0; offset >>= 1) {
       x = Reducer()(x, tl::shfl_xor_sync(uint32_t(-1), x, offset));

@@ -71,9 +71,13 @@ CASES = (
     {"name": "f32_max_t128", "dtype": "float32", "op": "max", "threads": 128},
     {"name": "f32_min_t1024", "dtype": "float32", "op": "min", "threads": 1024},
     {"name": "f16_max_t256", "dtype": "float16", "op": "max", "threads": 256},
+    {"name": "i32_sum_t128", "dtype": "int32", "op": "sum", "threads": 128},
+    {"name": "i32_sum_t1024", "dtype": "int32", "op": "sum", "threads": 1024},
     {"name": "i32_max_t128", "dtype": "int32", "op": "max", "threads": 128},
     {"name": "i32_min_t256", "dtype": "int32", "op": "min", "threads": 256},
     {"name": "i32_bitor_t1024", "dtype": "int32", "op": "bitor", "threads": 1024},
+    {"name": "i32_bitxor_t256", "dtype": "int32", "op": "bitxor", "threads": 256},
+    {"name": "i32_bitxor_t1024", "dtype": "int32", "op": "bitxor", "threads": 1024},
 )
 ALLREDUCE_CALL_RE = re.compile(r"tl::AllReduce<[^;]+?::run(?:_batch)?")
 SASS_INSTRUCTION_RE = re.compile(
@@ -108,6 +112,10 @@ def make_kernel(case: dict[str, Any]):
                 T.reduce_min(values, result, dim=0, clear=True)
             elif op == "bitor":
                 T.reduce_bitor(values, result, dim=0, clear=True)
+            elif op == "sum":
+                T.reduce_sum(values, result, dim=0, clear=True)
+            elif op == "bitxor":
+                T.reduce_bitxor(values, result, dim=0, clear=True)
             if T.get_thread_binding() == 0:
                 B[0] = result[0]
 
@@ -271,6 +279,7 @@ def build_comparisons(
     shuffle_reductions = 0
     strict_instruction_reductions = 0
     strict_instruction_reductions_by_dtype: Counter[str] = Counter()
+    strict_instruction_reductions_by_op: Counter[str] = Counter()
     for spec in CASES:
         for arch in ARCHES:
             default = by_key[(spec["name"], arch, "default")]
@@ -299,9 +308,14 @@ def build_comparisons(
             # spelling is not stable enough to make a REDUX mnemonic count a
             # correctness gate, so the gate uses the eliminated aggregate
             # shuffles and total instruction count instead.
-            eligible = (spec["dtype"] == "int32" and arch != "sm_75") or (
-                spec["dtype"] in ("float32", "float16") and arch == "sm_100a"
-            )
+            eligible = (
+                spec["dtype"] == "int32"
+                and arch != "sm_75"
+                and (
+                    spec["op"] in ("max", "min", "bitor")
+                    or (spec["op"] in ("sum", "bitxor") and spec["threads"] == 1024)
+                )
+            ) or (spec["dtype"] in ("float32", "float16") and arch == "sm_100a")
             comparison["eligible"] = eligible
             if eligible:
                 eligible_comparisons += 1
@@ -319,6 +333,7 @@ def build_comparisons(
                 if instruction_delta < 0:
                     strict_instruction_reductions += 1
                     strict_instruction_reductions_by_dtype[spec["dtype"]] += 1
+                    strict_instruction_reductions_by_op[spec["op"]] += 1
             else:
                 for field in ("instruction_count", "cubin_bytes"):
                     if default[field] != rollback[field]:
@@ -351,6 +366,16 @@ def build_comparisons(
             "hardware redux has no strict instruction reduction for dtypes: "
             + ", ".join(missing_dtype_reductions)
         )
+    missing_op_reductions = sorted(
+        op
+        for op in {case["op"] for case in CASES}
+        if strict_instruction_reductions_by_op[op] == 0
+    )
+    if missing_op_reductions:
+        raise RuntimeError(
+            "hardware redux has no strict instruction reduction for ops: "
+            + ", ".join(missing_op_reductions)
+        )
     acceptance = {
         "eligible_comparisons": eligible_comparisons,
         "shuffle_reductions": shuffle_reductions,
@@ -358,6 +383,9 @@ def build_comparisons(
         "minimum_strict_instruction_reductions": minimum_strict_reductions,
         "strict_instruction_reductions_by_dtype": dict(
             sorted(strict_instruction_reductions_by_dtype.items())
+        ),
+        "strict_instruction_reductions_by_op": dict(
+            sorted(strict_instruction_reductions_by_op.items())
         ),
     }
     return comparisons, acceptance
