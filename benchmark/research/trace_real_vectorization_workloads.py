@@ -30,7 +30,11 @@ import zipfile
 import tilelang as tl
 import tilelang.language as T
 from tilelang import tvm
-from tilelang.contrib.cuda_resource_info import pop_recorded, reset_recorder
+from tilelang.contrib.cuda_resource_info import (
+    pop_auto_launch_bounds_selection,
+    pop_recorded,
+    reset_recorder,
+)
 from tilelang.cuda.backend import tilelang_callback_cuda_compile
 
 
@@ -508,6 +512,7 @@ def compile_case(item: dict[str, Any], nvdisasm: str) -> dict[str, Any]:
             item["pass_configs"],
         )
     )
+    auto_launch_bounds_selection = pop_auto_launch_bounds_selection()
     compile_seconds = time.perf_counter() - started
     resources = {
         name: asdict(usage)
@@ -525,7 +530,7 @@ def compile_case(item: dict[str, Any], nvdisasm: str) -> dict[str, Any]:
         timeout=180,
     ).stdout
     sass_path.write_text(disassembly, encoding="utf-8")
-    return {
+    result = {
         "compile_seconds": compile_seconds,
         "cubin_sha256": sha256_bytes(cubin),
         "cubin_bytes": len(cubin),
@@ -534,6 +539,9 @@ def compile_case(item: dict[str, Any], nvdisasm: str) -> dict[str, Any]:
         "resources": resources,
         **parse_sass(disassembly),
     }
+    if auto_launch_bounds_selection is not None:
+        result["auto_launch_bounds_selection"] = auto_launch_bounds_selection
+    return result
 
 
 def compile_all(compile_inputs: list[dict[str, Any]]) -> None:
@@ -971,6 +979,15 @@ def enrich_auto_launch_bounds(
     def sum_resource(case: dict[str, Any], field: str) -> int:
         return sum(int(resource[field]) for resource in case["resources"].values())
 
+    def machine_signature(case: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "cubin_bytes": case["cubin_bytes"],
+            "instruction_count": case["instruction_count"],
+            "groups": case["groups"],
+            "opcodes": case["opcodes"],
+            "resources": case["resources"],
+        }
+
     for workload in workload_records:
         by_key = {(case["arch"], case["mode"]): case for case in workload["cases"]}
         workload["auto_launch_bounds_comparisons"] = []
@@ -987,16 +1004,24 @@ def enrich_auto_launch_bounds(
                     f"{workload['name']}/{arch}"
                 )
 
-            if automatic["cubin_sha256"] == planner["cubin_sha256"]:
+            selected_min_blocks = automatic.get("auto_launch_bounds_selection")
+            if selected_min_blocks == 1:
                 selection = "planner"
+                reference = planner
                 baseline_selections += 1
-            elif automatic["cubin_sha256"] == candidate["cubin_sha256"]:
+            elif selected_min_blocks == 2:
                 selection = "planner_lb2"
+                reference = candidate
                 candidate_selections += 1
             else:
                 raise RuntimeError(
-                    f"automatic launch-bound CUBIN matches neither reference for "
-                    f"{workload['name']}/{arch}"
+                    f"automatic launch-bound selection metadata is invalid for "
+                    f"{workload['name']}/{arch}: {selected_min_blocks}"
+                )
+            if machine_signature(automatic) != machine_signature(reference):
+                raise RuntimeError(
+                    f"automatic launch-bound machine code differs from its selected "
+                    f"reference for {workload['name']}/{arch}"
                 )
 
             spill_stores = sum_resource(automatic, "spill_store_bytes")

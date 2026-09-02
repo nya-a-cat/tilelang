@@ -42,6 +42,7 @@ def reset_recorder() -> None:
     """Begin a fresh CUDA resource-recording window on this thread."""
     _RECORDER.items = {}
     _RECORDER.last = {}
+    _RECORDER.auto_launch_bounds_selection = None
 
 
 def pop_recorded() -> dict[str, KernelResourceUsage]:
@@ -66,6 +67,20 @@ def record_usage(usage: dict[str, KernelResourceUsage]) -> None:
         _record(items, name, item)
 
 
+def record_auto_launch_bounds_selection(min_blocks_per_sm: int) -> None:
+    """Record the launch-bound variant selected by the latest CUDA compile."""
+
+    _RECORDER.auto_launch_bounds_selection = int(min_blocks_per_sm)
+
+
+def pop_auto_launch_bounds_selection() -> int | None:
+    """Return and clear the latest automatic launch-bound selection."""
+
+    selection = getattr(_RECORDER, "auto_launch_bounds_selection", None)
+    _RECORDER.auto_launch_bounds_selection = None
+    return selection
+
+
 @contextmanager
 def isolated_recorder() -> Iterator[None]:
     """Temporarily isolate nested CUDA compiler resource records.
@@ -77,8 +92,10 @@ def isolated_recorder() -> Iterator[None]:
 
     had_items = hasattr(_RECORDER, "items")
     had_last = hasattr(_RECORDER, "last")
+    had_selection = hasattr(_RECORDER, "auto_launch_bounds_selection")
     previous_items = getattr(_RECORDER, "items", None)
     previous_last = getattr(_RECORDER, "last", None)
+    previous_selection = getattr(_RECORDER, "auto_launch_bounds_selection", None)
     reset_recorder()
     try:
         yield
@@ -91,6 +108,10 @@ def isolated_recorder() -> Iterator[None]:
             _RECORDER.last = previous_last
         else:
             _RECORDER.__dict__.pop("last", None)
+        if had_selection:
+            _RECORDER.auto_launch_bounds_selection = previous_selection
+        else:
+            _RECORDER.__dict__.pop("auto_launch_bounds_selection", None)
 
 
 def _record(items: dict[str, KernelResourceUsage] | None, name: str, usage: KernelResourceUsage) -> None:

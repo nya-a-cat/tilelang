@@ -7,7 +7,12 @@ import tilelang
 import tilelang.cache.kernel_cache as kernel_cache_mod
 from tilelang.backend import create_backend_context
 from tilelang.cache.cuda_binary_cache import CUDABinaryCache
-from tilelang.contrib.cuda_resource_info import filter_and_record, pop_recorded, reset_recorder
+from tilelang.contrib.cuda_resource_info import (
+    filter_and_record,
+    pop_auto_launch_bounds_selection,
+    pop_recorded,
+    reset_recorder,
+)
 from tilelang.contrib.kernel_resource_info import KernelResourceUsage
 from tilelang.cache.kernel_cache import KernelCache
 from tilelang.env import env
@@ -118,6 +123,7 @@ def test_cuda_auto_launch_bounds_selects_spill_free_register_reduction(
     assert len(compile_sources) == 2
     assert usage["kernel"].n_regs == 128
     assert usage["kernel"].n_spills == 0
+    assert pop_auto_launch_bounds_selection() == 2
 
 
 def test_cuda_auto_launch_bounds_rejects_spilling_candidate(monkeypatch, tmp_path):
@@ -148,6 +154,7 @@ def test_cuda_auto_launch_bounds_rejects_spilling_candidate(monkeypatch, tmp_pat
     assert bytes(result) == b"baseline"
     assert usage["kernel"].n_regs == 240
     assert usage["kernel"].n_spills == 0
+    assert pop_auto_launch_bounds_selection() == 1
 
 
 def test_cuda_auto_launch_bounds_skips_low_register_kernel(monkeypatch, tmp_path):
@@ -174,6 +181,7 @@ def test_cuda_auto_launch_bounds_skips_low_register_kernel(monkeypatch, tmp_path
 
     assert bytes(result) == b"baseline"
     assert compile_sources == [source]
+    assert pop_auto_launch_bounds_selection() == 1
 
 
 def test_cuda_binary_cache_corrupted_entry_recompiles(monkeypatch, tmp_path):

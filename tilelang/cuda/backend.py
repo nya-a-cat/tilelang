@@ -13,6 +13,7 @@ from tilelang.contrib.cuda_resource_info import (
     isolated_recorder,
     pop_last_recorded,
     pop_recorded,
+    record_auto_launch_bounds_selection,
     record_usage,
     reset_recorder,
 )
@@ -110,6 +111,7 @@ def _compile_with_auto_launch_bounds(code, target, pass_config):
     base_config.pop(PassConfigKey.TL_ENABLE_AUTO_LAUNCH_BOUNDS, None)
     selected_binary: bytes | bytearray
     selected_usage: dict[str, KernelResourceUsage]
+    selected_min_blocks_per_sm = 1
 
     with isolated_recorder():
         baseline_binary = tilelang_callback_cuda_compile(code, target, base_config)
@@ -149,6 +151,7 @@ def _compile_with_auto_launch_bounds(code, target, pass_config):
                 ):
                     selected_binary = candidate_binary
                     selected_usage = candidate_usage
+                    selected_min_blocks_per_sm = 2
                     logger.info(
                         "CUDA auto launch bounds selected min_blocks_per_sm=2 "
                         "for %d kernel(s)",
@@ -156,6 +159,7 @@ def _compile_with_auto_launch_bounds(code, target, pass_config):
                     )
 
     record_usage(selected_usage)
+    record_auto_launch_bounds_selection(selected_min_blocks_per_sm)
     return selected_binary
 
 
