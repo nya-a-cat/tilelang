@@ -45,8 +45,8 @@ def solve_candidate_table(rows, register_costs, timeout_ms=100):
     for group in selected + layouts:
         opt.add(z3.PbEq([(x, 1) for x in group], 1))
     # Use separate weighted-soft groups, preserving lexicographic order.
-    opt.add_soft(z3.BoolVal(True, ctx), weight=1, id="memory")
-    opt.add_soft(z3.BoolVal(True, ctx), weight=1, id="registers")
+    memory_objective = opt.add_soft(z3.BoolVal(True, ctx), weight=1, id="memory")
+    register_objective = opt.add_soft(z3.BoolVal(True, ctx), weight=1, id="registers")
     for o, group in enumerate(rows):
         for c, row in enumerate(group):
             active = selected[o][c]
@@ -72,6 +72,10 @@ def solve_candidate_table(rows, register_costs, timeout_ms=100):
     encoded = [model.eval(expr).as_long() for expr in opt.objectives()]
     if encoded != [mem, regs]:
         raise RuntimeError(f"layout objective mismatch: {encoded} vs {[mem, regs]}")
+    for objective, cost in zip((memory_objective, register_objective), (mem, regs)):
+        bounds = (objective.lower(), objective.upper())
+        if any(not z3.is_int_value(bound) or bound.as_long() != cost for bound in bounds):
+            return {"status": "unknown"}
     return {"status": "optimal", "memory": mem, "registers": regs, "choices": choices}
 
 
