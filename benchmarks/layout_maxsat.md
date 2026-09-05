@@ -102,6 +102,13 @@ and candidate root controls must be checked before attributing timing changes.
 
 ## T4 results (2026-09-06)
 
+The results in this section concern constructed layout components. A subsequent
+[real-workload evaluation](layout_maxsat_real.md) tested 28 upstream operator
+and shared-expert configurations: 23 passed all numerical/graph checks, and
+MaxSAT adopted no new layouts. The positive constructions below therefore
+provide a limited mechanism demonstration; general model-workload gains remain
+unestablished.
+
 [Workflow 33992154463](https://github.com/nya-a-cat/tilelang/actions/runs/33992154463)
 built baseline `1a1df62e94d9736a2c9f13849bc4c2cf9377275b` and compiler candidate
 `2a8c5e5b56b13953c238b6b4b8ebbb19cf6c7676`. The final measurement script is
