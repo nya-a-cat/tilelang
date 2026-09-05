@@ -1463,7 +1463,7 @@ private:
             }
           }
           domains[b].push_back(layout);
-          costs.push_back(Integer(regs));
+          costs.push_back(Integer(IntImm(DataType::Int(64), regs)));
         }
         ids[a].push_back(id);
       }
@@ -1475,7 +1475,7 @@ private:
       for (size_t a = 0; a < attempts.size(); ++a) {
         auto cost = cost_model.Score({op}, attempts[a].infer_list,
                                      attempts[a].layout_map);
-        Array<Integer> row{Integer(cost.mem)};
+        Array<Integer> row{Integer(IntImm(DataType::Int(64), cost.mem))};
         for (size_t b = 0; b < buffers.size(); ++b) {
           auto uses = use_list_.find(buffers[b]);
           bool touched = uses != use_list_.end() &&

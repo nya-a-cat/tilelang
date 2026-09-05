@@ -40,6 +40,8 @@ def test_random_tables_against_exhaustive():
 def test_shared_register_charged_once_and_lexicographic():
     result = solve([[[0, 0], [1, 1]], [[0, 0], [1, 1]]], [[1000000, 1]], 5000)
     assert (result["memory"], result["registers"]) == (0, 1000000)
+    result = solve([[[2**40, 0], [2**40 + 1, 1]]], [[2**40, 0]], 5000)
+    assert (result["memory"], result["registers"]) == (2**40, 2**40)
 
 
 def test_independent_composition():
