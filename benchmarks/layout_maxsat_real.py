@@ -64,7 +64,7 @@ def cases():
     return specs
 
 
-def load_example(root, family):
+def load_example(root, family, shape):
     path = root / SOURCES[family]
     # Import full example modules with their original decorators and schedules.
     # The softmax file runs an 8192x8192 demo at module scope: omit only those
@@ -75,6 +75,9 @@ def load_example(root, family):
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     if family == "softmax":
+        # This upstream demo declares M/N at module scope rather than T.const.
+        # Supply the selected concrete dimensions before the JIT decorator runs.
+        module.__dict__.update(M=shape[0], N=shape[1])
         tree = ast.parse(path.read_text(), filename=str(path))
         tree.body = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom, ast.FunctionDef))]
         exec(compile(tree, str(path), "exec"), module.__dict__)
@@ -86,7 +89,7 @@ def load_example(root, family):
 def prepare(case, root):
     import torch
     import torch.nn.functional as F
-    module, source_hash = load_example(root, case["family"])
+    module, source_hash = load_example(root, case["family"], case["shape"])
     family, shape = case["family"], case["shape"]
     rand = lambda dims, dtype=torch.float16: torch.randn(dims, device="cuda", dtype=dtype)
     manual_outputs = None
