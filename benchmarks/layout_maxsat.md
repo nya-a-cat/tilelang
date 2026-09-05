@@ -74,9 +74,9 @@ branches. Reduction cases exercise the current eligibility restriction.
 Run each installed wheel in a fresh process with a distinct cache directory:
 
 ```sh
-TILELANG_CACHE_DIR=/content/layout-cache-baseline \
+TILELANG_DISABLE_CACHE=1 TILELANG_CACHE_DIR=/content/layout-cache-baseline \
   python layout_maxsat.py --variant baseline --output /content/layout-baseline
-TILELANG_CACHE_DIR=/content/layout-cache-candidate \
+TILELANG_DISABLE_CACHE=1 TILELANG_CACHE_DIR=/content/layout-cache-candidate \
   python layout_maxsat.py --variant candidate --output /content/layout-candidate
 ```
 

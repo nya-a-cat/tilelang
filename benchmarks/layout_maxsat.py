@@ -7,6 +7,7 @@ source, correctness verdict and compiler log; failures remain in the JSON report
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import random
 import statistics
@@ -109,6 +110,8 @@ def main():
     rng = random.Random(20260906)
     report = {"variant": args.variant, "tilelang": tilelang.__version__, "torch": torch.__version__,
               "gpu": torch.cuda.get_device_name(), "capability": torch.cuda.get_device_capability(),
+              "tilelang_disable_cache": os.environ.get("TILELANG_DISABLE_CACHE", "0"),
+              "tilelang_cache_dir": os.environ.get("TILELANG_CACHE_DIR"),
               "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "results": []}
     factories = {"broadcast": broadcast, "fused": broadcast, "branches": branches,
                  "transpose": transpose, "reduction": reduction}
@@ -152,7 +155,7 @@ def main():
                             assert status == driver.CUresult.CUDA_SUCCESS
                             resource[label] = value
                         record["resources"][symbol] = resource
-                    binary = Path(compiled.adapter.libpath).read_bytes()
+                    binary = Path(compiled.adapter.lib_generator.libpath).read_bytes()
                     (output / (name + ".cubin")).write_bytes(binary)
                     record["binary_sha256"] = hashlib.sha256(binary).hexdigest()
                 except Exception as error:
