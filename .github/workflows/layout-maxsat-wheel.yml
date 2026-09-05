@@ -5,7 +5,7 @@ on:
     paths: ['src/**', 'tilelang/**', '.github/workflows/layout-maxsat-wheel.yml']
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 jobs:
   build:
     if: github.repository == 'nya-a-cat/tilelang'
@@ -32,6 +32,11 @@ jobs:
           python -m pip freeze > build-environment.txt
       - name: Validate solver
         run: python -m pytest --confcutdir=testing/python/layout testing/python/layout/test_tilelang_layout_solver.py -q
+      - uses: actions/cache/restore@v4
+        with:
+          path: build
+          key: layout-maxsat-build-cuda130-v1-${{ github.sha }}
+          restore-keys: layout-maxsat-build-cuda130-v1-
       - name: Build exact upstream and candidate
         shell: bash
         run: |
@@ -47,6 +52,18 @@ jobs:
           git checkout --detach "$candidate"
           python -m pip wheel . --no-deps --no-build-isolation -w wheel-results/candidate
           find wheel-results -name '*.whl' -exec sha256sum {} + > wheel-results/SHA256SUMS
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: build
+          key: layout-maxsat-build-cuda130-v1-${{ github.sha }}
+      - name: Publish fork experimental wheels for remote Colab download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="layout-maxsat-${GITHUB_SHA:0:12}"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Layout MaxSAT experimental wheels ${GITHUB_SHA:0:8}" --notes-file wheel-results/source-revisions.txt wheel-results/baseline/*.whl wheel-results/candidate/*.whl wheel-results/SHA256SUMS wheel-results/build-environment.txt wheel-results/source-revisions.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

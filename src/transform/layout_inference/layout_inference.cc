@@ -1397,7 +1397,16 @@ private:
                     const std::vector<AttemptOutcome> &attempts,
                     const LayoutMap &strict_layout_map,
                     const LayoutCostModel &cost_model, int timeout_ms,
-                    std::string &status) {
+                    std::string &status, double &extraction_ms,
+                    double &solver_ms, double &validation_ms) {
+    auto phase = std::chrono::steady_clock::now();
+    auto elapsed = [&]() {
+      auto now = std::chrono::steady_clock::now();
+      double ms =
+          std::chrono::duration<double, std::milli>(now - phase).count();
+      phase = now;
+      return ms;
+    };
     status = "ineligible";
     if (attempts.size() < 2 || members.size() > 32 ||
         members.size() * attempts.size() > 256)
@@ -1413,7 +1422,7 @@ private:
     for (const auto &[buffer, layout] : attempts.front().layout_map) {
       auto aliases = buffer_data_to_buffers_.find(buffer->data);
       if (aliases != buffer_data_to_buffers_.end() &&
-          aliases->second.size() > 1)
+          (*aliases).second.size() > 1)
         return std::nullopt;
       buffers.push_back(buffer);
     }
@@ -1490,8 +1499,10 @@ private:
     }
     auto saved = BackupInferList();
     std::optional<AttemptOutcome> result;
+    extraction_ms = elapsed();
     try {
       String reply = (*solver)(rows, register_costs, timeout_ms).cast<String>();
+      solver_ms = elapsed();
       std::istringstream input{std::string(reply)};
       int64_t memory, registers;
       input >> status;
@@ -1521,6 +1532,7 @@ private:
       for (int op : members)
         RunInferStep(op, InferLevel::kFree, false, composed, strict_layout_map,
                      queue, queued);
+      ICHECK_EQ(composed.size(), buffers.size());
       for (size_t b = 0; b < buffers.size(); ++b) {
         ICHECK_GE(selected[b], 0);
         ICHECK(composed[buffers[b]]->IsEqual(domains[b][selected[b]].get()));
@@ -1534,6 +1546,7 @@ private:
       DLOG(INFO) << "[LayoutMaxSAT] " << e.what();
     }
     infer_list_ = std::move(saved);
+    validation_ms = elapsed();
     return result;
   }
 
@@ -1689,9 +1702,10 @@ private:
       if (solver_name == "maxsat") {
         auto before = best_cost;
         std::string status;
-        auto composed =
-            ComposeCandidates(members, candidates, strict_layout_map,
-                              *cost_model, timeout_ms, status);
+        double extraction_ms = 0, solver_ms = 0, validation_ms = 0;
+        auto composed = ComposeCandidates(
+            members, candidates, strict_layout_map, *cost_model, timeout_ms,
+            status, extraction_ms, solver_ms, validation_ms);
         bool improved = composed && composed->cost.BetterThan(best_cost);
         if (improved)
           adopt(std::move(*composed), -1);
@@ -1702,7 +1716,10 @@ private:
                     << " before_regs=" << before.regs
                     << " after_mem=" << best_cost.mem
                     << " after_regs=" << best_cost.regs
-                    << " improved=" << improved << " total_ms="
+                    << " improved=" << improved
+                    << " extraction_ms=" << extraction_ms
+                    << " solver_ms=" << solver_ms
+                    << " validation_ms=" << validation_ms << " total_ms="
                     << std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - started)
                            .count();
