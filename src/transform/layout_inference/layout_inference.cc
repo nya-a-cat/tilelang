@@ -1540,7 +1540,7 @@ private:
   void InferInFreeMode(LayoutMap &layout_map,
                        const LayoutMap &strict_layout_map) {
 
-    auto context = transform::PassContext::Current();
+    auto context = tvm::transform::PassContext::Current();
     auto solver_name =
         context->GetConfig<String>(kLayoutSolver, String("root")).value();
     ICHECK(solver_name == "root" || solver_name == "maxsat");

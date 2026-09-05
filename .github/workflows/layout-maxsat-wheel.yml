@@ -28,7 +28,7 @@ jobs:
           python-version: '3.12'
       - name: Install binary build dependencies
         run: |
-          python -m pip install --only-binary=:all: 'scikit-build-core<1' 'cython>=3.1' cmake ninja patchelf 'apache-tvm-ffi>=0.1.11,<0.1.13' 'z3-solver>=4.13,<4.15.5' 'nvidia-cuda-nvcc==13.0.88' 'nvidia-cuda-cccl==13.0.85' pytest
+          python -m pip install --only-binary=:all: 'scikit-build-core<1' 'cython>=3.1' cmake ninja patchelf 'apache-tvm-ffi>=0.1.11,<0.1.13' 'z3-solver>=4.13,<4.15.5' 'nvidia-cuda-nvcc==13.0.88' 'nvidia-cuda-cccl==13.0.85' 'nvidia-nvvm==13.0.88' 'nvidia-cuda-crt==13.0.88' 'nvidia-cuda-runtime==13.0.88' pytest
           python -m pip freeze > build-environment.txt
       - name: Validate solver
         run: python -m pytest --confcutdir=testing/python/layout testing/python/layout/test_tilelang_layout_solver.py -q
