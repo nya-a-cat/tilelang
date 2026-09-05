@@ -27,6 +27,7 @@
 
 #include "../../config.h"
 #include "../../layout/layout.h"
+#include "../../layout/solver_config.h"
 #include "../../layout/utils.h"
 #include "../../op/builtin.h"
 #include "../../op/copy.h"

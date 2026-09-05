@@ -4,6 +4,7 @@
  */
 
 #include "builtin.h"
+#include "../layout/solver_config.h"
 
 #include <tvm/ir/transform.h>
 

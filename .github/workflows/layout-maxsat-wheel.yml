@@ -34,7 +34,7 @@ jobs:
           path: build
           key: layout-maxsat-build-cuda130-v1-${{ github.sha }}
           restore-keys: layout-maxsat-build-cuda130-v1-
-      - name: Build exact upstream and candidate
+      - name: Record exact source revisions
         shell: bash
         run: |
           set -euo pipefail
@@ -44,10 +44,17 @@ jobs:
           cp build-environment.txt wheel-results/
           printf 'baseline=%s\ncandidate=%s\n' "$baseline" "$candidate" > wheel-results/source-revisions.txt
           git submodule status --recursive >> wheel-results/source-revisions.txt
+      - name: Build upstream baseline
+        run: |
+          set -euo pipefail
+          baseline=1a1df62e94d9736a2c9f13849bc4c2cf9377275b
           git checkout --detach "$baseline"
-          python -m pip wheel . --no-deps --no-build-isolation -w wheel-results/baseline
-          git checkout --detach "$candidate"
-          python -m pip wheel . --no-deps --no-build-isolation -w wheel-results/candidate
+          python -m pip wheel . --no-deps --no-build-isolation -v -w wheel-results/baseline
+      - name: Build experimental candidate
+        run: |
+          set -euo pipefail
+          git checkout --detach "$GITHUB_SHA"
+          python -m pip wheel . --no-deps --no-build-isolation -v -w wheel-results/candidate
           find wheel-results -name '*.whl' -exec sha256sum {} + > wheel-results/SHA256SUMS
       - uses: actions/cache/save@v4
         if: always()
