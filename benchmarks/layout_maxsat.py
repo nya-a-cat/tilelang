@@ -164,10 +164,24 @@ def main():
                 record["correct"] = True
                 for _ in range(5):
                     compiled(*tensors)
-                graph = torch.cuda.CUDAGraph()
+                graph = torch.cuda.CUDAGraph(keep_graph=True)
                 with torch.cuda.graph(graph):
                     for _ in range(100):
-                        compiled(*tensors)
+                        compiled(*tensors, stream=torch.cuda.current_stream().cuda_stream)
+                # Check actual replay writes: an empty graph can produce plausible
+                # timing samples while direct kernel calls still pass correctness.
+                for i in out_ids:
+                    tensors[i].fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                for i, ref in zip(out_ids, references):
+                    torch.testing.assert_close(tensors[i], ref, atol=2e-4, rtol=2e-4)
+                record["graph_correct"] = True
+                from cuda.bindings import driver
+                status, _, node_count = driver.cuGraphGetNodes(driver.CUgraph(graph.raw_cuda_graph()))
+                assert status == driver.CUresult.CUDA_SUCCESS
+                assert node_count == 100, f"Expected 100 captured launches, got {node_count}"
+                record["graph_nodes"] = node_count
                 kernels.append((record, graph, compiled))
             except Exception as error:
                 record["error"] = str(error)

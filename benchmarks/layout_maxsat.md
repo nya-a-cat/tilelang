@@ -88,6 +88,12 @@ local and shared memory sizes; CUBIN files and hashes are retained when these
 queries succeed. Query failures are recorded independently of numerical checks.
 Successful kernels are captured as 100 launches in
 a CUDA graph; 15 replay measurements are interleaved across modes within a case.
+The launcher receives the current stream explicitly. Each graph must contain
+100 nodes and reproduce the reference after its outputs are filled with NaNs.
+This guards against empty captures: the pinned upstream NVRTC adapter tests
+whether the target string starts with `cuda`, while this TVM revision renders
+the target as JSON. Automatic stream selection therefore used stream 0 during
+the initial capture attempt. Those initial timing samples are invalid.
 Raw per-launch microsecond samples, median, minimum and maximum are retained.
 This timing measures repeated execution with warm caches. Compilation includes
 initialization costs; trace phase times separately describe solver overhead.
