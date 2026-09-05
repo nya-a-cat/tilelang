@@ -125,6 +125,19 @@ class PassConfigKey(str, Enum):
     ``TILELANG_LAYOUT_COST_MODEL`` environment variable supplies the
     default. Default: 'register-count'"""
 
+    TL_LAYOUT_SOLVER = "tl.layout_solver"
+    """Free-mode candidate selection: 'root' (default) or experimental 'maxsat'.
+    MaxSAT composes compatible per-operator candidates from successful roots.
+    It preserves the selected cost model and inserts no layout conversions."""
+
+    TL_LAYOUT_SOLVER_TIMEOUT_MS = "tl.layout_solver_timeout_ms"
+    """MaxSAT check time limit per component in milliseconds. Default: 100.
+    Candidate extraction and validation are outside this solver-only limit."""
+
+    TL_LAYOUT_SOLVER_VERBOSE = "tl.layout_solver_verbose"
+    """Log candidate counts, solver status, objective changes and elapsed time.
+    Default: False."""
+
     TL_REDUCER_FORCE_BASELINE = "tl.reducer_force_baseline"
     """Force the canonical FullParticipant baseline for every reducer epoch,
     disabling narrow physical plans (compact storage / sub-block collectives).

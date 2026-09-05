@@ -16,11 +16,13 @@
 #include <tvm/tirx/transform.h>
 
 #include <algorithm>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <queue>
+#include <sstream>
 #include <unordered_set>
 
 #include "../../config.h"
@@ -1387,9 +1389,168 @@ private:
     return outcome;
   }
 
+  // Compose locally valid operator snapshots with a single layout per buffer.
+  // This search introduces no communication and excludes stateful reducers and
+  // aliases. Re-inference and full rescoring certify every adopted composition.
+  std::optional<AttemptOutcome>
+  ComposeCandidates(const std::vector<int> &members,
+                    const std::vector<AttemptOutcome> &attempts,
+                    const LayoutMap &strict_layout_map,
+                    const LayoutCostModel &cost_model, int timeout_ms,
+                    std::string &status) {
+    status = "ineligible";
+    if (attempts.size() < 2 || members.size() > 32 ||
+        members.size() * attempts.size() > 256)
+      return std::nullopt;
+    for (int op : members) {
+      if (!infer_list_[op].as<ParallelOpNode>() &&
+          !infer_list_[op].as<CopyNode>())
+        return std::nullopt;
+    }
+    std::vector<Buffer> buffers;
+    // Include constant entries outside this component so the register objective
+    // is identical to LayoutCostModel::Score, which prices the entire map.
+    for (const auto &[buffer, layout] : attempts.front().layout_map) {
+      auto aliases = buffer_data_to_buffers_.find(buffer->data);
+      if (aliases != buffer_data_to_buffers_.end() &&
+          aliases->second.size() > 1)
+        return std::nullopt;
+      buffers.push_back(buffer);
+    }
+    if (buffers.size() > 64)
+      return std::nullopt;
+    std::sort(
+        buffers.begin(), buffers.end(),
+        [](const Buffer &a, const Buffer &b) { return a->name < b->name; });
+    for (size_t b = 1; b < buffers.size(); ++b)
+      if (buffers[b - 1]->name == buffers[b]->name)
+        return std::nullopt;
+    std::vector<std::vector<Layout>> domains(buffers.size());
+    std::vector<std::vector<int>> ids(attempts.size());
+    Array<Array<Integer>> register_costs;
+    for (const auto &attempt : attempts)
+      if (attempt.layout_map.size() != buffers.size())
+        return std::nullopt;
+    for (size_t b = 0; b < buffers.size(); ++b) {
+      Array<Integer> costs;
+      for (size_t a = 0; a < attempts.size(); ++a) {
+        if (!attempts[a].layout_map.count(buffers[b]))
+          return std::nullopt;
+        auto layout = attempts[a].layout_map[buffers[b]];
+        if (layout.as<PartialFragmentNode>())
+          return std::nullopt;
+        int id = 0;
+        while (id < domains[b].size() && !layout->IsEqual(domains[b][id].get()))
+          ++id;
+        if (id == domains[b].size()) {
+          int64_t regs = 0;
+          if (auto fragment = layout.as<Fragment>()) {
+            regs = 1;
+            for (auto extent : fragment.value()->OutputShape()) {
+              auto value = as_const_int(extent);
+              if (!value || *value <= 0 || regs > INT64_MAX / *value)
+                return std::nullopt;
+              regs *= *value;
+            }
+          }
+          domains[b].push_back(layout);
+          costs.push_back(Integer(regs));
+        }
+        ids[a].push_back(id);
+      }
+      register_costs.push_back(costs);
+    }
+    Array<Array<Array<Integer>>> rows;
+    for (int op : members) {
+      Array<Array<Integer>> group;
+      for (size_t a = 0; a < attempts.size(); ++a) {
+        auto cost = cost_model.Score({op}, attempts[a].infer_list,
+                                     attempts[a].layout_map);
+        Array<Integer> row{Integer(cost.mem)};
+        for (size_t b = 0; b < buffers.size(); ++b) {
+          auto uses = use_list_.find(buffers[b]);
+          bool touched = uses != use_list_.end() &&
+                         std::find(uses->second.begin(), uses->second.end(),
+                                   op) != uses->second.end();
+          // Constant domains may be attached to every row. Varying domains
+          // must have a recorded use within this component.
+          if (domains[b].size() > 1 && uses == use_list_.end())
+            return std::nullopt;
+          row.push_back(
+              Integer(touched || domains[b].size() == 1 ? ids[a][b] : -1));
+        }
+        group.push_back(row);
+      }
+      rows.push_back(group);
+    }
+    auto solver = Function::GetGlobal("tl.layout.solve_candidate_table");
+    if (!solver) {
+      status = "unavailable";
+      return std::nullopt;
+    }
+    auto saved = BackupInferList();
+    std::optional<AttemptOutcome> result;
+    try {
+      String reply = (*solver)(rows, register_costs, timeout_ms).cast<String>();
+      std::istringstream input{std::string(reply)};
+      int64_t memory, registers;
+      input >> status;
+      if (status != "optimal")
+        return std::nullopt;
+      ICHECK(input >> memory >> registers);
+      LayoutMap composed = attempts.front().layout_map;
+      std::vector<int> selected(buffers.size(), -1);
+      infer_list_ = BackupInferList();
+      for (size_t o = 0; o < members.size(); ++o) {
+        int a;
+        ICHECK(input >> a);
+        ICHECK_GE(a, 0);
+        ICHECK_LT(a, attempts.size());
+        infer_list_[members[o]] = attempts[a].infer_list[members[o]]->Clone();
+        for (size_t b = 0; b < buffers.size(); ++b) {
+          int id = rows[o][a][b + 1]->value;
+          if (id < 0)
+            continue;
+          ICHECK(selected[b] == -1 || selected[b] == id);
+          selected[b] = id;
+          composed.Set(buffers[b], domains[b][id]);
+        }
+      }
+      std::deque<int> queue;
+      std::vector<bool> queued(infer_list_.size(), false);
+      for (int op : members)
+        RunInferStep(op, InferLevel::kFree, false, composed, strict_layout_map,
+                     queue, queued);
+      for (size_t b = 0; b < buffers.size(); ++b) {
+        ICHECK_GE(selected[b], 0);
+        ICHECK(composed[buffers[b]]->IsEqual(domains[b][selected[b]].get()));
+      }
+      auto cost = cost_model.Score(members, infer_list_, composed);
+      ICHECK_EQ(cost.mem, memory);
+      ICHECK_EQ(cost.regs, registers);
+      result = AttemptOutcome{BackupInferList(), composed, cost};
+    } catch (const std::exception &e) {
+      status = "validation_failed";
+      DLOG(INFO) << "[LayoutMaxSAT] " << e.what();
+    }
+    infer_list_ = std::move(saved);
+    return result;
+  }
+
   void InferInFreeMode(LayoutMap &layout_map,
                        const LayoutMap &strict_layout_map) {
 
+    auto context = transform::PassContext::Current();
+    auto solver_name =
+        context->GetConfig<String>(kLayoutSolver, String("root")).value();
+    ICHECK(solver_name == "root" || solver_name == "maxsat");
+    int timeout_ms =
+        context->GetConfig<Integer>(kLayoutSolverTimeoutMs, Integer(100))
+            .value()
+            ->value;
+    ICHECK(timeout_ms >= 1 && timeout_ms <= 60000);
+    bool verbose =
+        context->GetConfig<Bool>(kLayoutSolverVerbose, Bool(false)).value();
     DLOG(INFO) << "Enforced layout maps:" << '\n';
     for (auto &&[k, v] : layout_map) {
       DLOG(INFO) << "    " << k << ": " << v->DebugOutput() << '\n';
@@ -1465,6 +1626,8 @@ private:
       AttemptCost best_cost;
       bool has_best = false;
       int best_infer_root = -1;
+      std::vector<AttemptOutcome> candidates;
+      auto started = std::chrono::steady_clock::now();
 
       auto adopt = [&](AttemptOutcome &&outcome, int attempt_root) {
         best_infer_list = std::move(outcome.infer_list);
@@ -1484,6 +1647,8 @@ private:
         if (!outcome) {
           continue;
         }
+        if (solver_name == "maxsat" && members.size() <= 16)
+          candidates.push_back(*outcome);
         DLOG(INFO) << "[InferInFreeMode] attempt root " << attempt_infer_root
                    << " cost model " << cost_model->Name()
                    << " output: mem=" << outcome->cost.mem
@@ -1521,6 +1686,27 @@ private:
         }
       }
       ICHECK(has_best) << "no available layout found" << '\n';
+      if (solver_name == "maxsat") {
+        auto before = best_cost;
+        std::string status;
+        auto composed =
+            ComposeCandidates(members, candidates, strict_layout_map,
+                              *cost_model, timeout_ms, status);
+        bool improved = composed && composed->cost.BetterThan(best_cost);
+        if (improved)
+          adopt(std::move(*composed), -1);
+        if (verbose)
+          LOG(INFO) << "[LayoutMaxSAT] component=" << root
+                    << " status=" << status << " attempts=" << candidates.size()
+                    << " ops=" << members.size() << " before_mem=" << before.mem
+                    << " before_regs=" << before.regs
+                    << " after_mem=" << best_cost.mem
+                    << " after_regs=" << best_cost.regs
+                    << " improved=" << improved << " total_ms="
+                    << std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
+      }
       // Apply the best plan for this component
       infer_list_ = std::move(best_infer_list);
       layout_map = best_layout_map;

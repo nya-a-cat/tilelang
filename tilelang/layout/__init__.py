@@ -23,3 +23,6 @@ from .swizzle import (
 from .gemm_sp import make_cutlass_metadata_layout  # noqa: F401
 from .swizzle_mode import SwizzleMode  # noqa: F401
 from . import cute  # noqa: F401  (registers tl.cute.* FFI objects on import)
+from ._solver import register_solver as _register_solver
+
+_register_solver()
