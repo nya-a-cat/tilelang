@@ -149,21 +149,21 @@ def main():
                 with torch.cuda.graph(graph):
                     for _ in range(100):
                         compiled(*tensors)
-                kernels.append((record, graph))
+                kernels.append((record, graph, compiled))
             except Exception as error:
                 record["error"] = str(error)
                 print("FAIL " + name + " " + str(error), flush=True)
         # Interleave modes within each case; graph replay suppresses Python gaps.
         for _ in range(15):
             rng.shuffle(kernels)
-            for record, graph in kernels:
+            for record, graph, _compiled in kernels:
                 start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                 start.record()
                 graph.replay()
                 end.record()
                 end.synchronize()
                 record["samples_us"].append(start.elapsed_time(end) * 10)
-        for record, _ in kernels:
+        for record, _graph, _compiled in kernels:
             record["median_us"] = statistics.median(record["samples_us"])
             record["min_us"] = min(record["samples_us"])
             record["max_us"] = max(record["samples_us"])
