@@ -138,6 +138,25 @@ def main():
                 source = compiled.get_kernel_source()
                 (output / (name + ".cu")).write_text(source)
                 record["source_sha256"] = hashlib.sha256(source.encode()).hexdigest()
+                try:
+                    from cuda.bindings import driver
+                    status, device = driver.cuDeviceGet(torch.cuda.current_device())
+                    assert status == driver.CUresult.CUDA_SUCCESS
+                    record["resources"] = {}
+                    for symbol, handle in compiled.adapter.kernels.items():
+                        resource = {}
+                        for label, attribute in [("registers", "CU_FUNC_ATTRIBUTE_NUM_REGS"),
+                                                 ("local_bytes", "CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES"),
+                                                 ("shared_bytes", "CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES")]:
+                            status, value = driver.cuKernelGetAttribute(getattr(driver.CUfunction_attribute, attribute), handle, device)
+                            assert status == driver.CUresult.CUDA_SUCCESS
+                            resource[label] = value
+                        record["resources"][symbol] = resource
+                    binary = Path(compiled.adapter.libpath).read_bytes()
+                    (output / (name + ".cubin")).write_bytes(binary)
+                    record["binary_sha256"] = hashlib.sha256(binary).hexdigest()
+                except Exception as error:
+                    record["resource_query_error"] = str(error)
                 compiled(*tensors)
                 torch.cuda.synchronize()
                 for i, ref in zip(out_ids, references):

@@ -83,7 +83,10 @@ TILELANG_CACHE_DIR=/content/layout-cache-candidate \
 The baseline includes register-count/root and io-aware/root. The candidate
 includes those controls plus register-count/maxsat and io-aware/maxsat.
 All outputs are checked against PyTorch. Each mode records compilation time,
-generated CUDA and its hash. Successful kernels are captured as 100 launches in
+generated CUDA and its hash. CUDA Driver API queries record register counts,
+local and shared memory sizes; CUBIN files and hashes are retained when these
+queries succeed. Query failures are recorded independently of numerical checks.
+Successful kernels are captured as 100 launches in
 a CUDA graph; 15 replay measurements are interleaved across modes within a case.
 Raw per-launch microsecond samples, median, minimum and maximum are retained.
 This timing measures repeated execution with warm caches. Compilation includes
