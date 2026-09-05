@@ -100,5 +100,49 @@ initialization costs; trace phase times separately describe solver overhead.
 Failures remain in the report. Source equality between corresponding baseline
 and candidate root controls must be checked before attributing timing changes.
 
-GPU measurements are pending. No runtime speedup is established by the solver
-tests or compilation alone.
+## T4 results (2026-09-06)
+
+[Workflow 33992154463](https://github.com/nya-a-cat/tilelang/actions/runs/33992154463)
+built baseline `1a1df62e94d9736a2c9f13849bc4c2cf9377275b` and compiler candidate
+`2a8c5e5b56b13953c238b6b4b8ebbb19cf6c7676`. The final measurement script is
+`415bda7b1fba89fbdb3af81e9777eecdd0e4993e`. Wheels and build provenance are in
+the [fork prerelease](https://github.com/nya-a-cat/tilelang/releases/tag/layout-maxsat-2a8c5e5b56b1).
+The Colab environment used Tesla T4, driver 580.82.07, Python 3.13.15 and
+PyTorch 2.11.0+cu128. Compilation caching was disabled for the final run.
+
+Baseline passed 38/40 mode configurations; candidate passed 76/80. All 114
+successful records passed direct and graph-replay numerical checks, with 100
+graph nodes and 15 timing samples each. Their saved source and CUBIN hashes
+were independently checked. The 38 successful baseline/root controls had
+identical source and CUBIN in the candidate wheel. The reduction shape
+`(2,2560)` with 256 threads failed with `no available layout found` under both
+baseline models and all four candidate modes; these failures were retained.
+
+MaxSAT solved 32 eligible tables to optimality and retained root selection in
+six ineligible reduction cases. Three io-aware connected-branch configurations
+produced strictly improved costs and changed source/CUBIN:
+
+| Branch shape (m,n,threads) | Root median us | MaxSAT median us | Speedup | CUDA registers root / MaxSAT |
+|---|---:|---:|---:|---:|
+| (8,512,128) | 35.194 | 21.865 | 1.610x | 46 / 48 |
+| (32,128,128) | 32.276 | 21.402 | 1.508x | 52 / 48 |
+| (64,64,256) | 24.844 | 20.068 | 1.238x | 62 / 42 |
+
+An earlier graph-validated round also favored all three compositions, with
+speedups of 1.286x, 1.357x and 1.597x respectively. Ratios vary across rounds;
+these measurements establish benefits for these constructions on this T4.
+The other 35 successful root/MaxSAT comparisons had identical source and CUBIN.
+Timing variation for those binaries does not establish an optimization benefit.
+The default register-count model selected no improved composition in this suite.
+
+For the three changed configurations, memory proxy costs decreased from
+217088/165888/159744 to 102400/65536/57344. Register-slot proxy costs changed
+from 13/10/6 to 17/17/9; these proxy counts differ from physical CUDA registers.
+Across 32 eligible solves, median extraction, solver and validation times were
+3.920, 9.204 and 3.112 ms. These phases exclude initial root inference and
+do not capture every source of total compilation overhead.
+
+The initial empty-graph timing run is invalid and was preserved with that
+label. The final report, all raw samples, generated source/CUBIN, failures and
+both valid measurement rounds were saved locally. Colab was terminated and
+the server reported no active sessions after delivery.
