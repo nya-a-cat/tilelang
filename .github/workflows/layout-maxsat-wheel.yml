@@ -14,6 +14,11 @@ jobs:
       USE_LLVM: 'OFF'
       CMAKE_GENERATOR: Ninja
       CMAKE_BUILD_PARALLEL_LEVEL: '3'
+      CMAKE_ARGS: '-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache'
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_NOHASHDIR: 'true'
+      CCACHE_COMPILERCHECK: content
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,12 +30,25 @@ jobs:
           python-version: '3.12'
       - name: Install binary build dependencies
         run: |
-          python -m pip install --only-binary=:all: 'scikit-build-core<1' 'cython>=3.1' cmake ninja patchelf 'apache-tvm-ffi>=0.1.11,<0.1.13' 'z3-solver>=4.13,<4.15.5' 'nvidia-cuda-nvcc==13.0.88' 'nvidia-cuda-cccl==13.0.85' 'nvidia-nvvm==13.0.88' 'nvidia-cuda-crt==13.0.88' 'nvidia-cuda-runtime==13.0.88' pytest
+          python -m pip install --only-binary=:all: 'scikit-build-core<1' 'cython>=3.1' cmake ninja patchelf 'apache-tvm-ffi>=0.1.11,<0.1.13' 'z3-solver>=4.13,<4.15.5' 'nvidia-cuda-nvcc==13.0.88' 'nvidia-cuda-cccl==13.0.85' 'nvidia-nvvm==13.0.88' 'nvidia-cuda-crt==13.0.88' 'nvidia-cuda-runtime==13.0.88' 'nvidia-cuda-nvrtc==13.0.88' pytest
           python -m pip freeze > build-environment.txt
           # Recreate links/stubs outside the restored build directory.
           python cmake/find_pip_cuda.py
+          find "$pythonLocation" -name nvrtc.h -print -quit | grep .
+          sudo apt-get update -qq
+          apt-cache show ccache | head -25
+          sudo apt-get install -y ccache
+          ccache --max-size=2G
       - name: Validate solver
         run: python -m pytest --confcutdir=testing/python/layout testing/python/layout/test_tilelang_layout_solver.py -q
+      - name: Check native integration before full build
+        run: |
+          c++ -std=c++20 -fsyntax-only -I src -I 3rdparty/tvm/include -I 3rdparty/tvm/src -I 3rdparty/tvm/3rdparty/tvm-ffi/include -I 3rdparty/tvm/3rdparty/tvm-ffi/3rdparty/dlpack/include src/transform/layout_inference/layout_inference.cc
+      - uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: layout-maxsat-ccache-cuda130-v1-${{ github.sha }}
+          restore-keys: layout-maxsat-ccache-cuda130-v1-
       - uses: actions/cache/restore@v4
         with:
           path: build
@@ -63,6 +81,14 @@ jobs:
         with:
           path: build
           key: layout-maxsat-build-cuda130-v1-${{ github.sha }}
+      - name: Record compiler cache statistics
+        if: always()
+        run: ccache --show-stats
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .ccache
+          key: layout-maxsat-ccache-cuda130-v1-${{ github.sha }}
       - name: Publish fork experimental wheels for remote Colab download
         env:
           GH_TOKEN: ${{ github.token }}
