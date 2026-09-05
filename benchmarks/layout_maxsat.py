@@ -42,12 +42,16 @@ def branches(blocks, m, n, threads, kind):
                Out: T.Tensor((blocks, m, n), T.float32),
                Other: T.Tensor((blocks, n, m), T.float32)):
         with T.Kernel(blocks, threads=threads) as b:
+            anchor = T.alloc_fragment((1,), T.float32)
             left = T.alloc_fragment((m,), T.float32)
             right = T.alloc_fragment((n,), T.float32)
+            T.annotate_layout({anchor: tilelang.layout.make_fully_replicated_layout_fragment(anchor, threads)})
+            for k in T.Parallel(1):
+                anchor[k] = 1.0
             for i in T.Parallel(m):
-                left[i] = S[b, i]
+                left[i] = S[b, i] + anchor[0]
             for j in T.Parallel(n):
-                right[j] = S[b, m + j]
+                right[j] = S[b, m + j] + anchor[0]
             for i, j in T.Parallel(m, n):
                 Out[b, i, j] = left[i] * 2.0
             for j, i in T.Parallel(n, m):
@@ -88,7 +92,7 @@ def inputs(blocks, m, n, kind):
     if kind == "branches":
         s = x(blocks, m + n)
         a, b = x(blocks, m, n), x(blocks, n, m)
-        return [s, a, b], [(s[:, :m, None] * 2).expand_as(a), (s[:, m:, None] * 3).expand_as(b)], [1, 2]
+        return [s, a, b], [((s[:, :m, None] + 1) * 2).expand_as(a), ((s[:, m:, None] + 1) * 3).expand_as(b)], [1, 2]
     a = x(blocks, m, n)
     ref = a.transpose(1, 2).contiguous() + 1 if kind == "transpose" else a.sum(2)
     return [a, torch.empty_like(ref)], [ref], [1]
