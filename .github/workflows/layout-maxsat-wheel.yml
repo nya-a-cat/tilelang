@@ -1,8 +1,5 @@
 name: Layout MaxSAT experimental wheels
 on:
-  push:
-    branches: [experiment/layout-maxsat-20260906]
-    paths: ['src/**', 'tilelang/**', '.github/workflows/layout-maxsat-wheel.yml']
   workflow_dispatch:
 permissions:
   contents: write
