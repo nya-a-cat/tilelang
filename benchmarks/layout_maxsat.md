@@ -1,5 +1,8 @@
 # Experimental layout candidate composition
 
+Reference: Eisenhofer et al., [Tensor Seeks Layout: Formalizing Layout Selection
+for ML Compilers](https://arxiv.org/abs/2608.21555v1), Section 3.2.2.
+
 This experiment starts from upstream commit
 `1a1df62e94d9736a2c9f13849bc4c2cf9377275b`. The default layout selection
 remains `root`, with upstream's default `register-count` cost model.
@@ -12,6 +15,8 @@ and solves a finite candidate table. Each operator selects one snapshot. All
 operators accessing the same buffer select the same layout for that buffer.
 Weighted soft constraints minimize the existing memory score, followed by
 the total register-slot score. Each buffer's register slots are charged once.
+Costs cross the compiler/solver boundary as 64-bit integers. Both optimization
+objectives must have matching lower and upper bounds at the returned cost.
 
 The selected composition is re-inferred against the complete layout map and
 strict annotations. Its memory and register scores must match a fresh full
