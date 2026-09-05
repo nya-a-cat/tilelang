@@ -292,6 +292,28 @@ def run_case(case, args):
         record.update(median_us=statistics.median(record["samples_us"]),
                       min_us=min(record["samples_us"]), max_us=max(record["samples_us"]))
         print("RESULT " + json.dumps(record), flush=True)
+    # Optional warmed, randomized repeated compilation. The initial four builds
+    # above initialize both policies before these samples are collected.
+    report["compile_repetitions"] = []
+    for repetition in range(args.compile_repeats):
+        order = list(modes)
+        rng.shuffle(order)
+        for model, solver in order:
+            config = dict(impl.pass_configs or {})
+            config["tl.layout_cost_model"] = model
+            if args.variant == "candidate":
+                config.update({"tl.layout_solver": solver, "tl.layout_solver_verbose": True,
+                               "tl.layout_solver_timeout_ms": 100})
+            label = f"{model}-{solver}"
+            print(f"RECOMPILE {case['id']} {label} repetition={repetition}", flush=True)
+            started = time.perf_counter()
+            compiled = tilelang.compile(impl.get_tir(**schedule), out_idx=impl.out_idx,
+                                        execution_backend="nvrtc", target="cuda", pass_configs=config)
+            seconds = time.perf_counter() - started
+            report["compile_repetitions"].append(dict(
+                mode=label, repetition=repetition, seconds=seconds,
+                binary_sha256=hashlib.sha256(Path(compiled.adapter.lib_generator.libpath).read_bytes()).hexdigest()))
+            (output / "results.json").write_text(json.dumps(report, indent=2))
     (output / "results.json").write_text(json.dumps(report, indent=2))
 
 
@@ -303,6 +325,7 @@ def main():
     parser.add_argument("--case")
     parser.add_argument("--family", action="append")
     parser.add_argument("--timeout", type=int, default=240)
+    parser.add_argument("--compile-repeats", type=int, default=0)
     args = parser.parse_args()
     selected = [c for c in cases() if not args.family or c["family"] in args.family]
     if args.case:
@@ -320,7 +343,8 @@ def main():
             with (folder / "run.log").open("w") as log:
                 process = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--variant", args.variant,
                                           "--examples-root", args.examples_root, "--output", str(folder),
-                                          "--case", case["id"]], stdout=log, stderr=subprocess.STDOUT, timeout=args.timeout)
+                                          "--case", case["id"], "--compile-repeats", str(args.compile_repeats)],
+                                         stdout=log, stderr=subprocess.STDOUT, timeout=args.timeout)
             item["returncode"] = process.returncode
         except subprocess.TimeoutExpired:
             item["timeout_seconds"] = args.timeout
