@@ -29,6 +29,14 @@ Array<PrimExpr> Indices(int flat, const std::vector<int> &shape) {
 
 PrimExpr Lookup(const std::vector<int> &values, PrimExpr thread) {
   ICHECK(!values.empty());
+  if (values.size() > 1) {
+    int delta = values[1] - values[0];
+    bool affine = true;
+    for (size_t i = 2; i < values.size(); ++i)
+      affine &= values[i] == values[0] + static_cast<int>(i) * delta;
+    if (affine)
+      return Integer(values[0]) + thread * Integer(delta);
+  }
   PrimExpr result = Integer(values.back());
   // Runs of identical values share a comparison; simplify later folds affine
   // patterns and constant tables. Register accesses always use constant slots.
@@ -75,6 +83,17 @@ LayoutConvert::LayoutConvert(Array<PrimExpr> args, Map<String, ObjectRef>) {
   node->target = dst.region->buffer;
   ICHECK(IsFragmentBuffer(node->source) && IsFragmentBuffer(node->target));
   ICHECK(node->source->dtype == node->target->dtype);
+  ICHECK(!node->source->data.same_as(node->target->data))
+      << "layout conversion requires distinct storage";
+  arith::Analyzer analyzer;
+  for (const auto &region : {src.region, dst.region}) {
+    ICHECK_EQ(region->region.size(), region->buffer->shape.size());
+    for (size_t d = 0; d < region->region.size(); ++d) {
+      ICHECK(analyzer.CanProveEqual(region->region[d]->min, Integer(0)) &&
+             analyzer.CanProveEqual(region->region[d]->extent, region->buffer->shape[d]))
+          << "layout conversion requires the full logical buffer";
+    }
+  }
   node->SetAccessRegions({src, dst});
   data_ = std::move(node);
 }
