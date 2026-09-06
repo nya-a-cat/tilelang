@@ -128,7 +128,11 @@ class PassConfigKey(str, Enum):
     TL_LAYOUT_SOLVER = "tl.layout_solver"
     """Free-mode candidate selection: 'root' (default) or experimental 'maxsat'.
     MaxSAT composes compatible per-operator candidates from successful roots.
-    It preserves the selected cost model and inserts no layout conversions."""
+    It preserves the selected cost model and inserts no layout conversions.
+    Experimental 'maxsat-full', 'treewidth', 'local' and 'greedy' operate on
+    intrakernel value graphs and can insert fragment conversions. These require
+    an active GraphLayoutSession with frozen calibration or explicit collection
+    mode. Their exactness concerns the declared finite additive objective."""
 
     TL_LAYOUT_SOLVER_TIMEOUT_MS = "tl.layout_solver_timeout_ms"
     """MaxSAT check time limit per component in milliseconds. Default: 100.

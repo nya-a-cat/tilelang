@@ -30,3 +30,7 @@ _register_solver()
 from ._graph_solver import register_solver as _register_graph_solver
 
 _register_graph_solver()
+
+from ._graph_selection import GraphLayoutSession, register_selection as _register_selection
+
+_register_selection()

@@ -49,6 +49,11 @@ def LowerTileOp():
     return _ffi_api.LowerTileOp()  # type: ignore
 
 
+def GraphLayoutSelection():
+    """Select finite intrakernel layouts in an active GraphLayoutSession."""
+    return _ffi_api.GraphLayoutSelection()  # type: ignore
+
+
 def InjectSoftwarePipeline():
     """InjectSoftwarePipeline
 

@@ -8,6 +8,7 @@
 #include "../../op/builtin.h"
 #include "../../layout/utils.h"
 #include <tvm/tirx/stmt_functor.h>
+#include <unordered_set>
 
 namespace tvm {
 namespace tl {
@@ -21,36 +22,121 @@ TileOperator GraphOperator(const Stmt &stmt, const BlockAnnotations &annotations
   return ParseOperator(stmt, annotations);
 }
 
-Map<String, Any> Accesses(Stmt stmt, BlockAnnotations annotations) {
+class GraphAccessCollector : public StmtExprVisitor {
+public:
+  Array<Buffer> reads, writes;
+  std::unordered_set<const BufferNode *> full_writes;
+  GraphAccessCollector(BlockAnnotations annotations, Map<Var, PrimExpr> bindings)
+      : annotations_(annotations), bindings_(bindings) {}
+
+  bool FullRegion(const BufferRegion &region) {
+    arith::Analyzer analyzer;
+    for (size_t d = 0; d < region->region.size(); ++d)
+      if (!analyzer.CanProveEqual(region->region[d]->min, Integer(0)) ||
+          !analyzer.CanProveEqual(region->region[d]->extent, region->buffer->shape[d]))
+        return false;
+    return true;
+  }
+
+  void AddOperator(const TileOperator &op) {
+    for (const auto &region : op->GetReadBeforeWriteRegions())
+      reads.push_back(region->buffer);
+    for (const auto &region : op->GetAccessRegions().writes) {
+      writes.push_back(region->buffer);
+      if (!conditional_ && FullRegion(region))
+        full_writes.insert(region->buffer.get());
+    }
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    reads.push_back(op->buffer);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(reducer_update())) {
+      auto update = ParseReducerUpdate(op);
+      reads.push_back(update.reducer);
+      writes.push_back(update.reducer);
+      VisitExpr(update.value);
+      return;
+    }
+    auto tile = ParseOperator(GetRef<Call>(op), annotations_);
+    if (tile.defined()) {
+      AddOperator(tile);
+      return;
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+  void VisitStmt_(const BufferStoreNode *op) final {
+    writes.push_back(op->buffer);
+    if (!conditional_) {
+      Array<PrimExpr> indices;
+      Map<Var, Range> ranges;
+      for (const auto &axis : axes_)
+        ranges.Set(axis->var, axis->dom);
+      for (const auto &index : op->indices)
+        indices.push_back(Substitute(index, bindings_));
+      arith::Analyzer analyzer;
+      auto mapping = arith::DetectIterMap(indices, ranges, Integer(1),
+                                          arith::IterMapLevel::Bijective, &analyzer);
+      if (mapping->errors.empty()) {
+        auto shape = Layout(axes_, indices)->OutputShape();
+        bool full = shape.size() == op->buffer->shape.size();
+        for (size_t d = 0; full && d < shape.size(); ++d)
+          full &= analyzer.CanProveEqual(mapping->indices[d]->base, Integer(0)) &&
+                  analyzer.CanProveEqual(shape[d], op->buffer->shape[d]);
+        if (full)
+          full_writes.insert(op->buffer.get());
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  void VisitStmt_(const ForNode *op) final {
+    axes_.push_back(IterVar(Range::FromMinExtent(op->min, op->extent), op->loop_var,
+                            IterVarType::kDataPar));
+    StmtExprVisitor::VisitStmt_(op);
+    axes_.pop_back();
+  }
+  void VisitStmt_(const BindNode *op) final {
+    bindings_.Set(op->var, Substitute(op->value, bindings_));
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  void VisitStmt_(const IfThenElseNode *op) final {
+    bool previous = conditional_;
+    conditional_ = true;
+    StmtExprVisitor::VisitStmt_(op);
+    conditional_ = previous;
+  }
+private:
+  BlockAnnotations annotations_;
+  Map<Var, PrimExpr> bindings_;
+  Array<IterVar> axes_;
+  bool conditional_{false};
+};
+
+Map<String, Any> Accesses(Stmt stmt, BlockAnnotations annotations, Map<Var, PrimExpr> bindings) {
   auto op = GraphOperator(stmt, annotations);
   if (!op.defined())
     return {{"supported", false}};
-  Array<Buffer> reads, writes;
-  if (auto parallel = op.as<ParallelOpNode>()) {
-    for (const auto &buffer : parallel->GetAccessOrder()) {
-      const auto &access = parallel->GetIndiceMap().at(buffer);
-      if (access.is_read)
-        reads.push_back(buffer);
-      if (access.is_write)
-        writes.push_back(buffer);
-    }
-    // Reducer state has addend semantics and must participate in dependencies.
-    PostOrderVisit(stmt, [&](const ObjectRef &node) {
-      if (auto call = node.as<CallNode>(); call && call->op.same_as(reducer_update())) {
-        auto update = ParseReducerUpdate(call);
-        reads.push_back(update.reducer);
-        writes.push_back(update.reducer);
-      }
-    });
-    return {{"supported", true}, {"reads", reads}, {"writes", writes},
-            {"kind", String("parallel")}};
+  GraphAccessCollector collector(annotations, bindings);
+  if (op.as<ParallelOpNode>()) {
+    collector(stmt);
+  } else {
+    collector.AddOperator(op);
   }
-  for (const auto &region : op->GetReadBeforeWriteRegions())
-    reads.push_back(region->buffer);
-  for (const auto &region : op->GetAccessRegions().writes)
-    writes.push_back(region->buffer);
-  return {{"supported", true}, {"reads", reads}, {"writes", writes},
-          {"kind", String(op->GetTypeKey())}};
+  // A partial write consumes the old tensor value for its untouched elements.
+  // This dependency is required even when the source syntax has no BufferLoad.
+  Array<Buffer> partial;
+  for (const auto &buffer : collector.writes) {
+    if (!collector.full_writes.count(buffer.get())) {
+      partial.push_back(buffer);
+      if (std::none_of(collector.reads.begin(), collector.reads.end(),
+                       [&](const Buffer &read) { return read.same_as(buffer); }))
+        collector.reads.push_back(buffer);
+    }
+  }
+  return {{"supported", true}, {"reads", collector.reads}, {"writes", collector.writes},
+          {"partial_writes", partial}, {"kind", String(op->GetTypeKey())}};
 }
 
 // Each call reparses the operator so mutable inference state is never shared

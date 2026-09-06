@@ -132,6 +132,7 @@ def CUDAPassPipelineBodyPrologue(mod: IRModule, target: Target) -> IRModule:
 
     # Infer memory layouts for fragments and shared memory
     mod = tilelang.transform.LayoutInference()(mod)
+    mod = tilelang.transform.GraphLayoutSelection()(mod)
     # Plan physical storage/communication for reducer v2 epochs and
     # materialize the first-class reducer ops. Loop layouts are frozen at
     # this point; the planner only reads them.

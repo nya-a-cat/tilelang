@@ -142,6 +142,7 @@ struct LayoutInferenceResult {
   Map<For, Fragment> for_map;
   Map<For, PrimExpr> predicate_map;
   Map<For, Bool> padding_guard_map;
+  LayoutMap annotated_layouts;
 };
 
 /*! \brief Everything the inference engine knows about reducer dst-steering,
@@ -710,7 +711,7 @@ public:
       }
     }
 
-    return {layout_map, for_map, predicate_map, padding_guard_map};
+    return {layout_map, for_map, predicate_map, padding_guard_map, annotated_layout_map_};
   }
 
   void Collect(const PrimFunc &f) {
@@ -1557,7 +1558,9 @@ private:
     auto context = tvm::transform::PassContext::Current();
     auto solver_name =
         context->GetConfig<String>(kLayoutSolver, String("root")).value();
-    ICHECK(solver_name == "root" || solver_name == "maxsat");
+    ICHECK(solver_name == "root" || solver_name == "maxsat" ||
+           solver_name == "maxsat-full" || solver_name == "treewidth" ||
+           solver_name == "local" || solver_name == "greedy");
     int timeout_ms =
         context->GetConfig<Integer>(kLayoutSolverTimeoutMs, Integer(100))
             .value()
@@ -1771,6 +1774,10 @@ private:
 
     auto block_ptr = block.CopyOnWrite();
     block_ptr->annotations.Set(attr::kLayoutMap, result_.layout_map);
+    auto strategy = tvm::transform::PassContext::Current()
+                        ->GetConfig<String>(kLayoutSolver, String("root")).value();
+    if (strategy != "root" && strategy != "maxsat")
+      block_ptr->annotations.Set(kGraphPinnedLayouts, result_.annotated_layouts);
     return block;
   }
 
@@ -1802,6 +1809,11 @@ private:
 
     // Store the loop layout as an annotation on the For node (outermost)
     auto for_ptr = for_node.CopyOnWrite();
+    auto strategy = tvm::transform::PassContext::Current()
+                        ->GetConfig<String>(kLayoutSolver, String("root")).value();
+    if (strategy != "root" && strategy != "maxsat" &&
+        op->annotations.count(attr::kParallelLoopLayout))
+      for_ptr->annotations.Set(kGraphPinnedLoop, Bool(true));
     for_ptr->annotations.Set(attr::kParallelLoopLayout, loop_layout);
     if (result_.padding_guard_map.count(root)) {
       for_ptr->annotations.Set(attr::kParallelLoopRequiresPaddingGuard,

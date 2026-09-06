@@ -11,6 +11,8 @@ static constexpr const char *kLayoutSolver = "tl.layout_solver";
 static constexpr const char *kLayoutSolverTimeoutMs =
     "tl.layout_solver_timeout_ms";
 static constexpr const char *kLayoutSolverVerbose = "tl.layout_solver_verbose";
+static constexpr const char *kGraphPinnedLayouts = "tl.graph_pinned_layouts";
+static constexpr const char *kGraphPinnedLoop = "tl.graph_pinned_loop";
 } // namespace tl
 } // namespace tvm
 
