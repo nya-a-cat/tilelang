@@ -38,6 +38,7 @@ def test_conversion_ownership_classification(kind, expected):
 @pytest.mark.parametrize("kind", ["register", "shuffle", "shared", "replicated"])
 @pytest.mark.parametrize("n", [160, 256])
 def test_conversion_roundtrip_and_loop_reuse(dtype, kind, n):
+    torch.cuda.init()
     # LayoutInference requires a bijective padded fragment domain. Exercise a
     # ragged global extent while retaining that native domain contract.
     capacity = (n + 127) // 128 * 128
@@ -59,9 +60,9 @@ def test_conversion_roundtrip_and_loop_reuse(dtype, kind, n):
                     if i < n:
                         B[i] = restored[i]
 
-    kernel = tilelang.compile(main, target="cuda", execution_backend="nvrtc")
     a = torch.arange(n, device="cuda").to(getattr(torch, dtype))
     b = torch.full_like(a, -1)
+    kernel = tilelang.compile(main, target="cuda", execution_backend="nvrtc")
     launch = kernel.adapter._forward_from_prebuild_lib
     launch(a, b, stream=torch.cuda.current_stream().cuda_stream)
     torch.cuda.synchronize()
