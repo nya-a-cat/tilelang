@@ -261,10 +261,26 @@ def measure_one(measurement, directory, protocol=None, compile_flags=()):
     return entry
 
 
+def _read_verified_measurement(directory, expected_environment, identity, protocol):
+    """Read one measurement only after validating its complete local evidence."""
+    directory = Path(directory)
+    entry = json.loads((directory / "measurement.json").read_text(encoding="utf-8"))
+    LatencyTable(dict(schema=1, frozen=True, environment=expected_environment,
+                      entries=[entry]), expected_environment)
+    if digest(entry["key"]) != identity or entry.get("protocol") != protocol:
+        raise ValueError("saved measurement identity or protocol differs")
+    for filename, field in (("kernel.cubin", "executable_sha256"), ("kernel.cu", "source_sha256")):
+        if hashlib.sha256((directory / filename).read_bytes()).hexdigest() != entry.get(field):
+            raise ValueError("saved measurement executable/source digest differs")
+    return entry
+
+
 def calibrate(collection, directory, expected_environment, protocol=None, *, resume=True, cache_directory=None):
     """Measure all requested keys, save failures, and freeze only full coverage."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
+    table_path = directory / "latency-table.json"
+    table_tmp = directory / ".latency-table.json.tmp"
     protocol = dict(protocol or PROTOCOL)
     if expected_environment["timing_protocol"] != digest(protocol):
         raise ValueError("timing protocol differs from the calibration environment")
@@ -276,6 +292,11 @@ def calibrate(collection, directory, expected_environment, protocol=None, *, res
     manifest = directory / "environment.json"
     if manifest.exists() and json.loads(manifest.read_text()) != expected_environment:
         raise ValueError("output directory contains measurements from another environment")
+    # A request that passed environment identity validation owns the output
+    # directory. Remove any prior frozen table before collecting fresh
+    # evidence, so an incomplete request cannot retain a successful result.
+    table_path.unlink(missing_ok=True)
+    table_tmp.unlink(missing_ok=True)
     manifest.write_text(json.dumps(expected_environment, indent=2) + "\n", encoding="utf-8")
     # Identify missing profiling contexts before spending GPU time on thousands
     # of conversion pairs. Every requested key stays in the coverage accounting.
@@ -288,47 +309,63 @@ def calibrate(collection, directory, expected_environment, protocol=None, *, res
     if preflight_failures:
         (directory / "progress.json").write_text(json.dumps(dict(
             requested=len(collection.measurements), entries=[], failures=preflight_failures,
+            cache_rejections=[],
         ), indent=2) + "\n", encoding="utf-8")
         raise RuntimeError(f"calibration preflight failed for {len(preflight_failures)} requested measurements; see progress.json")
     # The environment and complete key jointly identify reusable measurements.
     # Copy verified files into each case so its evidence remains self-contained.
     cache = None if cache_directory is None else Path(cache_directory) / digest(expected_environment)
-    entries, failures = [], []
+    entries, failures, cache_rejections = [], [], []
     for identity, measurement in collection.measurements.items():
         try:
             saved = directory / identity / "measurement.json"
             cached = None if cache is None else cache / identity / "measurement.json"
-            if resume and not saved.exists() and cached is not None and cached.exists():
-                saved.parent.mkdir(parents=True, exist_ok=True)
-                for filename in ("measurement.json", "kernel.cu", "kernel.cubin"):
-                    shutil.copyfile(cached.parent / filename, saved.parent / filename)
+            entry = None
+            # Validate all cache evidence before copying any of it into the
+            # calibration directory. A damaged cache is recorded and replaced
+            # by a fresh measurement without promoting unverified files.
+            if resume and not saved.exists() and cached is not None and cached.parent.exists():
+                if not cached.exists():
+                    cache_rejections.append(dict(
+                        key=measurement["key"], error="cached measurement.json is missing"))
+                else:
+                    try:
+                        _read_verified_measurement(cached.parent, expected_environment, identity, protocol)
+                    except Exception as exc:
+                        cache_rejections.append(dict(key=measurement["key"], error=repr(exc)))
+                    else:
+                        saved.parent.mkdir(parents=True, exist_ok=True)
+                        for filename in ("measurement.json", "kernel.cu", "kernel.cubin"):
+                            shutil.copyfile(cached.parent / filename, saved.parent / filename)
+                        entry = _read_verified_measurement(saved.parent, expected_environment, identity, protocol)
             if resume and saved.exists():
-                entry = json.loads(saved.read_text())
-                LatencyTable(dict(schema=1, frozen=True, environment=expected_environment,
-                                  entries=[entry]), expected_environment)
-                if digest(entry["key"]) != identity or entry["protocol"] != protocol:
-                    raise ValueError("saved measurement identity or protocol differs")
-                for filename, field in (("kernel.cubin", "executable_sha256"), ("kernel.cu", "source_sha256")):
-                    if hashlib.sha256((saved.parent / filename).read_bytes()).hexdigest() != entry[field]:
-                        raise ValueError("saved measurement executable/source digest differs")
-            else:
+                if entry is None:
+                    entry = _read_verified_measurement(saved.parent, expected_environment, identity, protocol)
+            if entry is None:
                 entry = measure_one(measurement, directory / identity, protocol,
                                     expected_environment["compiler_flags"])
+                entry = _read_verified_measurement(saved.parent, expected_environment, identity, protocol)
             entries.append(entry)
             if cache is not None:
                 destination = cache / identity
                 destination.mkdir(parents=True, exist_ok=True)
                 for filename in ("kernel.cu", "kernel.cubin", "measurement.json"):
                     shutil.copyfile(saved.parent / filename, destination / filename)
+                _read_verified_measurement(destination, expected_environment, identity, protocol)
         except Exception as exc:
             failures.append(dict(key=measurement["key"], error=repr(exc)))
         (directory / "progress.json").write_text(json.dumps(dict(
             requested=len(collection.measurements), entries=entries, failures=failures,
+            cache_rejections=cache_rejections,
         ), indent=2) + "\n", encoding="utf-8")
     if failures:
         raise RuntimeError(f"calibration failed for {len(failures)} of {len(collection.measurements)} measurements; see progress.json")
     if not entries:
         raise ValueError("calibration collection contains no measurements")
     table = LatencyTable(dict(schema=1, frozen=True, environment=expected_environment, entries=entries), expected_environment)
-    table.write(directory / "latency-table.json")
+    try:
+        table.write(table_tmp)
+        table_tmp.replace(table_path)
+    finally:
+        table_tmp.unlink(missing_ok=True)
     return table
