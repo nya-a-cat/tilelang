@@ -6,6 +6,7 @@
 #include "utils.h"
 #include <tvm/tirx/stmt_functor.h>
 #include <algorithm>
+#include <deque>
 #include <limits>
 #include <stdexcept>
 
@@ -78,6 +79,39 @@ std::vector<int> Enumerate(const Fragment &layout, int threads,
   }
   return values;
 }
+
+std::vector<int> CachedEnumerate(const Fragment &layout, int threads,
+                                 int max_cells, std::vector<int> *storage_shape) {
+  // A domain's same immutable layout is visited for every directed pair.
+  // Keep successful ownership enumerations per compiler thread. Strong object
+  // references prevent pointer reuse; thread count and budget remain in the key.
+  struct Entry {
+    Fragment layout;
+    int threads, max_cells;
+    std::vector<int> shape, values;
+  };
+  static thread_local std::deque<Entry> cache;
+  static thread_local size_t cells = 0;
+  constexpr size_t kMaxCells = 8 * 1024 * 1024; // 32 MiB of ownership integers.
+  for (const auto &entry : cache) {
+    if (entry.layout.same_as(layout) && entry.threads == threads &&
+        entry.max_cells == max_cells) {
+      *storage_shape = entry.shape;
+      return entry.values;
+    }
+  }
+  auto values = Enumerate(layout, threads, max_cells, storage_shape);
+  if (values.size() <= kMaxCells) {
+    while (!cache.empty() &&
+           (cache.size() >= 256 || cells + values.size() > kMaxCells)) {
+      cells -= cache.front().values.size();
+      cache.pop_front();
+    }
+    cells += values.size();
+    cache.push_back({layout, threads, max_cells, *storage_shape, values});
+  }
+  return values;
+}
 } // namespace
 
 FragmentConversionPlan PlanFragmentConversion(const Fragment &source,
@@ -92,8 +126,8 @@ FragmentConversionPlan PlanFragmentConversion(const Fragment &source,
   if (shape != Shape(target->InputShape(), &analyzer))
     throw LayoutConflictException("conversion must preserve logical tensor shape");
   plan.elements = Product(shape, max_cells);
-  plan.source_values = Enumerate(source, threads, max_cells, &plan.source_shape);
-  plan.target_values = Enumerate(target, threads, max_cells, &plan.target_shape);
+  plan.source_values = CachedEnumerate(source, threads, max_cells, &plan.source_shape);
+  plan.target_values = CachedEnumerate(target, threads, max_cells, &plan.target_shape);
   plan.source_slots = static_cast<int>(plan.source_values.size()) / threads;
   plan.target_slots = static_cast<int>(plan.target_values.size()) / threads;
   std::vector<std::vector<std::pair<int, int>>> owners(plan.elements);
