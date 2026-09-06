@@ -74,3 +74,32 @@ def test_conversion_roundtrip_and_loop_reuse(dtype, kind, n):
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+def test_single_statement_identity_conversion():
+    layout = Fragment((1,), forward_fn=lambda i, replica: (replica, i), replicate=32)
+
+    @T.prim_func
+    def main(A: T.Tensor((1,), "float32"), B: T.Tensor((1,), "float32")):
+        with T.Kernel(1, threads=32):
+            source = T.alloc_fragment((1,), "float32")
+            target = T.alloc_fragment((1,), "float32")
+            T.annotate_layout({source: layout, target: layout})
+            T.copy(A, source)
+            convert(source, target)
+            T.copy(target, B)
+
+    a = torch.tensor([17.0], device="cuda")
+    b = torch.full_like(a, float("nan"))
+    kernel = tilelang.compile(main, target="cuda", execution_backend="nvrtc")
+    launch = kernel.adapter._forward_from_prebuild_lib
+    launch(a, b, stream=torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(a, b, stream=torch.cuda.current_stream().cuda_stream)
+    b.fill_(-1)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(a, b, rtol=0, atol=0)

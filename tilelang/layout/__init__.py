@@ -32,5 +32,7 @@ from ._graph_solver import register_solver as _register_graph_solver
 _register_graph_solver()
 
 from ._graph_selection import GraphLayoutSession, register_selection as _register_selection
+from ._latency_table import LatencyTable, MissingMeasurement  # noqa: F401
+from ._graph_profile import calibrate, environment as calibration_environment  # noqa: F401
 
 _register_selection()

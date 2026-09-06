@@ -36,6 +36,7 @@ def synthetic_table(collection):
     roots = {op["configs"][0]["cost_key"] for report in collection.reports
              for op in report["problem"]["operators"] if "cost_key" in op["configs"][0]}
     environment = {key: "synthetic-test-fixture" for key in ENVIRONMENT_FIELDS}
+    environment["compiler_flags"] = []
     entries = []
     for identity, measurement in collection.measurements.items():
         cost = 1000 if identity in roots else 1

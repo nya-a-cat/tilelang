@@ -94,6 +94,11 @@ class LatencyTable:
             raise MissingMeasurement(identity)
         return self._entries[identity]
 
+    @property
+    def environment(self):
+        """Return a detached copy of the immutable calibration provenance."""
+        return json.loads(self._serialized)["environment"]
+
     def coverage(self, keys):
         identities = {digest(measurement_key(**key)) for key in keys}
         missing = sorted(identities.difference(self._entries))

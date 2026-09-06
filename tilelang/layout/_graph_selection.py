@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+from contextlib import contextmanager
 import hashlib
 import json
 import time
@@ -11,9 +12,26 @@ from pathlib import Path
 from ._graph_domains import DomainBudgetExceeded, domain_specs, make_fragment
 from ._graph_solver import solve, evaluate
 from ._latency_table import LatencyTable, MissingMeasurement, digest, measurement_key
+from .partial_fragment import PartialFragment
 
 
 _active_session = contextvars.ContextVar("tilelang_graph_layout_session", default=None)
+_compile_flags = contextvars.ContextVar("tilelang_graph_compile_flags", default=())
+
+
+@contextmanager
+def compiler_configuration(flags):
+    """Carry the actual JIT flags into every requested measurement identity."""
+    flags = list(flags)
+    session = _active_session.get()
+    if session is not None and session.table is not None:
+        if flags != session.table.environment["compiler_flags"]:
+            raise ValueError("compiler flags differ from the frozen calibration")
+    token = _compile_flags.set(tuple(flags))
+    try:
+        yield
+    finally:
+        _compile_flags.reset(token)
 
 
 class GraphLayoutSession:
@@ -120,12 +138,12 @@ class _Region:
             reason = None
             if len(self.aliases[family]) > 1:
                 reason = "aliased storage"
-            elif family.scope() != "local.fragment":
+            elif family.scope() != "local.fragment" or isinstance(layout, PartialFragment):
                 reason = "native storage or reducer state"
             elif family in self.pins:
                 reason = "explicit layout annotation"
             elif self.divergent:
-                reason = "thread-dependent control-flow scope"
+                reason = "thread-dependent or multidimensional thread scope"
             elif family in asynchronous:
                 reason = "explicit asynchronous operation lifetime"
             if reason:
@@ -139,6 +157,7 @@ class _Region:
         self.schedule = dict(target=str(self.target), threads=self.threads,
                              thread_min=str(thread_bounds.min), in_pipeline=self.in_pipeline,
                              divergent_scope=self.divergent,
+                             compiler_flags=list(_compile_flags.get()),
                              pass_configs={str(k): str(v) for k, v in tvm.transform.PassContext.current().config.items()
                                            if str(k) not in ("tl.layout_solver", "tl.layout_solver_verbose",
                                                              "tl.layout_solver_timeout_ms")})

@@ -111,16 +111,23 @@ private:
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     auto old_bounds = thread_bounds_;
     auto old_index = thread_index_;
+    bool old_divergent = divergent_scope_;
     if (op->attr_key == tirx::attr::thread_extent) {
       auto axis = Downcast<IterVar>(op->node);
       if (axis->thread_tag == "threadIdx.x") {
         thread_bounds_ = Range::FromMinExtent(Integer(0), op->value);
         thread_index_ = axis->var;
+      } else if (axis->thread_tag == "threadIdx.y" || axis->thread_tag == "threadIdx.z") {
+        auto extent = op->value.as<IntImmNode>();
+        // The conversion primitive currently uses a single linear thread axis.
+        // Preserve native storage when a second nontrivial axis is present.
+        divergent_scope_ |= !extent || extent->value != 1;
       }
     }
     auto result = StmtExprMutator::VisitStmt_(op);
     thread_bounds_ = old_bounds;
     thread_index_ = old_index;
+    divergent_scope_ = old_divergent;
     return result;
   }
 

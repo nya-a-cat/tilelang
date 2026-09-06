@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Any, Generic, Literal, ParamSpec, TypeVar
 from collections.abc import Callable
+from contextlib import nullcontext
 
 from tilelang.jit.adapter.utils import is_cutedsl_target, is_metal_target, is_cuda_target, is_hip_target
 from tvm.tirx import PrimFunc
@@ -284,7 +285,12 @@ class JITKernel(Generic[_P, _T]):
             *create_pass_instruments(context=pass_instrument_context),
             *base_pass_instruments,
         ]
+        graph_configuration = nullcontext()
+        if pass_configs.get("tl.layout_solver", "root") in ("maxsat-full", "treewidth", "local", "greedy"):
+            from tilelang.layout._graph_selection import compiler_configuration
+            graph_configuration = compiler_configuration(self.compile_flags or [])
         with (
+            graph_configuration,
             jit_phase("lower", verbose=self.verbose, **compile_metadata),
             tvm.transform.PassContext(opt_level=3, config=pass_configs, instruments=pass_instruments),
             self.target,

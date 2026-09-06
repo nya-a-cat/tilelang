@@ -133,6 +133,15 @@ def CUDAPassPipelineBodyPrologue(mod: IRModule, target: Target) -> IRModule:
     # Infer memory layouts for fragments and shared memory
     mod = tilelang.transform.LayoutInference()(mod)
     mod = tilelang.transform.GraphLayoutSelection()(mod)
+    return CUDAPassPipelineAfterLayout(mod, target)
+
+
+def CUDAPassPipelineAfterLayout(mod: IRModule, target: Target) -> IRModule:
+    """Lower an annotated module whose launch, pipeline and layouts are fixed.
+
+    The offline layout profiler uses this boundary to compile isolated native
+    operator configurations without running layout inference a second time.
+    """
     # Plan physical storage/communication for reducer v2 epochs and
     # materialize the first-class reducer ops. Loop layouts are frozen at
     # this point; the planner only reads them.
@@ -167,9 +176,13 @@ def CUDAPassPipelineBodyPrologue(mod: IRModule, target: Target) -> IRModule:
 
 
 def CUDAPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
-    pass_ctx = tilelang.transform.get_pass_context()
-
     mod = CUDAPassPipelineBodyPrologue(mod, target)
+    return CUDAPassPipelineFinalize(mod, target)
+
+
+def CUDAPassPipelineFinalize(mod: IRModule, target: Target) -> IRModule:
+    """Finish physical storage planning and code generation preparation."""
+    pass_ctx = tilelang.transform.get_pass_context()
 
     # @CUDA-specific
     # Lower the shared.tmem into specific initialization slot
