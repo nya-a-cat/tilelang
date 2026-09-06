@@ -149,7 +149,7 @@ def _maxsat(problem, timeout_ms, check):
                 elif penalty:
                     opt.add_soft(clause, weight=str(penalty))
     remaining = check()
-    opt.set(timeout=max(1, int(remaining)))
+    opt.set(timeout=max(1, int(remaining)), maxsat_engine="wmax")
     answer = opt.check()
     if answer == z3.unsat:
         return {"status": "unsat"}
