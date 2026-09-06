@@ -44,6 +44,7 @@ jobs:
       - name: Check native integration before full build
         run: |
           c++ -std=c++20 -fsyntax-only -I src -I 3rdparty/tvm/include -I 3rdparty/tvm/src -I 3rdparty/tvm/3rdparty/tvm-ffi/include -I 3rdparty/tvm/3rdparty/tvm-ffi/3rdparty/dlpack/include src/transform/layout_inference/layout_inference.cc
+          c++ -std=c++20 -fsyntax-only -I src -I 3rdparty/tvm/include -I 3rdparty/tvm/src -I 3rdparty/tvm/3rdparty/tvm-ffi/include -I 3rdparty/tvm/3rdparty/tvm-ffi/3rdparty/dlpack/include src/layout/conversion.cc src/op/layout_convert.cc
       - uses: actions/cache/restore@v4
         with:
           path: .ccache
