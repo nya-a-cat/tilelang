@@ -277,6 +277,19 @@ def calibrate(collection, directory, expected_environment, protocol=None, *, res
     if manifest.exists() and json.loads(manifest.read_text()) != expected_environment:
         raise ValueError("output directory contains measurements from another environment")
     manifest.write_text(json.dumps(expected_environment, indent=2) + "\n", encoding="utf-8")
+    # Identify missing profiling contexts before spending GPU time on thousands
+    # of conversion pairs. Every requested key stays in the coverage accounting.
+    preflight_failures = []
+    for measurement in collection.measurements.values():
+        try:
+            make_microkernel(measurement)
+        except Exception as exc:
+            preflight_failures.append(dict(key=measurement["key"], stage="preflight", error=repr(exc)))
+    if preflight_failures:
+        (directory / "progress.json").write_text(json.dumps(dict(
+            requested=len(collection.measurements), entries=[], failures=preflight_failures,
+        ), indent=2) + "\n", encoding="utf-8")
+        raise RuntimeError(f"calibration preflight failed for {len(preflight_failures)} requested measurements; see progress.json")
     # The environment and complete key jointly identify reusable measurements.
     # Copy verified files into each case so its evidence remains self-contained.
     cache = None if cache_directory is None else Path(cache_directory) / digest(expected_environment)
