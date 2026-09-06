@@ -228,7 +228,9 @@ class _Region:
     def measure(self, key, **description):
         return self.session.lookup(key, dict(function=self.function, thread_bounds=self.thread_bounds,
                                             thread_index=self.thread_index, bindings=self.bindings,
-                                            annotations=self.annotations, **description))
+                                            annotations=self.annotations,
+                                            pass_configs=dict(self.tvm.transform.PassContext.current().config),
+                                            **description))
 
     def build(self):
         tensors, operators = [], []
@@ -345,7 +347,7 @@ class _Region:
                 available[tensor, layout_id] = physical(self.values[tensor], layout_id)
         for tensor in self.sinks:
             require(tensor, 0)
-        return dict(statement=tir.SeqStmt(output), allocations=allocations, layouts=new_layouts)
+        return dict(statement=tir.stmt_seq(*output), allocations=allocations, layouts=new_layouts)
 
 
 def select_region(*arguments):
@@ -366,7 +368,7 @@ def select_region(*arguments):
                   table_sha256=None if session.collect else session.table.sha256)
     if session.collect:
         session.record(report)
-        return dict(statement=region.tvm.tirx.SeqStmt(region.statements), allocations=[], layouts={})
+        return dict(statement=region.tvm.tirx.stmt_seq(*region.statements), allocations=[], layouts={})
     if missing:
         session.record(report)
         raise MissingMeasurement(f"frozen calibration lacks {len(missing)} requested measurements")

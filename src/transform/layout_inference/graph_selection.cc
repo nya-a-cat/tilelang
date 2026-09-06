@@ -84,7 +84,7 @@ private:
       }
     }
     flush();
-    return SeqStmt(output);
+    return SeqStmt::Flatten(output);
   }
 
   Stmt VisitStmt_(const SBlockNode *op) final {

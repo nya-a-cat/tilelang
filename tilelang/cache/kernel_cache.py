@@ -345,7 +345,13 @@ class KernelCache:
         target_host = backend_context.target_host
         execution_backend = backend_context.execution_backend.name
 
-        if not env.is_cache_enabled():
+        # Graph sessions collect measurements and consume an external frozen
+        # table. Neither those side effects nor the table identity is captured
+        # by the ordinary kernel cache key. Always execute this explicit path.
+        graph_selection = pass_configs.get("tl.layout_solver", "root") in (
+            "maxsat-full", "treewidth", "local", "greedy"
+        )
+        if graph_selection or not env.is_cache_enabled():
             if verbose:
                 self.logger.info("Cache is disabled; compiling kernel without caching.")
             return JITKernel(

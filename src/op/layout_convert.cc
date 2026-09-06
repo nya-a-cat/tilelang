@@ -199,7 +199,7 @@ Stmt LayoutConvertNode::Lower(const LowerArgs &args, arith::Analyzer *analyzer) 
           BufferStore(dst, value, Indices(slot, plan.target_shape))));
     }
   }
-  return SeqStmt(statements);
+  return SeqStmt::Flatten(statements);
 }
 
 Stmt MakeLayoutConversion(const Buffer &source, const Buffer &target) {
