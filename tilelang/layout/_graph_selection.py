@@ -104,6 +104,12 @@ class _Region:
             families.setdefault(buffer.data, []).append(buffer)
         self.family = {b: members[0] for members in families.values() for b in members}
         self.aliases = {members[0]: members for members in families.values()}
+        asynchronous = set()
+        for statement, access in zip(self.statements, self.accesses):
+            if isinstance(statement, tvm.tirx.Evaluate) and isinstance(statement.value, tvm.tirx.Call):
+                name = getattr(statement.value.op, "name", "")
+                if name in ("tl.tileop.wgmma_gemm", "tl.tileop.tcgen05_gemm"):
+                    asynchronous.update(self.family[b] for b in [*access["reads"], *access["writes"]])
         self.domains, self.fixed_reasons = {}, {}
         for buffer in self.buffers:
             family = self.family[buffer]
@@ -120,6 +126,8 @@ class _Region:
                 reason = "explicit layout annotation"
             elif self.divergent:
                 reason = "thread-dependent control-flow scope"
+            elif family in asynchronous:
+                reason = "explicit asynchronous operation lifetime"
             if reason:
                 self.fixed_reasons[family] = reason
                 for alias in self.aliases[family]:
@@ -169,7 +177,8 @@ class _Region:
                 for key in ("parallel_loop_layout", "parallel_loop_predicate", "parallel_loop_requires_padding_guard"):
                     attrs.pop(key, None)
                 unbound = tir.For(stmt.loop_var, stmt.min, stmt.extent, stmt.kind, stmt.body,
-                                  stmt.thread_binding, attrs, stmt.span)
+                                  thread_binding=stmt.thread_binding, annotations=attrs,
+                                  step=stmt.step)
             if not self.divergent:
                 seeds.append(("native", unbound, {}))
                 for buffer in operands:

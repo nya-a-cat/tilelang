@@ -22,8 +22,9 @@ def kernel_function(partial):
             for i, j in T.Parallel(8, 16):
                 y[i, j] = x[i, j] * 2
             if partial:
-                for i, j in T.Parallel(4, 16):
-                    y[i, j] = x[i, j] + 3
+                for i, j in T.Parallel(8, 16):
+                    if i < 4:
+                        y[i, j] = x[i, j] + 3
             else:
                 for i, j in T.Parallel(8, 16):
                     y[i, j] = y[i, j] + x[i, j] + x[i, j]
