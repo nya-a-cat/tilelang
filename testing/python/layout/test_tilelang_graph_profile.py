@@ -10,6 +10,28 @@ from tilelang.layout._graph_profile import calibrate, environment
 from tilelang.layout._latency_table import LatencyTable
 
 
+def test_nvrtc_single_output_parameter():
+    @T.prim_func
+    def fill(B: T.Tensor((128,), "float32")):
+        with T.Kernel(1, threads=128):
+            for i in T.Parallel(128):
+                B[i] = 3.0
+
+    output = torch.full((128,), float("nan"), device="cuda")
+    kernel = tilelang.compile(fill, target="cuda", execution_backend="nvrtc")
+    launch = kernel.adapter._forward_from_prebuild_lib
+    launch(output, stream=torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 3), rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(output, stream=torch.cuda.current_stream().cuda_stream)
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 3), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("threads", [32, 128])
 def test_measured_calibration_and_frozen_selection(tmp_path, monkeypatch, threads):
     @T.prim_func

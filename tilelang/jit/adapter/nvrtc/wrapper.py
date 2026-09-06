@@ -408,8 +408,10 @@ class TLNVRTCSourceWrapper(TLCUDASourceWrapper):
             call_args = kernel_info["call_args"]
             device_index = kernel_info["device_index"]
 
-            arg_names = ", ".join([arg[0] for arg in call_args])
-            arg_types = ", ".join([arg[1] for arg in call_args])
+            # CUDA bindings require a tuple for both values and types even
+            # when a kernel has just one parameter.
+            arg_names = "(" + "".join(f"{arg[0]}, " for arg in call_args) + ")"
+            arg_types = "(" + "".join(f"{arg[1]}, " for arg in call_args) + ")"
             smem_str = 0 if dynamic_smem_buf is None else dynamic_smem_buf
 
             # Generate L2 persistent map initialization for this function
