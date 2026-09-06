@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import shutil
 import statistics
 import subprocess
 import time
@@ -28,7 +29,7 @@ PROTOCOL = {
     "samples": 15,
     "includes": ["kernel launch", "input materialization", "native operation", "output materialization"],
     "free_loop_indices": 0,
-    "floating_inputs": "seeded uniform [0, 0.125) for finite sqrt/log inputs",
+    "floating_inputs": "seeded uniform [0.001, 0.126) before dtype rounding",
 }
 
 
@@ -260,7 +261,7 @@ def measure_one(measurement, directory, protocol=None, compile_flags=()):
     return entry
 
 
-def calibrate(collection, directory, expected_environment, protocol=None, *, resume=True):
+def calibrate(collection, directory, expected_environment, protocol=None, *, resume=True, cache_directory=None):
     """Measure all requested keys, save failures, and freeze only full coverage."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -276,10 +277,18 @@ def calibrate(collection, directory, expected_environment, protocol=None, *, res
     if manifest.exists() and json.loads(manifest.read_text()) != expected_environment:
         raise ValueError("output directory contains measurements from another environment")
     manifest.write_text(json.dumps(expected_environment, indent=2) + "\n", encoding="utf-8")
+    # The environment and complete key jointly identify reusable measurements.
+    # Copy verified files into each case so its evidence remains self-contained.
+    cache = None if cache_directory is None else Path(cache_directory) / digest(expected_environment)
     entries, failures = [], []
     for identity, measurement in collection.measurements.items():
         try:
             saved = directory / identity / "measurement.json"
+            cached = None if cache is None else cache / identity / "measurement.json"
+            if resume and not saved.exists() and cached is not None and cached.exists():
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                for filename in ("measurement.json", "kernel.cu", "kernel.cubin"):
+                    shutil.copyfile(cached.parent / filename, saved.parent / filename)
             if resume and saved.exists():
                 entry = json.loads(saved.read_text())
                 LatencyTable(dict(schema=1, frozen=True, environment=expected_environment,
@@ -293,6 +302,11 @@ def calibrate(collection, directory, expected_environment, protocol=None, *, res
                 entry = measure_one(measurement, directory / identity, protocol,
                                     expected_environment["compiler_flags"])
             entries.append(entry)
+            if cache is not None:
+                destination = cache / identity
+                destination.mkdir(parents=True, exist_ok=True)
+                for filename in ("kernel.cu", "kernel.cubin", "measurement.json"):
+                    shutil.copyfile(saved.parent / filename, destination / filename)
         except Exception as exc:
             failures.append(dict(key=measurement["key"], error=repr(exc)))
         (directory / "progress.json").write_text(json.dumps(dict(

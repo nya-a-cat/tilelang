@@ -104,7 +104,8 @@ schedules are retained. Run calibration and evaluation as separate phases:
 
 ```bash
 python benchmarks/layout_graph_real.py --examples-root /path/to/pinned/upstream \
-  --output results/real --compiler-revision EXACT_BUILD_SHA --phase calibrate
+  --output results/real --compiler-revision EXACT_BUILD_SHA --phase calibrate \
+  --calibration-cache results/measurement-cache
 python benchmarks/layout_graph_real.py --examples-root /path/to/pinned/upstream \
   --output results/real --compiler-revision EXACT_BUILD_SHA --phase benchmark
 ```
@@ -114,6 +115,16 @@ retains all six strategies, correctness failures, missing tables, generated code
 resource attributes, process peak RSS, extraction/solver/compilation time, and
 thirty shuffled timing samples. Preallocated outputs, explicit CUDA streams,
 poisoned graph replay, and graph node counts validate the measured execution.
+The optional calibration cache reuses measurements only under the same complete
+environment and measurement key, after validating source and executable hashes.
+Each case receives a separate copy of its evidence and a separately frozen table.
+
+Each benchmark report compares full-kernel timings with the unweighted sum of
+region costs. Pairwise rank errors exclude equal proxy costs, identical binaries,
+and measured differences within 1%. This band describes timing ties and supplies
+no confidence interval. Raw gaps, all ties, speedups and regressions are retained.
+Enclosing loop multiplicity is absent from the proxy sum; these diagnostics
+measure that proxy's ranking, with its stated limitations.
 
 The finite solver guarantee, correctness of the compiler transformation, and
 usefulness of the latency proxy are separate claims. The implementation does not

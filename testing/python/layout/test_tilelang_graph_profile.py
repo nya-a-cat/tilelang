@@ -10,7 +10,7 @@ from tilelang.layout._graph_profile import calibrate, environment
 from tilelang.layout._latency_table import LatencyTable
 
 
-def test_measured_calibration_and_frozen_selection(tmp_path):
+def test_measured_calibration_and_frozen_selection(tmp_path, monkeypatch):
     @T.prim_func
     def main(A: T.Tensor((128,), "float32"), B: T.Tensor((128,), "float32")):
         with T.Kernel(1, threads=32):
@@ -28,13 +28,18 @@ def test_measured_calibration_and_frozen_selection(tmp_path):
                          pass_configs={"tl.layout_solver": "maxsat-full"})
     env = environment(tilelang_revision=tilelang.__version__,
                       tvm_revision="907a88c8791ccf33b9874821bc875e7abf624367")
-    table = calibrate(collection, tmp_path / "calibration", env)
+    table = calibrate(collection, tmp_path / "calibration", env, cache_directory=tmp_path / "cache")
     loaded = LatencyTable.read(tmp_path / "calibration/latency-table.json", env)
     assert table.sha256 == loaded.sha256
     progress = json.loads((tmp_path / "calibration/progress.json").read_text())
     assert not progress["failures"] and len(progress["entries"]) == len(collection.measurements)
     assert all(entry["graph_nodes"] == 32 for entry in progress["entries"])
     assert calibrate(collection, tmp_path / "calibration", env).sha256 == table.sha256
+    def reject_measurement(*args, **kwargs):
+        raise AssertionError("a verified cached measurement must be reused")
+    monkeypatch.setattr("tilelang.layout._graph_profile.measure_one", reject_measurement)
+    assert calibrate(collection, tmp_path / "reused", env,
+                     cache_directory=tmp_path / "cache").sha256 == table.sha256
     objectives = {}
     for algorithm in ("maxsat-full", "treewidth", "local", "greedy"):
         with GraphLayoutSession(output_directory=tmp_path / algorithm, table=loaded) as session:

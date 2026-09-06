@@ -8,7 +8,9 @@ retained. Each case runs in a fresh process to contain CUDA/runtime failures.
 
 import argparse
 from contextlib import nullcontext
+import faulthandler
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -31,7 +33,43 @@ def write(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
+def comparison(report):
+    """Compare the frozen additive proxy with independently timed full kernels."""
+    valid = {r["strategy"]: r for r in report["results"] if "median_us" in r}
+    full = [r for r in valid.values() if "unweighted_region_objective_ns" in r]
+    result = dict(valid_strategies=list(valid), measured_speedups_vs_root={}, rank_pairs=[])
+    if "root" not in valid:
+        return result
+    root = valid["root"]
+    for name, record in valid.items():
+        result["measured_speedups_vs_root"][name] = root["median_us"] / record["median_us"]
+    ranked = [(r, r["unweighted_region_objective_ns"]) for r in full]
+    roots = {r["unweighted_root_objective_ns"] for r in full}
+    result["consistent_root_objective"] = len(roots) <= 1
+    if len(roots) == 1:
+        ranked.append((root, next(iter(roots))))
+    for (left, left_cost), (right, right_cost) in itertools.combinations(ranked, 2):
+        gap = left["median_us"] / right["median_us"] - 1
+        same_binary = left["binary_sha256"] == right["binary_sha256"]
+        model_direction = (left_cost > right_cost) - (left_cost < right_cost)
+        # A 1% band is a descriptive timing tie, not a confidence interval.
+        measured_direction = 0 if same_binary or abs(gap) <= 0.01 else (1 if gap > 0 else -1)
+        result["rank_pairs"].append(dict(
+            strategies=[left["strategy"], right["strategy"]],
+            proxy_costs_ns=[left_cost, right_cost], relative_time_gap=gap,
+            identical_binary=same_binary, model_direction=model_direction,
+            measured_direction=measured_direction,
+            discordant=bool(model_direction and measured_direction and model_direction != measured_direction),
+        ))
+    comparable = [p for p in result["rank_pairs"] if p["model_direction"] and p["measured_direction"]]
+    result["comparable_pairs"] = len(comparable)
+    result["discordant_pairs"] = sum(p["discordant"] for p in comparable)
+    result["pairwise_rank_error"] = (result["discordant_pairs"] / len(comparable)) if comparable else None
+    return result
+
+
 def run_case(case, args):
+    faulthandler.dump_traceback_later(60, repeat=True)
     import torch
     import tilelang
     from cuda.bindings import driver
@@ -82,7 +120,8 @@ def run_case(case, args):
         if args.phase == "calibrate" and "collection_error" not in report:
             start = time.monotonic()
             try:
-                table = calibrate(collection, output / "calibration", env)
+                table = calibrate(collection, output / "calibration", env,
+                                  cache_directory=args.calibration_cache)
                 report.update(table_sha256=table.sha256, calibration_seconds=time.monotonic() - start,
                               frozen_unix_time=time.time())
             except Exception:
@@ -190,6 +229,7 @@ def run_case(case, args):
         record["median_us"] = statistics.median(record["latency_samples_us"])
         record["min_us"] = min(record["latency_samples_us"])
         record["max_us"] = max(record["latency_samples_us"])
+    report["comparison"] = comparison(report)
     save()
 
 
@@ -203,6 +243,7 @@ def main():
     parser.add_argument("--family", action="append")
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--max-candidates", type=int, default=4096)
+    parser.add_argument("--calibration-cache", help="reuse verified measurements with identical environment and keys")
     args = parser.parse_args()
     if args.case:
         run_case(next(c for c in cases() if c["id"] == args.case), args)
@@ -220,6 +261,8 @@ def main():
         command = [sys.executable, str(Path(__file__).resolve()), "--examples-root", args.examples_root,
                    "--output", str(folder), "--compiler-revision", args.compiler_revision,
                    "--phase", args.phase, "--case", case["id"], "--max-candidates", str(args.max_candidates)]
+        if args.calibration_cache:
+            command.extend(["--calibration-cache", args.calibration_cache])
         with (folder / f"{args.phase}.log").open("w") as log:
             try:
                 result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=args.timeout,
