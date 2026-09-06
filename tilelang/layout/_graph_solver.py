@@ -441,3 +441,15 @@ def solve(problem, algorithm="maxsat-full", timeout_ms=60_000, max_states=1_000_
     except _BudgetExceeded as exc:
         result = {"status": "budget", "reason": str(exc)}
     return dict(result, algorithm=algorithm, elapsed_ms=(time.monotonic() - started) * 1000)
+
+
+def register_solver():
+    """Register a versioned JSON boundary without narrowing integer costs."""
+    import json
+    import tvm_ffi
+
+    def solve_json(problem, algorithm, timeout_ms, max_states):
+        result = solve(json.loads(str(problem)), str(algorithm), int(timeout_ms), int(max_states))
+        return json.dumps(result, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+    tvm_ffi.register_global_func("tl.layout.solve_graph_v1", solve_json)

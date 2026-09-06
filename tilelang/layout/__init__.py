@@ -26,3 +26,7 @@ from . import cute  # noqa: F401  (registers tl.cute.* FFI objects on import)
 from ._solver import register_solver as _register_solver
 
 _register_solver()
+
+from ._graph_solver import register_solver as _register_graph_solver
+
+_register_graph_solver()
