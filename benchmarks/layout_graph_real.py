@@ -236,6 +236,22 @@ def run_case(case, args):
     save()
 
 
+def _prepare_phase_attempt(folder, phase):
+    """Archive prior phase outputs before starting a new child attempt."""
+    attempt = 1
+    while any((folder / f"{phase}.attempt-{attempt:04d}.{suffix}").exists()
+              for suffix in ("json", "log")):
+        attempt += 1
+    label = f"{phase}.attempt-{attempt:04d}"
+    archived = False
+    for suffix in ("json", "log"):
+        current = folder / f"{phase}.{suffix}"
+        if current.exists():
+            current.replace(folder / f"{label}.{suffix}")
+            archived = True
+    return f"{phase}.attempt-{attempt + int(archived):04d}"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--examples-root", required=True)
@@ -259,7 +275,8 @@ def main():
             continue
         folder = root / case["id"]
         folder.mkdir(exist_ok=True)
-        item = dict(case=case)
+        attempt = _prepare_phase_attempt(folder, args.phase)
+        item = dict(case=case, attempt=attempt)
         print(args.phase.upper(), case["id"], flush=True)
         command = [sys.executable, str(Path(__file__).resolve()), "--examples-root", args.examples_root,
                    "--output", str(folder), "--compiler-revision", args.compiler_revision,
@@ -271,12 +288,25 @@ def main():
                 result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=args.timeout,
                                         env={**os.environ, "TILELANG_DISABLE_CACHE": "1"})
                 item["returncode"] = result.returncode
+                item["status"] = "completed" if result.returncode == 0 else "failed"
             except subprocess.TimeoutExpired:
                 item["timeout_seconds"] = args.timeout
-        if (folder / f"{args.phase}.json").exists():
-            item["report"] = json.loads((folder / f"{args.phase}.json").read_text())
-        else:
-            item["error"] = (folder / f"{args.phase}.log").read_text()[-12000:]
+                item["status"] = "timeout"
+                result = None
+            except OSError as exc:
+                item["status"] = "start_failed"
+                item["error"] = f"{type(exc).__name__}: {exc}"
+                result = None
+        report_path = folder / f"{args.phase}.json"
+        completed = result is not None and result.returncode == 0
+        if completed and report_path.exists():
+            item["report"] = json.loads(report_path.read_text())
+        elif completed:
+            item["status"] = "missing_report"
+            item["error"] = f"Child exited successfully without {report_path.name}"
+        elif "error" not in item:
+            log_path = folder / f"{args.phase}.log"
+            item["error"] = log_path.read_text()[-12000:] if log_path.exists() else ""
         summary.append(item)
         write(root / f"{args.phase}-summary.json", summary)
 
