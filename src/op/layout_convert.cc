@@ -36,6 +36,31 @@ PrimExpr Lookup(const std::vector<int> &values, PrimExpr thread) {
       affine &= values[i] == values[0] + static_cast<int>(i) * delta;
     if (affine)
       return Integer(values[0]) + thread * Integer(delta);
+    // Ownership maps commonly consist of equal-width runs, optionally repeated
+    // across warps. Verify the complete table before replacing it with integer
+    // division/modulo; irregular and masked maps retain the exact lookup below.
+    size_t run = 1;
+    while (run < values.size() && values[run] == values[0])
+      ++run;
+    if (run < values.size()) {
+      int step = values[run] - values[0];
+      size_t period = (values.size() + run - 1) / run;
+      for (size_t i = run; i < values.size(); i += run) {
+        if (values[i] == values[0]) {
+          period = i / run;
+          break;
+        }
+      }
+      bool regular = true;
+      for (size_t i = 0; i < values.size(); ++i)
+        regular &= values[i] == values[0] + static_cast<int>((i / run) % period) * step;
+      if (regular) {
+        PrimExpr index = floordiv(thread, Integer(static_cast<int>(run)));
+        if (period * run < values.size())
+          index = floormod(index, Integer(static_cast<int>(period)));
+        return Integer(values[0]) + index * Integer(step);
+      }
+    }
   }
   PrimExpr result = Integer(values.back());
   // Runs of identical values share a comparison; simplify later folds affine
