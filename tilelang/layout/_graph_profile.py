@@ -152,8 +152,14 @@ def make_microkernel(measurement):
     annotations = {"layout_map": {b: l for b, l in layouts.items() if b in buffers}}
     block = tir.SBlock([], [], [], "root", body, alloc_buffers=allocations, annotations=annotations)
     body = tir.SBlockRealize([], True, block)
-    axis = tir.IterVar(tvm.ir.Range(0, bound.extent), thread, tir.IterVar.ThreadIndex, "threadIdx.x")
-    body = tir.AttrStmt(axis, "thread_extent", bound.extent, body)
+    # The ordinary kernel frame supplies all three axes. ThreadSync's shared
+    # dependency analysis addresses its final three thread entries as x/y/z.
+    axes = [(thread, bound.extent, "threadIdx.x"),
+            (tir.Var("profile_thread_y", "int32"), 1, "threadIdx.y"),
+            (tir.Var("profile_thread_z", "int32"), 1, "threadIdx.z")]
+    for variable, extent, tag in reversed(axes):
+        axis = tir.IterVar(tvm.ir.Range(0, extent), variable, tir.IterVar.ThreadIndex, tag)
+        body = tir.AttrStmt(axis, "thread_extent", extent, body)
     function = tir.PrimFunc(params, body).with_attr("global_symbol", "layout_microkernel").with_attr("tir.noalias", True)
     function = function.with_attr("target", measurement["function"].attrs["target"])
     return function, params, outputs

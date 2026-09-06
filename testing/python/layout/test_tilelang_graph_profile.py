@@ -10,10 +10,11 @@ from tilelang.layout._graph_profile import calibrate, environment
 from tilelang.layout._latency_table import LatencyTable
 
 
-def test_measured_calibration_and_frozen_selection(tmp_path, monkeypatch):
+@pytest.mark.parametrize("threads", [32, 128])
+def test_measured_calibration_and_frozen_selection(tmp_path, monkeypatch, threads):
     @T.prim_func
     def main(A: T.Tensor((128,), "float32"), B: T.Tensor((128,), "float32")):
-        with T.Kernel(1, threads=32):
+        with T.Kernel(1, threads=threads):
             x = T.alloc_fragment((128,), "float32")
             y = T.alloc_fragment((128,), "float32")
             T.copy(A, x)
