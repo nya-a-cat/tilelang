@@ -74,6 +74,7 @@ def run_case(case, args):
     import tilelang
     from cuda.bindings import driver
     from tilelang.layout import GraphLayoutSession, LatencyTable, calibrate, calibration_environment
+    from tilelang.transform.pass_config import normalize_pass_configs
 
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -94,7 +95,7 @@ def run_case(case, args):
         report["preparation_error"] = traceback.format_exc()
         save()
         return
-    configs = {str(k): v for k, v in dict(impl.pass_configs or {}).items()}
+    configs = normalize_pass_configs(impl.pass_configs)
     flags = list(impl.compile_flags or [])
     env = calibration_environment(tilelang_revision=args.compiler_revision, tvm_revision=TVM_REVISION,
                                   compiler_flags=flags)
