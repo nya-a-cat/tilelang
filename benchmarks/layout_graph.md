@@ -121,7 +121,7 @@ Each case receives a separate copy of its evidence and a separately frozen table
 
 Each benchmark report compares full-kernel timings with the unweighted sum of
 region costs. Pairwise rank errors exclude equal proxy costs, identical binaries,
-and measured differences within 1%. This band describes timing ties and supplies
+and measured differences within 1% of the faster time. This symmetric band describes timing ties and supplies
 no confidence interval. Raw gaps, all ties, speedups and regressions are retained.
 Enclosing loop multiplicity is absent from the proxy sum; these diagnostics
 measure that proxy's ranking, with its stated limitations.

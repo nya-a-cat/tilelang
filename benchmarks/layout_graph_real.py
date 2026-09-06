@@ -53,7 +53,9 @@ def comparison(report):
         same_binary = left["binary_sha256"] == right["binary_sha256"]
         model_direction = (left_cost > right_cost) - (left_cost < right_cost)
         # A 1% band is a descriptive timing tie, not a confidence interval.
-        measured_direction = 0 if same_binary or abs(gap) <= 0.01 else (1 if gap > 0 else -1)
+        tied = max(left["median_us"], right["median_us"]) <= 1.01 * min(
+            left["median_us"], right["median_us"])
+        measured_direction = 0 if same_binary or tied else (1 if gap > 0 else -1)
         result["rank_pairs"].append(dict(
             strategies=[left["strategy"], right["strategy"]],
             proxy_costs_ns=[left_cost, right_cost], relative_time_gap=gap,
